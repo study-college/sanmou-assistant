@@ -1,0 +1,19 @@
+name: 功能建议
+description: 描述具体场景、期望行为和可行的替代办法。
+title: '[Feature] '
+labels: [enhancement]
+body:
+  - type: textarea
+    id: scenario
+    attributes:
+      label: 现在遇到什么问题
+      description: 描述使用场景，不需要提供真实角色或坐标。
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: 期望的行为
+      description: 说明解决后应有什么具体变化，以及已试过的替代办法。
+    validations:
+      required: true

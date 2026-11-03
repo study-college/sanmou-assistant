@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="380" viewBox="0 0 1200 380" role="img" aria-labelledby="title desc">
+  <title id="title">三谋助手 Sanmou Assistant</title>
+  <desc id="desc">Windows MuMu 桌面助手。读取现场，串行决策，持续执行。项目概念图，不是游戏截图。</desc>
+  <defs><linearGradient id="bg" x2="1" y2="1"><stop stop-color="#102736"/><stop offset="1" stop-color="#183f4d"/></linearGradient></defs>
+  <rect width="1200" height="380" rx="24" fill="url(#bg)"/>
+  <g stroke="#568188" stroke-width="1" opacity=".22"><path d="M720 0v380M800 0v380M880 0v380M960 0v380M1040 0v380M1120 0v380M640 60h560M640 140h560M640 220h560M640 300h560"/></g>
+  <rect x="56" y="58" width="74" height="74" rx="18" fill="#edc77a"/>
+  <text x="93" y="110" text-anchor="middle" font-family="Microsoft YaHei, sans-serif" font-size="44" font-weight="700" fill="#153442">谋</text>
+  <text x="154" y="87" font-family="Segoe UI, sans-serif" font-size="15" letter-spacing="3" fill="#9fbfc5">SANMOU ASSISTANT</text>
+  <text x="151" y="132" font-family="Microsoft YaHei, sans-serif" font-size="42" font-weight="700" fill="#f4f7f4">三谋助手</text>
+  <text x="56" y="201" font-family="Microsoft YaHei, sans-serif" font-size="26" fill="#f4f7f4">读取现场 · 串行决策 · 持续执行</text>
+  <text x="56" y="240" font-family="Microsoft YaHei, sans-serif" font-size="18" fill="#b2cbd0">多账号 / 队伍监控 / 武勋 / 讨贼 / 铺路 / 日常</text>
+  <g font-family="Segoe UI, sans-serif" font-size="14" fill="#c2d6d9"><text x="56" y="320">WINDOWS x64</text><text x="227" y="320">MuMu 5</text><text x="352" y="320">PYTHON 3.10–3.12</text></g>
+  <g stroke="#edc77a" stroke-width="3" fill="none"><path d="M783 280V200h95v-80h130v136h98" stroke-dasharray="8 8"/><circle cx="783" cy="280" r="14" fill="#edc77a"/><circle cx="878" cy="200" r="11" fill="#173d49"/><circle cx="1008" cy="120" r="11" fill="#173d49"/><circle cx="1106" cy="256" r="14" fill="#edc77a"/></g>
+  <g font-family="Microsoft YaHei, sans-serif" font-size="15" fill="#d6e4e3"><text x="746" y="326">观察</text><text x="850" y="242">判断</text><text x="977" y="86">执行</text><text x="1076" y="305">复核</text></g>
+</svg>

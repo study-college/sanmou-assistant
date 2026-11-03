@@ -40,12 +40,16 @@ def assemble(app, output, anonymize=None):
     stage.mkdir(parents=True)
     shutil.copytree(app, stage / "app")
     source = stage / "source"
+    for name in ("LICENSE", "THIRD_PARTY_NOTICES.md", "CHANGELOG.md", "CONTRIBUTING.md", "CODE_OF_CONDUCT.md", "SECURITY.md", "SUPPORT.md", ".gitignore", ".gitattributes"):
+        copy_file(ROOT / name, source / name)
+        if name in ("LICENSE", "THIRD_PARTY_NOTICES.md", "CHANGELOG.md"):
+            copy_file(ROOT / name, stage / name)
     for path in (ROOT / "sanmou_assistant").rglob("*"):
         if path.is_file() and (path.suffix == ".py" or "assets" in path.relative_to(ROOT / "sanmou_assistant").parts[:-1] and path.suffix in (".png", ".json")):
             copy_file(path, source / path.relative_to(ROOT))
     for name in ("pyproject.toml", "run_assistant.py", "requirements-runtime.txt", "requirements-build.txt", "requirements-lock.txt", "启动助手.cmd"):
         copy_file(ROOT / name, source / name)
-    for name in ("build.ps1", "setup-source.ps1", "start-source.ps1", "package_release.py", "verify_release.ps1", "render_guide.py"):
+    for name in ("build.ps1", "setup-source.ps1", "start-source.ps1", "package_release.py", "verify_release.ps1", "render_guide.py", "audit_publication.py", "prepare_github.py"):
         path = ROOT / "scripts" / name
         if path.suffix == ".ps1":
             text_file(source / "scripts" / name, path.read_text(encoding="utf-8-sig"), powershell=True)
@@ -60,18 +64,21 @@ def assemble(app, output, anonymize=None):
         text_file(source / ("research-tests" if private else "tests") / path.name, public_test)
         if private:
             fixture_tests.append(path.name)
-    for name in ("09-user-guide.md", "AGENT-GUIDE.md", f"RELEASE-{__version__}.md"):
+    for name in dict.fromkeys(("09-user-guide.md", "AGENT-GUIDE.md", "ROADMAP.md", "RELEASE-0.8.1.md", f"RELEASE-{__version__}.md")):
         copy_file(ROOT / "docs" / name, source / "docs" / name)
         public_name = "使用说明.md" if name == "09-user-guide.md" else name
         copy_file(ROOT / "docs" / name, stage / "docs" / public_name)
+        if name == "09-user-guide.md":
+            copy_file(ROOT / "docs" / name, stage / "docs" / name)
         if name in ("09-user-guide.md", "AGENT-GUIDE.md"):
             copy_file(ROOT / "docs" / name, stage / "app" / ("使用说明.md" if name == "09-user-guide.md" else name))
     copy_file(ROOT / "docs" / "AGENT-GUIDE.md", source / "AGENTS.md")
-    text_file(source / "README.md", "# 三谋助手源码\n\n先读AGENTS.md与docs/09-user-guide.md。\n\n标准CPython3.10–3.12 x64（不使用Anaconda/Conda），运行scripts/setup-source.ps1安装隔离环境。\n"
-              "随后 .venv/Scripts/python.exe -m pytest -q 运行公开可独立复现的测试。\n"
-              "research-tests保留历史实机图片回归源码，未包含维护者账号图片，不能在此直接跑。\n"
-              "发布测试中的历史角色名称已替换为测试名称；实机图片回归需换成自己的图片和对应角色期望值。\n"
-              "产品全部Python模块和识别资源均在sanmou_assistant，程序与源码共用数据但不要并发控制实例。\n")
+    copy_file(ROOT / "README.md", source / "README.md")
+    for path in (ROOT / ".github").rglob("*"):
+        if path.is_file() and path.suffix in (".yml", ".md"):
+            copy_file(path, source / path.relative_to(ROOT))
+    for path in (ROOT / "docs/assets").glob("*.svg"):
+        copy_file(path, source / path.relative_to(ROOT))
     text_file(stage / "校验完整性.ps1", (ROOT / "scripts" / "verify_release.ps1").read_text(encoding="utf-8-sig"), powershell=True)
     commands = {
         "启动助手.cmd": 'start "" "%~dp0app\\SanmouAssistant.exe" --data-dir "%~dp0data"\n',
@@ -86,6 +93,7 @@ def assemble(app, output, anonymize=None):
     if assets.is_dir():
         for asset in assets.glob("*.png"):
             copy_file(asset, source / "docs" / "guide-assets" / asset.name)
+            copy_file(asset, stage / "docs" / "guide-assets" / asset.name)
     sys.path.insert(0, str(ROOT / "scripts"))
     from render_guide import write_guides
     write_guides(stage, ROOT, __version__)

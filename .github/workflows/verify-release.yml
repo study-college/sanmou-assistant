@@ -6,7 +6,7 @@ on:
       tag:
         description: Release tag to download and verify
         required: true
-        default: v0.8.1
+        default: v0.8.2
         type: string
 
 permissions:
@@ -30,11 +30,20 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Release download failed' }
           $archive = Get-ChildItem -LiteralPath $download -Filter '*.zip' | Select-Object -First 1
           $digest = (Get-FileHash -LiteralPath $archive.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          gh release download $env:RELEASE_TAG --pattern '*-Windows-x64-full.zip.sha256' --dir $download
+          if ($LASTEXITCODE -ne 0) { throw 'Checksum download failed' }
+          $expected = (Get-Content -LiteralPath ($archive.FullName + '.sha256') -Raw).Split(' ')[0].Trim()
+          if ($digest -ne $expected) { throw 'Downloaded ZIP checksum differs' }
           Write-Output "Downloaded ZIP SHA256: $digest"
           $extracted = Join-Path $env:RUNNER_TEMP 'extracted'
           Expand-Archive -LiteralPath $archive.FullName -DestinationPath $extracted
           $root = (Get-ChildItem -LiteralPath $extracted -Directory | Select-Object -First 1).FullName
           & (Join-Path $root '校验完整性.ps1')
+          $auditScript = Join-Path $root 'source/scripts/audit_publication.py'
+          if (Test-Path -LiteralPath $auditScript) {
+            python $auditScript --archive $archive.FullName
+            if ($LASTEXITCODE -ne 0) { throw 'Downloaded archive audit failed' }
+          }
           $runtime = Join-Path $env:RUNNER_TEMP 'runtime-exe'
           $exe = Join-Path $root 'app/SanmouAssistant.exe'
           $process = Start-Process -FilePath $exe -ArgumentList @('--command', 'runtime', '--data-dir', ('"' + $runtime + '"')) -Wait -PassThru -WindowStyle Hidden

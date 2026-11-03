@@ -7,8 +7,8 @@ import json
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-TEXT = {".py", ".md", ".ps1", ".json", ".toml", ".txt", ".cmd", ".css"}
-SCRIPTS = ("build.ps1", "setup-source.ps1", "start-source.ps1", "package_release.py", "verify_release.ps1", "render_guide.py", "prepare_github.py")
+TEXT = {".py", ".md", ".ps1", ".json", ".toml", ".txt", ".cmd", ".css", ".svg", ".yml"}
+SCRIPTS = ("build.ps1", "setup-source.ps1", "start-source.ps1", "package_release.py", "verify_release.ps1", "render_guide.py", "prepare_github.py", "audit_publication.py")
 
 
 def export(output: Path) -> dict:
@@ -36,7 +36,7 @@ def export(output: Path) -> dict:
     for path in sorted((ROOT / "sanmou_assistant").rglob("*")):
         if path.is_file() and (path.suffix == ".py" or "assets" in path.relative_to(ROOT / "sanmou_assistant").parts[:-1] and path.suffix in (".png", ".json")):
             copy(path)
-    for name in ("README.md", "pyproject.toml", "run_assistant.py", "requirements-runtime.txt", "requirements-build.txt", "requirements-lock.txt", "启动助手.cmd"):
+    for name in ("README.md", "pyproject.toml", "run_assistant.py", "requirements-runtime.txt", "requirements-build.txt", "requirements-lock.txt", "启动助手.cmd", "LICENSE", "THIRD_PARTY_NOTICES.md", "CHANGELOG.md", "CONTRIBUTING.md", "CODE_OF_CONDUCT.md", "SECURITY.md", "SUPPORT.md"):
         copy(ROOT / name)
     for name in SCRIPTS:
         copy(ROOT / "scripts" / name)
@@ -44,12 +44,15 @@ def export(output: Path) -> dict:
         private = path.parent.name == "research-tests" or "artifacts" in path.read_text("utf-8") or "data/sessions" in path.read_text("utf-8")
         copy(path, Path("research-tests" if private else "tests") / path.name)
     from sanmou_assistant import __version__
-    for name in ("09-user-guide.md", "AGENT-GUIDE.md", f"RELEASE-{__version__}.md", "guide.css"):
+    for name in dict.fromkeys(("09-user-guide.md", "AGENT-GUIDE.md", "ROADMAP.md", "RELEASE-0.8.1.md", f"RELEASE-{__version__}.md", "guide.css")):
         copy(ROOT / "docs" / name)
     for path in sorted((ROOT / "docs/guide-assets").glob("*.png")):
         copy(path)
     copy(ROOT / "docs/AGENT-GUIDE.md", "AGENTS.md")
-    for path in sorted((ROOT / ".github/workflows").glob("*.yml")):
+    for path in sorted((ROOT / ".github").rglob("*")):
+        if path.is_file() and path.suffix in (".yml", ".md"):
+            copy(path)
+    for path in sorted((ROOT / "docs/assets").glob("*.svg")):
         copy(path)
     ignore = """# Runtime data, account settings, screenshots, secrets and generated files
 data/

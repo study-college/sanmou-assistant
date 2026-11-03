@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 使用说明与常见问题
+    url: https://github.com/study-college/sanmou-assistant/blob/main/docs/09-user-guide.md
+    about: 首次配置、完整解压、MuMu 连接和常见故障。
+  - name: 安全或隐私漏洞
+    url: https://github.com/study-college/sanmou-assistant/security/advisories/new
+    about: 使用私密报告，不在公开 Issue 暴露凭据或可利用细节。
