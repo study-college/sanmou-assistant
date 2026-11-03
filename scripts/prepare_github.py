@@ -40,8 +40,8 @@ def export(output: Path) -> dict:
         copy(ROOT / name)
     for name in SCRIPTS:
         copy(ROOT / "scripts" / name)
-    for path in sorted((ROOT / "tests").glob("*.py")):
-        private = "artifacts" in path.read_text("utf-8") or "data/sessions" in path.read_text("utf-8")
+    for path in sorted(list((ROOT / "tests").glob("*.py")) + list((ROOT / "research-tests").glob("*.py"))):
+        private = path.parent.name == "research-tests" or "artifacts" in path.read_text("utf-8") or "data/sessions" in path.read_text("utf-8")
         copy(path, Path("research-tests" if private else "tests") / path.name)
     from sanmou_assistant import __version__
     for name in ("09-user-guide.md", "AGENT-GUIDE.md", f"RELEASE-{__version__}.md", "guide.css"):
