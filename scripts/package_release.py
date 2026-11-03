@@ -97,7 +97,7 @@ def assemble(app, output, anonymize=None):
     sys.path.insert(0, str(ROOT / "scripts"))
     from render_guide import write_guides
     write_guides(stage, ROOT, __version__)
-    text_file(stage / "请先阅读.txt", "三谋助手 " + __version__ + " Windows x64完整分发包\n\n先完整解压，然后双击 启动助手.cmd。无需Python或AI。\n首次使用请打开 先读我.html，按步骤设置自己的MuMu、实例ID、渠道、账号和主城。\nAI请先读 docs/AGENT-GUIDE.md。源码环境首次安装需Python3.10–3.12 x64及网络。\n没有携带作者账号配置、数据库或截图。首次运行创建自己的data。\n停止和退出不撤军、不关闭模拟器。\n")
+    text_file(stage / "请先阅读.txt", "三谋助手 " + __version__ + " Windows x64完整分发包\n\n先完整解压，然后双击 启动助手.cmd。无需Python或AI。\n首次使用请打开 先读我.html，按步骤设置自己的MuMu、实例ID、渠道、账号和主城。\nAI请先读 docs/AGENT-GUIDE.md。源码环境首次安装需Python3.11–3.12 x64及网络。\n没有携带作者账号配置、数据库或截图。首次运行创建自己的data。\n停止和退出不撤军、不关闭模拟器。\n")
     license_root = stage / "licenses"
     runtime_packages = ("PySide6", "PySide6_Addons", "PySide6_Essentials", "shiboken6", "rapidocr-onnxruntime", "onnxruntime", "numpy", "opencv-python", "Pillow", "Shapely", "pyclipper", "PyYAML", "six", "tqdm", "coloredlogs", "humanfriendly", "flatbuffers", "protobuf", "packaging", "sympy", "mpmath", "pyreadline3", "pyinstaller", "pyinstaller-hooks-contrib")
     for name in runtime_packages:

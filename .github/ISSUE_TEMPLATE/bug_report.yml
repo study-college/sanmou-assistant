@@ -7,7 +7,7 @@ body:
     id: version
     attributes:
       label: 助手版本
-      placeholder: 例如 0.8.2，程序版或源码版
+      placeholder: 例如 0.8.3，程序版或源码版
     validations:
       required: true
   - type: input
