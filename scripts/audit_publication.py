@@ -82,7 +82,7 @@ def check_history(audit: Audit, repo: Path):
             content = process.stdout.read(size)
             process.stdout.read(1)
             if header[1] in ("blob", "commit"):
-                audit.check("history:" + oid[:12] + ":" + name, content, paths=header[1] == "blob")
+                audit.check("history:" + oid[:12] + "/" + name, content, paths=header[1] == "blob")
     finally:
         process.stdin.close()
         process.stdout.close()

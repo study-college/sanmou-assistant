@@ -14,16 +14,22 @@ def test_removed_token_is_still_found_in_git_history(tmp_path):
     git("config", "user.name", "Test")
     git("config", "user.email", "test@example.com")
     item = tmp_path / "config.txt"
+    old_data = tmp_path / "data" / "accounts.json"
+    old_data.parent.mkdir()
+    old_data.write_text("{}", "utf-8")
     item.write_text("credential=" + "ghp_" + "a" * 36, "utf-8")
     git("add", ".")
     git("commit", "-qm", "fixture")
     item.write_text("redacted", "utf-8")
-    git("add", ".")
+    old_data.unlink()
+    old_data.parent.rmdir()
+    git("add", "-A")
     git("commit", "-qm", "redacted fixture")
     result = subprocess.run([sys.executable, str(SCRIPT), "--repository", str(tmp_path), "--history"], capture_output=True, text=True)
     report = json.loads(result.stdout)
     assert result.returncode == 1
     assert any(i["rule"] == "github-token" and i["path"].startswith("history:") for i in report["issues"])
+    assert any(i["rule"] == "private-path" and i["path"].endswith("/data/accounts.json") for i in report["issues"])
     assert "ghp_" + "a" * 36 not in result.stdout
 
 
