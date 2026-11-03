@@ -1,0 +1,48 @@
+name: Verify Windows release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to download and verify
+        required: true
+        default: v0.8.1
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    env:
+      QT_QPA_PLATFORM: offscreen
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+      RELEASE_TAG: ${{ inputs.tag }}
+    steps:
+      - name: Download, verify and run the packaged OCR check
+        shell: pwsh
+        run: |
+          $download = Join-Path $env:RUNNER_TEMP 'download'
+          gh release download $env:RELEASE_TAG --pattern '*-Windows-x64-full.zip' --dir $download
+          if ($LASTEXITCODE -ne 0) { throw 'Release download failed' }
+          $archive = Get-ChildItem -LiteralPath $download -Filter '*.zip' | Select-Object -First 1
+          $digest = (Get-FileHash -LiteralPath $archive.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          Write-Output "Downloaded ZIP SHA256: $digest"
+          $extracted = Join-Path $env:RUNNER_TEMP 'extracted'
+          Expand-Archive -LiteralPath $archive.FullName -DestinationPath $extracted
+          $root = (Get-ChildItem -LiteralPath $extracted -Directory | Select-Object -First 1).FullName
+          & (Join-Path $root '校验完整性.ps1')
+          $runtime = Join-Path $env:RUNNER_TEMP 'runtime-exe'
+          $exe = Join-Path $root 'app/SanmouAssistant.exe'
+          $process = Start-Process -FilePath $exe -ArgumentList @('--command', 'runtime', '--data-dir', ('"' + $runtime + '"')) -Wait -PassThru -WindowStyle Hidden
+          if ($process.ExitCode -ne 0) { throw "Packaged runtime exited with $($process.ExitCode)" }
+          $result = Get-ChildItem -LiteralPath $runtime -Recurse -Filter result.json | Select-Object -First 1
+          if (-not $result) { throw 'Packaged runtime produced no result' }
+          $events = Get-Content -LiteralPath $result.FullName -Raw -Encoding UTF8 | ConvertFrom-Json
+          if (@($events | Where-Object event -eq error).Count) { throw 'Packaged runtime reported an error' }
+          if (-not ($events | Where-Object { $_.event -eq 'status' -and $_.value -eq '运行环境检测通过' })) { throw 'Packaged OCR success evidence missing' }
+          Write-Output 'Packaged executable Qt/OpenCV/ONNX/OCR check passed'
+          "Verified ZIP SHA256: $digest" >> $env:GITHUB_STEP_SUMMARY
