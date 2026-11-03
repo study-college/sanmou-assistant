@@ -54,6 +54,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\build.ps1 -Python 
 
 完整包包含程序、同版本源码、识别资源、使用说明、第三方许可和逐文件 SHA256 清单；在解压根目录运行 `校验完整性.ps1` 核验。构建不会携带作者或接收者的账号数据。
 
+也可以在 GitHub 的 Actions 中手动运行 **Build Windows release**，填写已有版本标签。流程在 Windows 环境安装依赖、运行独立测试与 OCR 检查、构建和校验完整包，并上传到该标签已存在的 Release；不会按时间自动运行。正式发布前仍需检查发行说明和附件摘要。
+
 ## 隐私与维护
 
 仓库只包含产品文件和脱敏文档、测试。账号配置、完整游戏截图、SQLite、运行日志、备份和本机历史交接资料不上传。运行后生成的 `data/`、构建产物与环境文件已列入 `.gitignore`。
