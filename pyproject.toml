@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sanmou-assistant"
+version = "0.8.1"
+description = "三谋桌面助手：MuMu 连接、部队监控与可配置调度"
+requires-python = ">=3.10,<3.13"
+dependencies = ["PySide6>=6.8,<7", "rapidocr-onnxruntime==1.4.4", "onnxruntime>=1.20,<2", "opencv-python>=4.10,<5", "numpy>=1.24,<3"]
+
+[project.scripts]
+sanmou-assistant = "sanmou_assistant.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["sanmou_assistant*"]
+
+[tool.setuptools.package-data]
+sanmou_assistant = ["assets/*.png", "assets/team-markers/*.png", "assets/team-markers/*.json", "assets/hide-toggle/*.png", "assets/action-icons/*.png"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+

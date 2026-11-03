@@ -1,0 +1,241 @@
+{
+  "version": 1,
+  "badge_window": {
+    "x": 1840,
+    "dy": -8,
+    "size": 58
+  },
+  "templates": [
+    {
+      "state": "busy",
+      "file": "busy-1.png",
+      "source": "artifacts/team-marker-calibration/frame-05",
+      "slot": 5,
+      "captured_at": ""
+    },
+    {
+      "state": "busy",
+      "file": "busy-2.png",
+      "source": "artifacts/team-marker-calibration/frame-06",
+      "slot": 5,
+      "captured_at": ""
+    },
+    {
+      "state": "busy",
+      "file": "busy-3.png",
+      "source": "artifacts/team-marker-calibration/frame-08",
+      "slot": 1,
+      "captured_at": ""
+    },
+    {
+      "state": "busy",
+      "file": "busy-4.png",
+      "source": "artifacts/team-marker-calibration/frame-08",
+      "slot": 2,
+      "captured_at": ""
+    },
+    {
+      "state": "fighting",
+      "file": "fighting-1.png",
+      "source": "artifacts/team-marker-calibration/battle-01",
+      "slot": 1,
+      "captured_at": ""
+    },
+    {
+      "state": "fighting",
+      "file": "fighting-2.png",
+      "source": "artifacts/team-marker-calibration/battle-01",
+      "slot": 2,
+      "captured_at": ""
+    },
+    {
+      "state": "fighting",
+      "file": "fighting-3.png",
+      "source": "artifacts/team-marker-calibration/battle-01",
+      "slot": 3,
+      "captured_at": ""
+    },
+    {
+      "state": "fighting",
+      "file": "fighting-4.png",
+      "source": "artifacts/team-marker-calibration/battle-01",
+      "slot": 1,
+      "captured_at": ""
+    },
+    {
+      "state": "fighting",
+      "file": "fighting-5.png",
+      "source": "artifacts/team-marker-calibration/battle-01",
+      "slot": 2,
+      "captured_at": ""
+    },
+    {
+      "state": "fighting",
+      "file": "fighting-6.png",
+      "source": "artifacts/team-marker-calibration/battle-01",
+      "slot": 3,
+      "captured_at": ""
+    },
+    {
+      "state": "fighting",
+      "file": "fighting-7.png",
+      "source": "artifacts/team-marker-calibration/battle-01",
+      "slot": 1,
+      "captured_at": ""
+    },
+    {
+      "state": "fighting",
+      "file": "fighting-8.png",
+      "source": "artifacts/team-marker-calibration/battle-01",
+      "slot": 2,
+      "captured_at": ""
+    },
+    {
+      "state": "fighting",
+      "file": "fighting-9.png",
+      "source": "artifacts/team-marker-calibration/battle-01",
+      "slot": 3,
+      "captured_at": ""
+    },
+    {
+      "state": "fighting",
+      "file": "fighting-10.png",
+      "source": "artifacts/team-marker-calibration/battle-01",
+      "slot": 1,
+      "captured_at": ""
+    },
+    {
+      "state": "fighting",
+      "file": "fighting-11.png",
+      "source": "artifacts/team-marker-calibration/battle-01",
+      "slot": 2,
+      "captured_at": ""
+    },
+    {
+      "state": "fighting",
+      "file": "fighting-12.png",
+      "source": "artifacts/team-marker-calibration/battle-01",
+      "slot": 3,
+      "captured_at": ""
+    },
+    {
+      "state": "fighting",
+      "file": "fighting-13.png",
+      "source": "artifacts/team-marker-calibration/battle-01",
+      "slot": 1,
+      "captured_at": ""
+    },
+    {
+      "state": "fighting",
+      "file": "fighting-14.png",
+      "source": "artifacts/team-marker-calibration/battle-01",
+      "slot": 2,
+      "captured_at": ""
+    },
+    {
+      "state": "fighting",
+      "file": "fighting-15.png",
+      "source": "artifacts/team-marker-calibration/battle-01",
+      "slot": 3,
+      "captured_at": ""
+    },
+    {
+      "state": "fighting",
+      "file": "fighting-16.png",
+      "source": "artifacts/team-marker-calibration/battle-01",
+      "slot": 1,
+      "captured_at": ""
+    },
+    {
+      "state": "fighting",
+      "file": "fighting-17.png",
+      "source": "artifacts/team-marker-calibration/battle-01",
+      "slot": 2,
+      "captured_at": ""
+    },
+    {
+      "state": "fighting",
+      "file": "fighting-18.png",
+      "source": "artifacts/team-marker-calibration/battle-01",
+      "slot": 3,
+      "captured_at": ""
+    },
+    {
+      "state": "fighting",
+      "file": "fighting-19.png",
+      "source": "artifacts/team-marker-calibration/frame-06",
+      "slot": 2,
+      "captured_at": ""
+    },
+    {
+      "state": "guard",
+      "file": "guard-1.png",
+      "source": "artifacts/team-marker-calibration/frame-01",
+      "slot": 4,
+      "captured_at": "2026-11-02T16:47:18.096024+08:00"
+    },
+    {
+      "state": "guard",
+      "file": "guard-2.png",
+      "source": "artifacts/team-marker-calibration/frame-04",
+      "slot": 4,
+      "captured_at": "2026-11-02T17:1"
+    },
+    {
+      "state": "march",
+      "file": "march-1.png",
+      "source": "artifacts/team-marker-calibration/frame-01",
+      "slot": 3,
+      "captured_at": "2026-11-02T16:47:18.096024+08:00"
+    },
+    {
+      "state": "queued_battle",
+      "file": "queued_battle-1.png",
+      "source": "artifacts/team-marker-calibration/frame-05",
+      "slot": 1,
+      "captured_at": ""
+    },
+    {
+      "state": "retreat",
+      "file": "retreat-1.png",
+      "source": "artifacts/team-marker-calibration/frame-04",
+      "slot": 3,
+      "captured_at": "2026-11-02T17:1"
+    },
+    {
+      "state": "stationary",
+      "file": "stationary-1.png",
+      "source": "artifacts/team-marker-calibration/frame-01",
+      "slot": 5,
+      "captured_at": "2026-11-02T16:47:18.096024+08:00"
+    },
+    {
+      "state": "stationary",
+      "file": "stationary-2.png",
+      "source": "artifacts/team-marker-calibration/frame-04",
+      "slot": 5,
+      "captured_at": "2026-11-02T17:1"
+    },
+    {
+      "state": "transfer",
+      "file": "transfer-1.png",
+      "source": "artifacts/team-marker-calibration/frame-04",
+      "slot": 2,
+      "captured_at": "2026-11-02T17:1"
+    },
+    {
+      "state": "transfer_stay",
+      "file": "transfer_stay-1.png",
+      "source": "artifacts/team-marker-calibration/frame-01",
+      "slot": 1,
+      "captured_at": "2026-11-02T16:47:18.096024+08:00"
+    },
+    {
+      "state": "transfer_stay",
+      "file": "transfer_stay-2.png",
+      "source": "artifacts/team-marker-calibration/frame-04",
+      "slot": 1,
+      "captured_at": "2026-11-02T17:1"
+    }
+  ]
+}
