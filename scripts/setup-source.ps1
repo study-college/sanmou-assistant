@@ -3,7 +3,7 @@ $ErrorActionPreference = 'Stop'
 $projectRoot = Split-Path -Parent $PSScriptRoot
 Set-Location -LiteralPath $projectRoot
 if (-not $Python) {
-    foreach ($version in @('3.12','3.11','3.10')) {
+    foreach ($version in @('3.12','3.11')) {
         if (Get-Command py -ErrorAction SilentlyContinue) {
             try {
                 $candidate = & py "-$version" -c 'import sys;print(sys.executable)' 2>$null
@@ -16,11 +16,15 @@ if (-not $Python) {
         }
     }
 }
+if (-not $Python -and (Get-Command uv -ErrorAction SilentlyContinue)) {
+    $candidate = & uv python find 3.11 --no-python-downloads 2>$null
+    if ($LASTEXITCODE -eq 0 -and $candidate) { $Python = $candidate.Trim() }
+}
 if (-not $Python) { $Python = 'python' }
-& $Python -c "import sys; assert (3,10)<=sys.version_info[:2]<(3,13), 'Need Python 3.10-3.12 x64'; assert sys.maxsize>2**32, 'Need x64 Python'"
-if ($LASTEXITCODE -ne 0) { throw 'Please install Python 3.10-3.12 x64, or use the packaged executable.' }
+& $Python -c "import sys; assert (3,11)<=sys.version_info[:2]<(3,13), 'Need Python 3.11-3.12 x64'; assert sys.maxsize>2**32, 'Need x64 Python'"
+if ($LASTEXITCODE -ne 0) { throw 'Please install Python 3.11-3.12 x64, or use the packaged executable.' }
 & $Python -c "import sys,pathlib; sys.exit(1 if 'anaconda' in sys.version.lower() or (pathlib.Path(sys.base_prefix)/'conda-meta').exists() else 0)"
-if ($LASTEXITCODE -ne 0) { throw 'Please use standard CPython 3.10-3.12 x64 from python.org. Conda Qt/DLL loading is not supported; the packaged app needs no Python.' }
+if ($LASTEXITCODE -ne 0) { throw 'Please use standard CPython 3.11-3.12 x64 from python.org. Conda Qt/DLL loading is not supported; the packaged app needs no Python.' }
 $venvPython = Join-Path $projectRoot '.venv\Scripts\python.exe'
 if (Test-Path -LiteralPath $venvPython) {
     $selectedBase = & $Python -c 'import sys;print(sys.base_prefix)'

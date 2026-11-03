@@ -3,3 +3,5 @@ rapidocr-onnxruntime==1.4.4
 onnxruntime==1.21.0
 opencv-python==4.11.0.86
 numpy==1.26.4
+
+Pillow==13.0.0

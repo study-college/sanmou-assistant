@@ -6,7 +6,7 @@
 
 先看 [使用指南](docs/09-user-guide.md)、[已知限制](docs/ROADMAP.md) 和已有 Issues。提交较大的功能前先开 Issue，说明具体使用场景和预期行为。
 
-开发使用标准 CPython 3.10–3.12 x64，在仓库根目录运行：
+开发使用标准 CPython 3.11–3.12 x64，在仓库根目录运行：
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\setup-source.ps1

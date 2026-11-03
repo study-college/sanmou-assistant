@@ -10,7 +10,7 @@
   <text x="151" y="132" font-family="Microsoft YaHei, sans-serif" font-size="42" font-weight="700" fill="#f4f7f4">三谋助手</text>
   <text x="56" y="201" font-family="Microsoft YaHei, sans-serif" font-size="26" fill="#f4f7f4">读取现场 · 串行决策 · 持续执行</text>
   <text x="56" y="240" font-family="Microsoft YaHei, sans-serif" font-size="18" fill="#b2cbd0">多账号 / 队伍监控 / 武勋 / 讨贼 / 铺路 / 日常</text>
-  <g font-family="Segoe UI, sans-serif" font-size="14" fill="#c2d6d9"><text x="56" y="320">WINDOWS x64</text><text x="227" y="320">MuMu 5</text><text x="352" y="320">PYTHON 3.10–3.12</text></g>
+  <g font-family="Segoe UI, sans-serif" font-size="14" fill="#c2d6d9"><text x="56" y="320">WINDOWS x64</text><text x="227" y="320">MuMu 5</text><text x="352" y="320">PYTHON 3.11–3.12</text></g>
   <g stroke="#edc77a" stroke-width="3" fill="none"><path d="M783 280V200h95v-80h130v136h98" stroke-dasharray="8 8"/><circle cx="783" cy="280" r="14" fill="#edc77a"/><circle cx="878" cy="200" r="11" fill="#173d49"/><circle cx="1008" cy="120" r="11" fill="#173d49"/><circle cx="1106" cy="256" r="14" fill="#edc77a"/></g>
   <g font-family="Microsoft YaHei, sans-serif" font-size="15" fill="#d6e4e3"><text x="746" y="326">观察</text><text x="850" y="242">判断</text><text x="977" y="86">执行</text><text x="1076" y="305">复核</text></g>
 </svg>
