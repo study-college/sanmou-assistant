@@ -1,0 +1,68 @@
+name: Build Windows release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag
+        required: true
+        default: v0.8.1
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: windows-release-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    env:
+      QT_QPA_PLATFORM: offscreen
+      PYTHONUTF8: '1'
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+      RELEASE_TAG: ${{ inputs.tag }}
+    steps:
+      - name: Check out the release tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.tag }}
+          persist-credentials: false
+      - name: Set up standard CPython
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.10'
+          architecture: x64
+      - name: Install locked dependencies
+        shell: pwsh
+        run: |
+          python -m pip install -r requirements-lock.txt
+          if ($LASTEXITCODE -ne 0) { throw 'Dependency installation failed' }
+      - name: Verify the tag and run independent tests
+        shell: pwsh
+        run: |
+          $version = python -c 'from sanmou_assistant import __version__; print(__version__)'
+          if ($env:RELEASE_TAG -ne "v$version") { throw 'Tag and source version differ' }
+          python -m pytest -q
+          if ($LASTEXITCODE -ne 0) { throw 'Independent tests failed' }
+          python -m sanmou_assistant --command runtime --data-dir "$env:RUNNER_TEMP/runtime-source"
+          if ($LASTEXITCODE -ne 0) { throw 'Source OCR check failed' }
+      - name: Build the Windows application
+        shell: pwsh
+        run: ./scripts/build.ps1 -Python (Get-Command python).Source
+      - name: Assemble, verify and upload the full package
+        shell: pwsh
+        run: |
+          python scripts/package_release.py
+          if ($LASTEXITCODE -ne 0) { throw 'Package assembly failed' }
+          $version = python -c 'from sanmou_assistant import __version__; print(__version__)'
+          $folder = "dist/SanmouAssistant-$version-Windows-x64-full"
+          & "$folder/校验完整性.ps1"
+          if ($LASTEXITCODE -ne 0) { throw 'Manifest verification failed' }
+          gh release upload $env:RELEASE_TAG "$folder.zip" "$folder.zip.sha256" --clobber
+          if ($LASTEXITCODE -ne 0) { throw 'Release upload failed' }
+          Get-Content "$folder.zip.sha256" >> $env:GITHUB_STEP_SUMMARY

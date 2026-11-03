@@ -49,6 +49,8 @@ def export(output: Path) -> dict:
     for path in sorted((ROOT / "docs/guide-assets").glob("*.png")):
         copy(path)
     copy(ROOT / "docs/AGENT-GUIDE.md", "AGENTS.md")
+    for path in sorted((ROOT / ".github/workflows").glob("*.yml")):
+        copy(path)
     ignore = """# Runtime data, account settings, screenshots, secrets and generated files
 data/
 profiles/
