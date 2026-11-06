@@ -34,7 +34,7 @@ def export(output: Path) -> dict:
         files.append({"path": target.relative_to(output).as_posix(), "sha256": hashlib.sha256(content).hexdigest()})
 
     for path in sorted((ROOT / "sanmou_assistant").rglob("*")):
-        if path.is_file() and (path.suffix == ".py" or "assets" in path.relative_to(ROOT / "sanmou_assistant").parts[:-1] and path.suffix in (".png", ".json")):
+        if path.is_file() and (path.suffix == ".py" or "assets" in path.relative_to(ROOT / "sanmou_assistant").parts[:-1] and path.suffix in (".png", ".json", ".ico")):
             copy(path)
     for name in ("README.md", "pyproject.toml", "run_assistant.py", "requirements-runtime.txt", "requirements-build.txt", "requirements-lock.txt", "启动助手.cmd", "LICENSE", "THIRD_PARTY_NOTICES.md", "CHANGELOG.md", "CONTRIBUTING.md", "CODE_OF_CONDUCT.md", "SECURITY.md", "SUPPORT.md"):
         copy(ROOT / name)
