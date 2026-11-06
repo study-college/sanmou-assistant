@@ -47,6 +47,9 @@ def needs_detail(marker, has_pending):
 
     重伤/待识别一律不派兵，角标本身已经够做决策；为读倒计时去开详情页
     每队要多花二十多秒，属于纯粹的空转，不再做。
+
+    例外由 Worker.recheck_due() 单独处理：久未产出的队按 20 分钟到点读一次详情，
+    读的是兵力（和到点后的重伤倒计时），不读征兵剩余时间。
     """
     if not marker:
         return True
@@ -56,6 +59,10 @@ def needs_detail(marker, has_pending):
 class Worker(QThread):
     event = Signal(str, object)
     completed = Signal()
+
+    # 2026-11-04：久未产出就按 20 分钟看一次兵力；武勋每 30 分钟读一次只作展示。
+    RECHECK_SECONDS = 1200
+    MERIT_INTERVAL = 1800
 
     def __init__(self, profile: Profile, folder: Path, command="scan", dry_run=True, max_orders=0, duration=0):
         super().__init__()
@@ -77,6 +84,20 @@ class Worker(QThread):
         self.idle_rounds = {}
         self.refresh_requested = threading.Event()
         self.transport_recoveries = []
+        # 2026-11-04：状态只用角标，久了就按时间开一次详情读兵力；武勋只做展示。
+        self.started_at = time.time()
+        self.last_progress = {}      # 该队最近一次“有新动作”的时间
+        self.progress_marker = {}    # 上次读到的角标状态，用于判断“有没有变化”
+        self.last_recheck = {}       # 上次强制开详情的时间
+        self.wounded_until = {}      # 重伤本地倒计时截止（从详情页读到的秒数）
+        self.wounded_probed = {}     # 刚看到重伤时先立刻读一次倒计时，避免干等 10 分钟
+        self.merit_value = None      # 最近一次武勋读数
+        self.merit_base = None       # 本次任务开始时的武勋
+        self.merit_prev = None       # 上一次读数，用于单次增量
+        self.next_merit_at = 0.0
+        self.merit_failures = 0
+        self.wait_log_at = {}        # “可派/不可派原因”限频日志
+        self.published = []
 
     def request_refresh(self):
         self.refresh_requested.set()
@@ -87,6 +108,7 @@ class Worker(QThread):
         if kind != "preview":
             with (self.folder / "events.jsonl").open("a", encoding="utf-8") as f:
                 f.write(json.dumps({"at":datetime.now().isoformat(), "event":kind, "value":value}, ensure_ascii=False)+"\n")
+            self.published.append({"event": kind, "value": value})
         self.event.emit(kind, value)
 
     def pause(self, value: bool):
@@ -116,6 +138,8 @@ class Worker(QThread):
             if self.command == "pave-reset":
                 self.journal = Journal(self.folder.parent / "runtime.sqlite", self._scope())
                 for route in self.profile.pave_routes:
+                    if not route.team:
+                        continue
                     if self.journal.pending(route.team):
                         self.publish("log", {"time": datetime.now().strftime("%H:%M:%S"), "level": "WARN",
                                              "message": f"路线 {route.name} 的队伍有待核对命令，先核对再重置"})
@@ -298,7 +322,8 @@ class Worker(QThread):
                     self.publish("status", "监控中 · 正在读取队伍" if self.command == "scan" else "只监控" if self.dry_run else "运行中")
                     if not self.profile.account or not self.profile.main_city:
                         game.calibrate_home()
-                    policies = self.profile.teams if self.command == "scan" else [t for t in self.profile.teams if t.merit or t.bandits]
+                    policies = ([t for t in self.profile.teams if not t.role == "hidden"] if self.command == "scan"
+                                else [t for t in self.profile.teams if t.role in ("merit", "bandits")])
                     if self.command == "run" and self.profile.food_enabled:
                         game.ensure_sandbox()
                         if game.grain is not None:
@@ -309,8 +334,12 @@ class Worker(QThread):
                             food_recovery = game.grain is None or game.grain < self.profile.food_recover
                             self.journal.set_flag("food_recovery",food_recovery)
                     game.reserved_teams = self.pave_team_keys()
-                    # 同一队兼做讨贼且设为讨贼优先时，先尝试当前集结；独立讨贼队不打断武勋批次。
-                    if self.command == "run" and self.bandits_due() and any(t.merit and t.bandits and t.priority == "bandits" for t in policies):
+                    # 2026-11-04：武勋只作展示——本次任务第一次读数作基线，之后每 30 分钟一次。
+                    # 读不到就跳过一次，不影响任何派兵。
+                    if self.command == "run" and not self.dry_run:
+                        self.check_merit(game)
+                    # 讨贼独立成队，按周期检查；武勋批次不因讨贼插入而中断。
+                    if self.command == "run" and self.bandits_due() and any(t.role == "bandits" for t in policies):
                         self.check_bandits(game,allow_execute=not food_recovery)
                     limited = self.order_limit_reached()
                     # 粮食恢复标记按已读库存重算：低于触发值才置位，达到恢复值就解除。
@@ -322,7 +351,7 @@ class Worker(QThread):
                             if self.command == "run" and not self.dry_run:
                                 self.journal.set_flag("food_recovery", food_recovery)
                     pave_keys = self.pave_team_keys() if self.command == "run" and not self.dry_run else set()
-                    batch_policies = policies if self.command == "scan" or self.dry_run else [t for t in policies if (t.merit or self.journal.pending(t.key)) and t.key not in pave_keys]
+                    batch_policies = policies if self.command == "scan" or self.dry_run else [t for t in policies if (t.role == "merit" or self.journal.pending(t.key)) and t.key not in pave_keys]
                     if not limited:
                         limited = self.process_team_batch(game, batch_policies, food_recovery)
                     if self.command == "run" and not self.dry_run:
@@ -340,7 +369,7 @@ class Worker(QThread):
                     if self.command == "run" and not self.dry_run:
                         # 讨贼专用队的状态读取放在武勋连续派出之后。
                         reserved = self.pave_team_keys()
-                        self.process_team_batch(game, [t for t in policies if t.bandits and not t.merit and t.key not in reserved
+                        self.process_team_batch(game, [t for t in policies if t.role == "bandits" and t.key not in reserved
                             and (self.bandits_enabled_today() or self.journal.pending(t.key) or self.journal.phase(t.key) == "bandits")], food_recovery)
                     if self.command == "run":
                         # 部队先行动；每轮最多一个有界日常流程，不占住沙盘反复签到。
@@ -391,6 +420,13 @@ class Worker(QThread):
                     if device:
                         device.close()
                 finally:
+                    try:
+                        # 手动停止也留一份本次会话的事件摘要，方便和历史会话对比；
+                        # 以前只有命令行入口会写，界面里停止后没有 result.json。
+                        (self.folder / "result.json").write_text(
+                            json.dumps(self.published, ensure_ascii=False, indent=2), encoding="utf-8")
+                    except OSError:
+                        pass
                     try:
                         from .diagnostics import write_session_report
                         write_session_report(self.folder, failure)
@@ -482,6 +518,107 @@ class Worker(QThread):
         self.retry_at[key] = time.time() + delay
         self.retry_reason[key] = str(error)
 
+    def note_progress(self, policy, obs):
+        """记录“这队最近什么时候有变化”，并维护重伤本地倒计时。
+
+        2026-11-04 用户口径：不从角标推断忙碌在做什么（黄色时钟覆盖征兵/占领/铺路），
+        只看“这队多久没动”；到点开一次详情读兵力就够了。重伤例外：读到倒计时后本地倒数。
+        """
+        key = policy.key
+        state = obs.marker_state or obs.state
+        now = time.time()
+        if self.progress_marker.get(key) != state:
+            self.progress_marker[key] = state
+            self.last_progress[key] = now
+        else:
+            self.last_progress.setdefault(key, now)
+        if obs.wounded:
+            if obs.injury_seconds is not None:
+                self.wounded_until[key] = now + int(obs.injury_seconds)
+                self.wounded_probed.pop(key, None)
+        else:
+            self.wounded_until.pop(key, None)
+            self.wounded_probed.pop(key, None)
+
+    def take_recheck(self, key, now, gap):
+        if now - self.last_recheck.get(key, 0.0) < gap:
+            return False
+        self.last_recheck[key] = now
+        return True
+
+    def recheck_due(self, key, marker):
+        """角标不可派、且久未产出 → 到点开一次详情（读兵力；重伤读到点后的倒计时）。
+
+        既不猜“忙碌=征兵/占领/铺路”，也不读征兵剩余时间。
+        """
+        state = (marker or {}).get("state")
+        if not state or state == "unknown" or can_dispatch(state):
+            return False
+        now = time.time()
+        until = self.wounded_until.get(key)
+        if state == "wounded":
+            if until is None:
+                # 刚看到重伤：下一轮立刻读一次倒计时；读不到就 10 分钟再试，不在重伤期间空转。
+                if not self.wounded_probed.get(key):
+                    self.wounded_probed[key] = True
+                    return self.take_recheck(key, now, 30)
+                return self.take_recheck(key, now, 600)
+            return now >= until and self.take_recheck(key, now, 60)
+        if until is not None and now < until:
+            return False
+        last = max(self.last_progress.get(key, 0.0), self.started_at)
+        if now - last < self.RECHECK_SECONDS:
+            return False
+        return self.take_recheck(key, now, self.RECHECK_SECONDS)
+
+    def log_recheck(self, policy, obs):
+        """到点复核后写一行带数字的日志：多久没动、在什么角标、兵力多少。"""
+        minutes = int((time.time() - self.last_progress.get(policy.key, self.started_at)) / 60)
+        label = obs.marker_label or obs.state or "未知"
+        extra = ""
+        if obs.wounded:
+            until = self.wounded_until.get(policy.key)
+            if until:
+                extra = f"，重伤剩余约 {max(0, int(until - time.time()))} 秒"
+        troops = f"兵力 {obs.strength}/{obs.maximum}" if obs.strength is not None else "兵力未读到"
+        when = f"已 {minutes} 分钟没有新动作" if minutes >= 1 else "刚刚变为"
+        self.publish("log", {"time": datetime.now().strftime("%H:%M:%S"), "level": "INFO",
+                             "message": f"{policy.display} {when}（{label}{extra}）；详情：{troops}"})
+
+    def log_once(self, key, message, level="INFO", every=3600):
+        now = time.time()
+        if now - self.wait_log_at.get(key, 0.0) < every:
+            return
+        self.wait_log_at[key] = now
+        self.publish("log", {"time": datetime.now().strftime("%H:%M:%S"), "level": level, "message": message})
+
+    def check_merit(self, game):
+        """每 30 分钟读一次个人信息页武勋；只做展示，失败不影响任何派兵。"""
+        now = time.time()
+        if now < self.next_merit_at:
+            return
+        self.next_merit_at = now + self.MERIT_INTERVAL
+        try:
+            value, text = game.read_merit()
+        except (GameError, RecognitionUnavailable) as exc:
+            self.merit_failures += 1
+            if self.merit_failures <= 2:
+                game.log(f"武勋读数未取到：{exc}；本轮跳过，不影响派兵", "WARN")
+            return
+        self.merit_failures = 0
+        previous = self.merit_prev
+        if self.merit_base is None:
+            self.merit_base = value
+        self.merit_value = value
+        self.merit_prev = value
+        delta = value - self.merit_base
+        step = value - previous if previous is not None else 0
+        # 游戏按“x.x万”显示时读数只能精确到 0.1 万；展示时标“约”，不做跨精度换算。
+        unit = 10000000 if "亿" in text else 1000 if "万" in text else 1
+        self.publish("merit", {"value": value, "text": text, "base": self.merit_base,
+                               "delta": delta, "step": step, "unit": unit})
+        game.log(f"武勋 {text}；本次任务累计 {delta:+d}", "INFO")
+
     def process_team_batch(self, game, policies, food_recovery=False, refresh_stale=True):
         if policies and self.command == "run" and not self.dry_run and getattr(game, "account_checked", None) is False:
             if not game.verify_account():
@@ -496,10 +633,18 @@ class Worker(QThread):
             if not markers:
                 self.publish("diagnostic", {"stage": "marker_batch", "result": "整帧角标不可用，退回逐队读取"})
 
+        forced = set()
+
         def needs_scan(policy):
             if not markers:
                 return True
-            return needs_detail(markers.get(policy.slot), self.journal.pending(policy.key))
+            marker = markers.get(policy.slot)
+            if needs_detail(marker, self.journal.pending(policy.key)):
+                return True
+            if self.recheck_due(policy.key, marker):
+                forced.add(policy.key)
+                return True
+            return False
 
         def read_batch():
             for policy in policies:
@@ -511,10 +656,13 @@ class Worker(QThread):
                                       note="仅按单帧角标判定，未读详情",
                                       marker_state=marker["state"], marker_label=marker["label"],
                                       marker_confidence=marker["confidence"], marker_at=time.time())
+                    self.note_progress(policy, obs)
                     self.publish("observation", obs.__dict__)
                     observations.append((policy, obs))
                     continue
-                observations.append((policy, self.observe_team(game, policy)))
+                obs = self.observe_team(game, policy)
+                self.note_progress(policy, obs)
+                observations.append((policy, obs))
         batch = getattr(game, "team_reading_batch", None)
         if batch is None:
             read_batch()
@@ -529,6 +677,9 @@ class Worker(QThread):
             if self.unreadable_batches == 3:
                 self.publish("diagnostic", {"stage":"team_batch", "unreadable_batches":self.unreadable_batches,
                                             "teams":[p.key for p,_ in observations]})
+        for policy, obs in observations:
+            if policy.key in forced:
+                self.log_recheck(policy, obs)
         plans = [(p,o,self.team_decision(game,p,o,food_recovery)) for p,o in observations]
         def group_key(item):
             decision = item[2]
@@ -544,12 +695,26 @@ class Worker(QThread):
             self.control.checkpoint()
             decision = self.team_decision(game,policy,obs,food_recovery)
             self.publish("decision", {"team":policy.key,"action":decision.action,"reason":decision.reason})
+            # 讨贼队的补兵开关归使用者自己管：不达标就跳过，但一小时最多提醒一次原因。
+            if (policy.role == "bandits" and decision.action == "wait"
+                    and "自动补兵未开启" in decision.reason):
+                self.log_once(policy.key, f"{policy.display} 跳过讨贼：{decision.reason}；"
+                                          f"请在游戏里打开该队主城自动补兵，脚本不改游戏设置",
+                              level="WARN", every=3600)
             if self.command != "run" or self.dry_run or decision.action in ("wait", "bandits"):
                 continue
             failure = None
             try:
                 if decision.action in ("merit", "transfer"):
-                    points = sorted([p for p in (self.profile.targets if decision.action == "merit" else self.profile.backups) if p.enabled and (p.group == policy.target_group if decision.action == "merit" else not policy.backup or p.name == policy.backup)], key=lambda p:p.priority)
+                    if decision.action == "merit":
+                        points = sorted([p for p in self.profile.targets
+                                         if p.enabled and p.group == policy.target_group],
+                                        key=lambda p: p.priority)
+                    else:
+                        order = {name: i for i, name in enumerate(policy.backup_points)}
+                        candidates = [p for p in self.profile.backups if p.enabled
+                                      and (not order or p.name in order)]
+                        points = sorted(candidates, key=lambda p: (order.get(p.name, 10 ** 6), p.priority))
                     for point in points:
                         key = (point.x,point.y,point.name,tuple(point.actions),point.expected_name,decision.action)
                         try:
@@ -557,6 +722,7 @@ class Worker(QThread):
                             previous_target = key
                             failure = None
                             dispatched.add(policy.key)
+                            self.last_progress[policy.key] = time.time()
                             break
                         except NetworkRecovered:
                             raise
@@ -575,7 +741,16 @@ class Worker(QThread):
                                 break
                 elif decision.action == "return":
                     previous_target = None
-                    game.recall(policy,obs)
+                    if obs.location is None:
+                        # 坐标没读到就不点回城：宁可下一轮重读，也不在不确定位置点箭头。
+                        self.log_once(policy.key + ":return",
+                                      f"{policy.display} 兵力已够回城，但队伍坐标未读到；本轮不点回城，等现场重读",
+                                      every=600)
+                    else:
+                        # 自然征满/够兵回城：只要达到本队出击下限即可，不要求满兵。
+                        game.recall(policy, obs, minimum=policy.threshold(obs.maximum) if obs.maximum else None)
+                        dispatched.add(policy.key)
+                        self.last_progress[policy.key] = time.time()
                 if failure is not None:
                     self.defer_team(policy.key, failure)
                 else:
@@ -608,7 +783,7 @@ class Worker(QThread):
         """
         if self.command != "run" or self.dry_run or not plans:
             return
-        if not any(policy.merit for policy, _obs, _planned in plans):
+        if not any(policy.role == "merit" for policy, _obs, _planned in plans):
             return
         labels = {"home": "主城", "outside": "城外停留", "guarding": "驻守", "wounded": "重伤恢复",
                   "marching": "行军", "returning": "返回", "fighting": "战斗", "recruiting": "征兵"}
@@ -616,7 +791,7 @@ class Worker(QThread):
         for policy, obs, planned in plans:
             label = obs.marker_label or labels.get(obs.state, obs.state or "未知")
             states.append(f"{policy.key}={label}")
-            if not policy.merit or policy.key in dispatched or not _can_dispatch(obs):
+            if policy.role != "merit" or policy.key in dispatched or not _can_dispatch(obs):
                 self.idle_rounds.pop(policy.key, None)
                 continue
             rounds = self.idle_rounds.get(policy.key, 0) + 1
@@ -645,7 +820,7 @@ class Worker(QThread):
         """仍有未完成铺路路线的队伍；含 blocked（故障暂停也要保留归属）。"""
         keys = set()
         for route in self.profile.pave_routes:
-            if not route.enabled or not route.points:
+            if not route.team or not route.points:
                 continue
             progress = self.journal.pave_progress(route.name)
             if progress["fingerprint"] and progress["fingerprint"] != self.pave_fingerprint(route):
@@ -712,7 +887,8 @@ class Worker(QThread):
         """每轮最多为每条路线推进一段；订单与进度原子落盘，结果未知不重发。"""
         if self.command != "run" or self.dry_run:
             return
-        routes = [r for r in self.profile.pave_routes if r.enabled and r.points]
+        # 只执行被某支队伍选中的路线；未分配的路线只是草稿，不参与执行。
+        routes = [r for r in self.profile.pave_routes if r.team and r.points]
         if not routes:
             return
         game.reserved_teams = self.pave_team_keys()
@@ -854,7 +1030,7 @@ class Worker(QThread):
         return False
 
     def bandits_enabled_today(self):
-        return bool(self.profile.dailies.get("bandits") and any(t.bandits for t in self.profile.teams)
+        return bool(self.profile.dailies.get("bandits") and any(t.role == "bandits" for t in self.profile.teams)
                     and (self.profile.bandit_allow_assist or self.journal is None or not self.journal.bandits_exhausted()))
 
     def bandits_due(self):
@@ -900,7 +1076,7 @@ class Worker(QThread):
             processed += int(not recurring or result is not False)
             if max_tasks and processed >= max_tasks:
                 break
-        if self.command == "dailies" and daily.get("bandits") and any(t.bandits for t in self.profile.teams):
+        if self.command == "dailies" and daily.get("bandits") and any(t.role == "bandits" for t in self.profile.teams):
             self.check_bandits(game)
         if daily.get("career"):
             self.publish("daily", {"task":"career","result":"职业技能的消耗与入口待校验，本版保留设置但不执行"})

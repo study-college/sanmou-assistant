@@ -77,7 +77,7 @@ def test_active_task_needs_local_cancel_and_complete_timer(vision, tmp_path, mis
     assert state == expected
     obs = Observation("main:2", state=state, strength=33000, maximum=33000,
                       wounded=False, auto_refill=True, stamina=200, supply=100)
-    decision = decide(Profile(), TeamPolicy(slot=2, merit=True), obs, 999999)
+    decision = decide(Profile(), TeamPolicy(slot=2, role="merit"), obs, 999999)
     assert decision.action == "wait"
     if expected == "active":
         assert "任务进行中" in decision.reason
@@ -85,7 +85,7 @@ def test_active_task_needs_local_cancel_and_complete_timer(vision, tmp_path, mis
 
 def test_active_task_does_not_acknowledge_an_unknown_order(tmp_path):
     journal = Journal(tmp_path / "runtime.sqlite", "active-test")
-    policy = TeamPolicy(slot=2, merit=True)
+    policy = TeamPolicy(slot=2, role="merit")
     ident = journal.prepare(policy.key, "merit", "target")
     journal.finish(ident, "uncertain", "result unknown")
     worker = Worker(Profile(), tmp_path / "worker", "scan", True)
@@ -213,7 +213,7 @@ def test_unknown_bandit_result_back_home_after_cooldown_is_rejected_for_retry(tm
     # 冷却时间内仍保留待核对，见 test_worker_batches 的对应用例。
     profile = Profile()
     policy = profile.teams[0]
-    policy.bandits = True
+    policy.role = "bandits"
     j = Journal(tmp_path / "runtime.sqlite", "account")
     ident = j.prepare(policy.key, "bandits", "a past rally")
     j.finish(ident, "uncertain")

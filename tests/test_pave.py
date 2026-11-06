@@ -277,6 +277,15 @@ def test_pave_route_change_resets_progress(tmp_path):
     assert [call[2] for call in pave_calls(game)] == [(500, 200)]
 
 
+def test_unassigned_route_never_enters_pave_batch(tmp_path):
+    """回归：没有人选中的路线只是草稿，不参与铺路，也不拦开始执行。"""
+    profile = make_profile([[571, 243]])
+    profile.pave_routes[0].team = ""
+    worker = make_worker(tmp_path, profile)
+    assert worker.pave_team_keys() == set()
+    assert profile.validate() == []
+
+
 def test_pave_route_validation():
     profile = Profile(account="x", main_city=Point(name="主城", x=1, y=1))
     profile.pave_routes = [PaveRoute(name="A", team="main:9", points=[[1, 2]])]
@@ -288,9 +297,12 @@ def test_pave_route_validation():
     profile.pave_routes = [PaveRoute(name="A", team="main:2", points=[[1, 2]]),
                            PaveRoute(name="A", team="main:3", points=[[3, 4]])]
     assert any("名称重复" in error for error in profile.validate())
-    profile.pave_routes = [PaveRoute(name="A", team="main:2", points=[[1, 2]], enabled=True),
-                           PaveRoute(name="B", team="main:2", points=[[3, 4]], enabled=True)]
-    assert any("多条铺路路线" in error for error in profile.validate())
+    profile.pave_routes = [PaveRoute(name="A", points=[[1, 2]], enabled=True),
+                           PaveRoute(name="B", points=[[3, 4]], enabled=True)]
+    profile.teams[1].role, profile.teams[1].route = "pave", "A"
+    profile.teams[2].role, profile.teams[2].route = "pave", "A"
+    profile.normalize()
+    assert any("同一条铺路路线" in error for error in profile.validate())
 
 
 def test_pave_route_roundtrip_and_labels():
@@ -423,7 +435,7 @@ def test_bandits_skip_teams_reserved_for_pave(tmp_path):
     worker = Worker(profile, tmp_path, command="run", dry_run=False)
     worker.journal = journal
     team = next(t for t in profile.teams if t.key == "main:2")
-    team.bandits, team.merit, team.priority = True, True, "bandits"
+    team.role = "bandits"
     home = Observation("main:2", observed_at=time.time(), state="home", strength=33000,
                        maximum=33000, wounded=False, stamina=200, supply=100,
                        location=(607, 291))

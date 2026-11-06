@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 import os
 import re
@@ -10,10 +11,10 @@ from datetime import datetime
 from pathlib import Path
 
 import cv2
-from PySide6.QtCore import Qt, QTimer, Signal, QItemSelectionModel
-from PySide6.QtGui import QImage, QPixmap, QFont, QDesktopServices, QColor, QBrush
+from PySide6.QtCore import Qt, QTimer, Signal, QItemSelectionModel, QByteArray
+from PySide6.QtGui import QImage, QPixmap, QFont, QDesktopServices, QColor, QBrush, QKeySequence
 from PySide6.QtCore import QUrl
-from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QLabel, QPushButton, QCheckBox, QComboBox, QSpinBox, QLineEdit, QFormLayout, QVBoxLayout, QHBoxLayout, QGridLayout, QStackedWidget, QListWidget, QListWidgetItem, QDialog, QDialogButtonBox, QTableWidget, QTableWidgetItem, QHeaderView, QFrame, QFileDialog, QMessageBox, QPlainTextEdit, QScrollArea, QSplitter, QAbstractItemView)
+from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QLabel, QPushButton, QCheckBox, QComboBox, QSpinBox, QLineEdit, QFormLayout, QVBoxLayout, QHBoxLayout, QGridLayout, QStackedWidget, QListWidget, QListWidgetItem, QDialog, QDialogButtonBox, QTableWidget, QTableWidgetItem, QHeaderView, QFrame, QFileDialog, QMessageBox, QPlainTextEdit, QScrollArea, QSplitter, QAbstractItemView, QMenu, QTabWidget, QRadioButton, QInputDialog)
 
 from . import __version__
 from .models import Profile, Point, TeamPolicy, PaveRoute, pave_label, pave_summary, STATES, ACTION_NAMES, atomic_json, data_directory
@@ -65,12 +66,13 @@ QFrame#sidebar { background:#142238; }
 QLabel#brand { font-size:23px; letter-spacing:2px; }
 QListWidget#nav::item { padding:14px 12px; margin:3px 0; border-radius:8px; }
 QListWidget#nav::item:selected { background:#2a4f80; font-weight:600; }
-QLabel#heading { font-size:24px; color:#16263d; }
+QLabel#heading { font-size:22px; color:#16263d; }
 QLabel#subheading { color:#77859b; font-size:12px; }
+QLabel#sectionTitle { font-size:17px; font-weight:700; color:#17253e; padding-top:8px; }
 QFrame#topBar { background:white; border:1px solid #e6ebf2; border-radius:10px; }
 QLabel#currentStatus { color:#53657e; font-size:12px; }
 QFrame#card { border:1px solid #e5eaf2; border-radius:10px; }
-QLabel#cardValue { font-size:25px; color:#183b65; }
+QLabel#cardValue { font-size:22px; color:#183b65; }
 QLabel#notice { background:#ecf2fc; color:#526c91; font-size:12px; padding:10px 12px; border-radius:7px; }
 QPushButton { padding:8px 14px; border-radius:7px; min-height:18px; }
 QPushButton#primary { background:#3167d5; }
@@ -86,6 +88,20 @@ QPlainTextEdit#diagnosticLog { background:#15243a; color:#d1deef; border:0; font
 QListWidget#recentEvents { border:0; background:transparent; outline:0; font-size:12px; }
 QListWidget#recentEvents::item { padding:3px 0; border-bottom:1px solid #edf1f7; }
 QScrollArea > QWidget > QWidget { background:transparent; }
+QFrame#metric { background:white; border:1px solid #e5eaf2; border-radius:8px; }
+QLabel#metricCap { color:#7d8ca3; font-size:11px; }
+QLabel#metricValue { color:#20497e; font-size:15px; font-weight:700; }
+QTabWidget::pane { border:1px solid #e5eaf2; border-radius:8px; background:white; top:-1px; }
+QTabBar::tab { background:transparent; padding:8px 18px; color:#6c7c92; border:0; }
+QTabBar::tab:selected { color:#1c3f74; font-weight:600; border-bottom:2px solid #3167d5; }
+QTabBar::tab:hover { color:#3167d5; }
+QPushButton#disclosure { background:transparent; border:0; color:#5b7ba8; text-align:left; padding:2px 0; font-size:12px; }
+QPushButton#disclosure:hover { color:#3167d5; }
+QLabel#disclosureBody { color:#74839a; font-size:12px; padding:7px 10px; background:#f6f8fc; border-radius:6px; }
+QPushButton#detailButton { text-align:left; background:transparent; border:0; color:#31547f; padding:4px 8px; }
+QPushButton#detailButton:hover { background:#eaf1fc; border-radius:5px; }
+QPushButton#linkButton { background:transparent; border:0; color:#5b7ba8; padding:2px 0; text-align:left; font-size:12px; }
+QPushButton#linkButton::menu-indicator { image:none; width:0; }
 QToolTip { background:#20314d; color:white; padding:7px; border:0; }
 """
 
@@ -190,7 +206,7 @@ class ActionOrderDialog(QDialog):
         side.addStretch()
         body.addLayout(side)
         layout.addLayout(body, 1)
-        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons = dialog_buttons()
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
@@ -213,6 +229,30 @@ class ActionOrderDialog(QDialog):
         return result
 
 
+class PasteLineEdit(QLineEdit):
+    """粘贴后立即触发识别，省掉再点一次“识别并添加”。"""
+
+    pasted = Signal()
+
+    def keyPressEvent(self, event):
+        if event.matches(QKeySequence.StandardKey.Paste):
+            super().keyPressEvent(event)
+            self.pasted.emit()
+            return
+        super().keyPressEvent(event)
+
+    def contextMenuEvent(self, event):
+        menu = self.createStandardContextMenu()
+        menu.addSeparator()
+        action = menu.addAction("粘贴并识别")
+        action.triggered.connect(self.paste_now)
+        menu.exec(event.globalPos())
+
+    def paste_now(self):
+        self.paste()
+        self.pasted.emit()
+
+
 class PaveRouteDialog(QDialog):
     """铺路路线编辑器：粘贴游戏地址即可生成有序坐标，和地点优先级一样可上下调整。"""
 
@@ -231,12 +271,13 @@ class PaveRouteDialog(QDialog):
             self.add_entry(point)
         layout.addWidget(self.list, 1)
         row = QHBoxLayout()
-        self.paste = QLineEdit()
+        self.paste = PasteLineEdit()
         self.paste.setPlaceholderText("粘贴游戏地址或坐标，例如 空地(571,243)空地(566,240)")
         self.paste.setMaxLength(10000)
         row.addWidget(self.paste, 1)
         row.addWidget(button("识别并添加", self.add_pasted))
         self.paste.returnPressed.connect(self.add_pasted)
+        self.paste.pasted.connect(lambda: QTimer.singleShot(0, self.add_pasted))
         layout.addLayout(row)
         ops = QHBoxLayout()
         for label, callback in (("↑ 上移", lambda: self.move(-1)),
@@ -247,7 +288,7 @@ class PaveRouteDialog(QDialog):
                                 ("清空", self.list.clear)):
             ops.addWidget(button(label, callback))
         layout.addLayout(ops)
-        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons = dialog_buttons()
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
@@ -322,6 +363,90 @@ class PaveRouteDialog(QDialog):
 
     def points(self):
         return [list(self.list.item(i).data(Qt.ItemDataRole.UserRole)) for i in range(self.list.count())]
+
+
+class TeamDetailDialog(QDialog):
+    """单队任务细节：武勋目标组 + 有序补兵点。
+
+    默认收起在“部队任务”的详情按钮里，摘要始终显示在行内，避免功能被藏没。
+    """
+
+    def __init__(self, team, profile, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(f"{team.display} · 任务细节")
+        self.resize(560, 460)
+        layout = QVBoxLayout(self)
+        tip = QLabel("只有刷武勋时使用目标组；补兵点按列表顺序尝试，留空表示使用全部已启用补兵点。")
+        tip.setObjectName("muted")
+        tip.setWordWrap(True)
+        layout.addWidget(tip)
+
+        form = QFormLayout()
+        self.group = QComboBox()
+        self.group.setEditable(True)
+        groups = ["默认"] + sorted({p.group for p in profile.targets if p.group and p.group != "默认"})
+        self.group.addItems(groups)
+        self.group.setCurrentText(team.target_group or "默认")
+        form.addRow("武勋目标组", self.group)
+        layout.addLayout(form)
+
+        layout.addWidget(QLabel("本队补兵点（从上到下）"))
+        self.points = QListWidget()
+        for name in team.backup_points:
+            self.points.addItem(QListWidgetItem(name))
+        layout.addWidget(self.points, 1)
+
+        row = QHBoxLayout()
+        self.choice = QComboBox()
+        self.choice.addItem("选择补兵点…", "")
+        for p in profile.backups:
+            self.choice.addItem(p.name, p.name)
+        row.addWidget(self.choice, 1)
+        row.addWidget(button("添加", self.add_point))
+        row.addWidget(button("删除选中", self.remove_point))
+        row.addWidget(button("↑", lambda: self.move_point(-1)))
+        row.addWidget(button("↓", lambda: self.move_point(1)))
+        layout.addLayout(row)
+        note = QLabel("补兵点在地点列表里增删后，这里的同名条目会随之失效。")
+        note.setObjectName("muted")
+        note.setWordWrap(True)
+        layout.addWidget(note)
+
+        buttons = dialog_buttons()
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def add_point(self):
+        name = self.choice.currentData()
+        if not name:
+            return
+        if any(self.points.item(i).text() == name for i in range(self.points.count())):
+            return
+        self.points.addItem(QListWidgetItem(name))
+
+    def remove_point(self):
+        for row in sorted({i.row() for i in self.points.selectedIndexes()}, reverse=True):
+            self.points.takeItem(row)
+
+    def move_point(self, delta):
+        row = self.points.currentRow()
+        target = row + delta
+        if row < 0 or not 0 <= target < self.points.count():
+            return
+        item_ = self.points.takeItem(row)
+        self.points.insertItem(target, item_)
+        self.points.setCurrentRow(target)
+
+    def values(self):
+        return self.group.currentText().strip() or "默认", [self.points.item(i).text() for i in range(self.points.count())]
+
+
+def dialog_buttons():
+    box = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+    box.button(QDialogButtonBox.StandardButton.Ok).setText("确定")
+    box.button(QDialogButtonBox.StandardButton.Cancel).setText("取消")
+    return box
 
 
 def card(title, description=""):
@@ -411,12 +536,14 @@ class Window(QMainWindow):
             except (ValueError, OSError) as exc:
                 config_error = f"原配置无法读取，已保留原文件：{exc}"
         self.setWindowTitle(f"三谋助手  {__version__}")
-        screen = self.screen()
-        available = screen.availableGeometry() if screen else None
-        width = max(900, available.width()-40) if available else 1440
-        height = max(500, available.height()-60) if available else 960
-        self.resize(min(1440,width), min(960,height))
-        self.setMinimumSize(min(1120,width), min(760,height))
+        # 按当前屏幕可用区域决定初始尺寸：小屏笔记本（1366×768、125%/150% 缩放）也能完整显示。
+        available = self.screen().availableGeometry() if self.screen() else None
+        avail_w = available.width() if available else 1440
+        avail_h = available.height() if available else 940
+        width = min(1680, max(900, avail_w - 56))
+        height = min(1040, max(560, avail_h - 72))
+        self.resize(width, height)
+        self.setMinimumSize(min(900, avail_w), min(520, avail_h))
         self.setStyleSheet(STYLE)
         root = QWidget()
         layout = QHBoxLayout(root)
@@ -437,7 +564,8 @@ class Window(QMainWindow):
         navlayout.addSpacing(30)
         self.nav = QListWidget()
         self.nav.setObjectName("nav")
-        self.nav.addItems(["01   运行总览", "02   部队策略", "03   战场目标", "04   铺路路线", "05   征兵与补粮", "06   签到与日常", "07   连接与配置", "08   日志与诊断"])
+        self.nav.addItems(["01   运行总览", "02   部队任务", "03   目标与铺路", "04   补兵与日常", "05   连接与配置", "06   日志与诊断"])
+        self.log_page_index = 5
         navlayout.addWidget(self.nav)
         foot = QLabel(f"v{__version__}  Windows x64\n每个账号独立控制一个实例")
         foot.setObjectName("brandSub")
@@ -450,8 +578,8 @@ class Window(QMainWindow):
         topbar = QFrame()
         topbar.setObjectName("topBar")
         topbody = QVBoxLayout(topbar)
-        topbody.setContentsMargins(16,12,16,10)
-        topbody.setSpacing(7)
+        topbody.setContentsMargins(16,10,16,8)
+        topbody.setSpacing(5)
         top = QHBoxLayout()
         caption = QLabel("当前配置")
         caption.setObjectName("muted")
@@ -484,10 +612,8 @@ class Window(QMainWindow):
         body.addWidget(self.stack, 1)
         self.make_dashboard()
         self.make_teams()
-        self.make_targets()
-        self.make_pave()
-        self.make_recruitment()
-        self.make_dailies()
+        self.make_targets_pave()
+        self.make_supply_daily()
         self.make_connection()
         self.make_logs()
         bottom = QHBoxLayout()
@@ -506,12 +632,12 @@ class Window(QMainWindow):
         self.live_timer.timeout.connect(self.refresh_live)
         self.live_timer.start()
         if self.profile.main_city:
-            self.metrics["账号与主城"].setText(f"{self.profile.account}\n({self.profile.main_city.x},{self.profile.main_city.y})")
+            self.metrics["账号与主城"].setText(f"{self.profile.account} ({self.profile.main_city.x},{self.profile.main_city.y})")
         if config_error:
             self.status.setText(config_error)
             self.append_log({"time":datetime.now().strftime("%H:%M:%S"),"level":"ERROR","message":config_error})
 
-    def page(self, title, description):
+    def page(self, title, description, scroll=True):
         page = QWidget()
         layout = QVBoxLayout(page)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -524,25 +650,58 @@ class Window(QMainWindow):
         d.setWordWrap(True)
         layout.addWidget(d)
         self.stack.addWidget(page)
+        if scroll:
+            return self.scroll_settings(layout)
         return layout
 
-    def showEvent(self, event):
-        super().showEvent(event)
-        if getattr(self, "live_fit_pending", False):
-            QTimer.singleShot(0, self.fit_live_columns)
+    def page_section(self, layout, title, description=""):
+        h = QLabel(title)
+        h.setObjectName("sectionTitle")
+        layout.addWidget(h)
+        if description:
+            d = QLabel(description)
+            d.setObjectName("muted")
+            d.setWordWrap(True)
+            layout.addWidget(d)
+
+    def collapsible(self, layout, title, text):
+        """渐进式披露：默认只显示一行摘要，点开才看规则细节。"""
+        holder = QWidget()
+        inner = QVBoxLayout(holder)
+        inner.setContentsMargins(0, 0, 0, 0)
+        inner.setSpacing(2)
+        button = QPushButton(f"▸ {title}")
+        button.setObjectName("disclosure")
+        button.setCheckable(True)
+        body = QLabel(text)
+        body.setObjectName("disclosureBody")
+        body.setWordWrap(True)
+        body.setVisible(False)
+        button.toggled.connect(lambda checked: (body.setVisible(checked),
+                                                button.setText(("▾ " if checked else "▸ ") + title)))
+        inner.addWidget(button)
+        inner.addWidget(body)
+        layout.addWidget(holder)
+        return body
 
     def make_dashboard(self):
-        layout = self.page("运行总览", "读取游戏真实状态，显示每一队的下一步和等待原因。停止后，游戏中的任务继续进行。")
-        layout = self.scroll_settings(layout)
+        layout = self.page("运行总览", "读取游戏真实状态，显示每一队的下一步和等待原因。停止后，游戏中的任务继续进行。", scroll=False)
+        layout.setSpacing(8)
         row = QHBoxLayout()
+        row.setSpacing(8)
         self.metrics = {}
-        for name, value in (("游戏连接", "未连接"), ("粮食库存", "待识别"), ("账号与主城", "未校验"), ("本次出征", "0")):
-            f, inner = card(name)
+        for name, value in (("游戏连接", "未连接"), ("粮食库存", "待识别"), ("账号与主城", "未校验"), ("本次出征", "0"), ("本次武勋", "待读取")):
+            chip = QFrame()
+            chip.setObjectName("metric")
+            inner = QHBoxLayout(chip)
+            inner.setContentsMargins(12, 5, 12, 5)
+            inner.setSpacing(8)
+            cap = QLabel(name)
+            cap.setObjectName("metricCap")
+            inner.addWidget(cap)
             label = QLabel(value)
-            label.setObjectName("cardValue")
-            label.setWordWrap(True)
-            if name == "账号与主城":
-                label.setStyleSheet("font-size:17px;font-weight:600;color:#20497e;")
+            label.setObjectName("metricValue")
+            label.setToolTip(value)
             self.metrics[name] = label
             inner.addWidget(label)
             if name == "粮食库存":
@@ -550,9 +709,10 @@ class Window(QMainWindow):
                 self.resource_visible = False
                 self.resource_refresh_pending = False
                 self.resource_freshness = QLabel("尚未读取")
-                self.resource_freshness.setObjectName("muted")
+                self.resource_freshness.setObjectName("metricCap")
                 inner.addWidget(self.resource_freshness)
-            row.addWidget(f)
+            inner.addStretch()
+            row.addWidget(chip)
         layout.addLayout(row)
         controls = QHBoxLayout()
         self.scan_button = button("读取全部队伍", lambda:self.start("scan"))
@@ -565,42 +725,47 @@ class Window(QMainWindow):
         self.last_scan.setObjectName("muted")
         controls.addWidget(self.last_scan)
         layout.addLayout(controls)
-        self.live = table(["队伍 / 阵容", "状态", "兵力", "体力 / 补给", "预备兵池", "下一步 / 等待原因"])
+        self.live = table(["显示", "队伍 / 阵容", "状态", "兵力", "体力 / 补给", "预备兵池", "下一步 / 等待原因"])
         self.live.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         header = self.live.horizontalHeader()
-        # 每列都可以拖动列宽；宽度保存在数据目录，重启后沿用上次的布局。
+        # 除最后一列外都可以拖动；最后一列自动吃掉剩余宽度，窗口放大时不再大片留白。
         header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
-        header.setStretchLastSection(False)
-        header.setMinimumSectionSize(52)
+        header.setStretchLastSection(True)
+        header.setMinimumSectionSize(44)
         header.setDefaultAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         self.live.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-        self.live_columns = (175,105,130,120,165,375)
+        self.live_columns = (52, 175, 105, 130, 120, 165, 375)
         saved = self.saved_widths("live", self.live_columns)
-        for i,w in enumerate(saved or self.live_columns):
-            self.live.setColumnWidth(i,w)
-        self.live_fit_pending = saved is None
+        for i, w in enumerate(saved or self.live_columns):
+            self.live.setColumnWidth(i, w)
+        self.live_fit_pending = False
         self.width_save_timer = QTimer(self)
         self.width_save_timer.setSingleShot(True)
         self.width_save_timer.setInterval(400)
-        self.width_save_timer.timeout.connect(lambda:self.save_widths("live", self.live))
-        header.sectionResized.connect(lambda *a:self.width_save_timer.start())
-        self.live.setMinimumHeight(280)
-        self.live.verticalHeader().setDefaultSectionSize(36)
-        layout.addWidget(self.live, 3)
-        lower = QHBoxLayout()
-        f, inner = card("游戏画面", "最近一次截图；窗口最小化也可更新")
-        f.setMaximumHeight(244)
+        self.width_save_timer.timeout.connect(lambda: self.save_widths("live", self.live))
+        header.sectionResized.connect(lambda *a: self.width_save_timer.start())
+        self.live.setMinimumHeight(140)
+        self.live.verticalHeader().setDefaultSectionSize(34)
+
+        # 上下分区可拖动：队伍表、画面、日志按窗口大小自由分配，不再用固定高度留白。
+        split = QSplitter(Qt.Orientation.Vertical)
+        split.setChildrenCollapsible(False)
+        split.addWidget(self.live)
+
+        lower = QSplitter(Qt.Orientation.Horizontal)
+        lower.setChildrenCollapsible(False)
+        f, inner = card("游戏画面")
+        f.setToolTip("最近一次截图；窗口最小化也可更新")
         self.preview = Preview()
-        self.preview.setMinimumSize(180,100)
-        self.preview.setMaximumHeight(170)
-        inner.addWidget(self.preview,1)
-        lower.addWidget(f, 1)
-        f, inner = card("实时日志", "本次任务的最新进度；重新启动任务时清空显示")
-        f.setMaximumHeight(244)
+        self.preview.setMinimumSize(140, 70)
+        inner.addWidget(self.preview, 1)
+        lower.addWidget(f)
+        f, inner = card("实时日志")
+        f.setToolTip("本次任务的最新进度；重新启动任务时清空显示")
         self.recent_events = QListWidget()
         self.recent_events.setObjectName("recentEvents")
         self.recent_events.setWordWrap(True)
-        self.recent_events.setMinimumHeight(100)
+        self.recent_events.setMinimumHeight(70)
         self.event_history = []
         inner.addWidget(self.recent_events, 1)
         log_actions = QHBoxLayout()
@@ -611,10 +776,26 @@ class Window(QMainWindow):
         self.clear_log_button = button("清空显示", self.clear_logs)
         self.clear_log_button.setToolTip("清空界面日志，磁盘运行记录保留供排查")
         log_actions.addWidget(self.clear_log_button)
-        log_actions.addWidget(button("完整日志 →",lambda:self.nav.setCurrentRow(7)))
+        log_actions.addWidget(button("完整日志 →", lambda: self.nav.setCurrentRow(self.log_page_index)))
         inner.addLayout(log_actions)
-        lower.addWidget(f, 1)
-        layout.addLayout(lower, 2)
+        lower.addWidget(f)
+        lower.setStretchFactor(0, 1)
+        lower.setStretchFactor(1, 1)
+        split.addWidget(lower)
+        split.setStretchFactor(0, 3)
+        split.setStretchFactor(1, 2)
+        layout.addWidget(split, 1)
+        self.dashboard_split = split
+        self.dashboard_lower = lower
+        self.restore_splitter("dashboard", split, [430, 210])
+        self.restore_splitter("dashboard-lower", lower, [560, 460])
+
+        # 隐藏的队伍不参与任何任务，也就不出现在表格里；保留一个恢复入口，避免找不到它们。
+        self.hidden_hint = QPushButton("")
+        self.hidden_hint.setObjectName("linkButton")
+        self.hidden_hint.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.hidden_hint.setVisible(False)
+        layout.addWidget(self.hidden_hint)
 
     def ui_state_path(self):
         return self.data_dir / "ui-state.json"
@@ -660,34 +841,227 @@ class Window(QMainWindow):
             self.append_log({"time":datetime.now().strftime("%H:%M:%S"),"level":"WARN",
                              "message":f"列宽未能保存：{exc}"})
 
-    def make_teams(self):
-        layout = self.page("部队策略", "自由选择刷武勋与讨贼的队伍。最低兵力用于主城出击；城外备用补兵始终等满兵。")
-        layout = self.scroll_settings(layout)
-        notice = QLabel("开启任务前先校验账号与主城。亲卫自动出征暂未启用；讨贼加入与结算仍需实机验收，未知页面会暂停。")
-        notice.setObjectName("notice")
-        notice.setWordWrap(True)
-        layout.addWidget(notice)
-        self.team_table = table(["队伍", "武勋", "讨贼", "兵力方式", "出击下限", "体力", "补给", "目标组", "备用点", "优先任务"])
-        self.team_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
-        self.team_table.verticalHeader().setDefaultSectionSize(46)
-        widths = [95, 44, 44, 96, 100, 65, 65, 75, 90, 90]
-        for i,w in enumerate(widths):
-            self.team_table.setColumnWidth(i,w)
-        self.team_table.horizontalHeader().setStretchLastSection(False)
-        self.team_table.setColumnWidth(9,120)
-        for column in (7,8):
-            self.team_table.horizontalHeader().setSectionResizeMode(column,QHeaderView.ResizeMode.Stretch)
-        f, inner = card("队伍安排", "主城与亲卫分别显示；按每队实际最大兵力计算出击下限")
-        inner.addWidget(self.team_table,1)
-        layout.addWidget(f, 1)
-        note = QLabel("百分比按当前最大兵力向上取整，例如 33000 × 90% = 29700。\n每次派兵核对槽位、兵力和重伤；未知字段显示待识别，不按满兵处理。")
-        note.setObjectName("muted")
-        note.setWordWrap(True)
-        layout.addWidget(note)
+    def load_ui_state(self):
+        try:
+            state = json.loads(self.ui_state_path().read_text(encoding="utf-8"))
+            return state if isinstance(state, dict) else {}
+        except (OSError, ValueError):
+            return {}
 
-    def make_targets(self):
-        layout = self.page("战场目标", "以坐标为准，名称仅作备注。按列表从上到下尝试同组已启用目标；建筑变化不影响定位。")
-        layout = self.scroll_settings(layout)
+    def restore_splitter(self, key, splitter, defaults):
+        """恢复上次拖动过的分区比例；没有记录时按窗口大小给默认值。"""
+        value = self.load_ui_state().get("split-" + key)
+        if isinstance(value, str):
+            try:
+                if splitter.restoreState(QByteArray.fromBase64(value.encode("ascii"))):
+                    splitter.splitterMoved.connect(lambda *_: self.schedule_splitter_save())
+                    return
+            except (ValueError, TypeError):
+                pass
+        splitter.setSizes(defaults)
+        splitter.splitterMoved.connect(lambda *_: self.schedule_splitter_save())
+
+    def schedule_splitter_save(self):
+        if not hasattr(self, "split_save_timer"):
+            self.split_save_timer = QTimer(self)
+            self.split_save_timer.setSingleShot(True)
+            self.split_save_timer.setInterval(500)
+            self.split_save_timer.timeout.connect(self.persist_splitters)
+        self.split_save_timer.start()
+
+    def persist_splitters(self):
+        state = self.load_ui_state()
+        for key, splitter in (("dashboard", getattr(self, "dashboard_split", None)),
+                              ("dashboard-lower", getattr(self, "dashboard_lower", None))):
+            if splitter is not None:
+                state["split-" + key] = bytes(splitter.saveState().toBase64()).decode("ascii")
+        try:
+            atomic_json(self.ui_state_path(), state)
+        except OSError:
+            pass
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self.refresh_live()
+        self.update_hidden_hint()
+
+    def make_teams(self):
+        layout = self.page("部队任务", "每支队伍只做一件事：刷武勋、讨贼或铺路；暂时不用的队伍可以在运行总览里隐藏。", scroll=False)
+        self.team_table = table(["显示", "队伍", "任务", "兵力方式", "出击下限", "体力", "补给", "目标组 / 补兵点"])
+        header = self.team_table.horizontalHeader()
+        header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        header.setStretchLastSection(True)
+        header.setMinimumSectionSize(44)
+        self.team_table.verticalHeader().setDefaultSectionSize(46)
+        for i, w in enumerate((52, 100, 235, 105, 100, 62, 62)):
+            self.team_table.setColumnWidth(i, w)
+        f, inner = card("队伍安排", "点“详情”配置目标组和补兵点顺序；不用的队伍可在运行总览里隐藏")
+        inner.addWidget(self.team_table, 1)
+        layout.addWidget(f, 1)
+        hint = QLabel("选“铺路”时会让你挑一条已建好的路线；路线坐标仍在“目标与铺路 → 铺路路线”里编辑。"
+                      "灰色行是已隐藏的队伍，可在运行总览底部恢复。")
+        hint.setObjectName("muted")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+        self.collapsible(layout, "亲卫与派兵核对",
+                         "亲卫自动出征尚未开放，亲卫队暂不参与任务。百分比按当前最大兵力向上取整，"
+                         "例如 33000 × 90% = 29700。每次派兵核对槽位、兵力和重伤；"
+                         "未知字段显示待识别，不按满兵处理。")
+
+    def team_detail_summary(self, t):
+        if t.role == "pave":
+            return f"路线：{t.route or '未选择'}"
+        parts = [f"组：{t.target_group}"]
+        parts.append(f"补兵点 {len(t.backup_points)} 个" if t.backup_points else "补兵点：自动")
+        return " · ".join(parts)
+
+    def role_cell(self, t, r):
+        holder = QWidget()
+        row = QHBoxLayout(holder)
+        row.setContentsMargins(8, 0, 6, 0)
+        row.setSpacing(10)
+        if t.group != "main":
+            label = QLabel("暂不参与")
+            label.setObjectName("muted")
+            row.addWidget(label)
+            row.addStretch()
+            return holder
+        for role, text in (("merit", "刷武勋"), ("bandits", "讨贼"), ("pave", "铺路")):
+            button = QRadioButton(text)
+            button.setProperty("role", role)
+            button.clicked.connect(lambda checked=False, row=r, role=role: self.team_role_clicked(row, role))
+            row.addWidget(button)
+        row.addStretch()
+        return holder
+
+    def sync_team_row(self, r):
+        t = self.profile.teams[r]
+        box = self.team_table.cellWidget(r, 0)
+        box.blockSignals(True)
+        box.setChecked(t.role != "hidden")
+        box.blockSignals(False)
+        holder = self.team_table.cellWidget(r, 2)
+        for button in holder.findChildren(QRadioButton):
+            role = button.property("role")
+            button.blockSignals(True)
+            button.setChecked(t.role == role)
+            button.setEnabled(t.role != "hidden")
+            button.blockSignals(False)
+        detail = self.team_table.cellWidget(r, 7)
+        detail.setText(self.team_detail_summary(t))
+        detail.setEnabled(t.role in ("merit", "bandits", "pave"))
+        for c in range(self.team_table.columnCount()):
+            cell = self.team_table.item(r, c)
+            if cell:
+                cell.setForeground(QBrush(QColor("#9aa7b8" if t.role == "hidden" else "#27374d")))
+
+    def choose_pave_route(self, r):
+        t = self.profile.teams[r]
+        names = [route.name for route in self.profile.pave_routes if route.name.strip() and route.points]
+        if not names:
+            QMessageBox.information(self, "还没有可用的铺路路线",
+                                    "先在“目标与铺路 → 铺路路线”里创建路线并编辑至少一个坐标，再回来选择。")
+            return None
+        labels, entries = [], []
+        for name in names:
+            owner = next((other for other in self.profile.teams
+                          if other is not t and other.role == "pave" and other.route == name), None)
+            labels.append(f"{name}（已由 {owner.display} 使用）" if owner else name)
+            entries.append((name, owner))
+        current = labels.index(t.route) if t.route in names else 0
+        choice, ok = QInputDialog.getItem(self, "选择铺路路线", "本队执行哪条路线？", labels, current, False)
+        if not ok:
+            return None
+        name, owner = entries[labels.index(choice)]
+        if owner is not None:
+            answer = QMessageBox.question(self, "路线已被占用",
+                                          f"{owner.display} 也在执行这条路线，改由本队执行吗？")
+            if answer != QMessageBox.StandardButton.Yes:
+                return None
+            for index, other in enumerate(self.profile.teams):
+                if other is owner:
+                    other.role, other.route, other.saved_role = "idle", "", ""
+                    self.sync_team_row(index)
+        return name
+
+    def team_role_clicked(self, r, role):
+        t = self.profile.teams[r]
+        if t.role == "hidden":
+            return
+        if role == "pave":
+            name = self.choose_pave_route(r)
+            if name is None:
+                self.sync_team_row(r)
+                return
+            t.route = name
+            self.set_team_role(r, "pave")
+            self.refresh_pave_table()
+        else:
+            self.set_team_role(r, role)
+
+    def set_team_role(self, r, role):
+        t = self.profile.teams[r]
+        if role != t.role:
+            if role == "hidden":
+                t.saved_role = t.role if t.role != "hidden" else t.saved_role
+            else:
+                t.saved_role = ""
+            t.role = role
+            if role != "pave":
+                t.route = ""
+            self.saved_label.setText("队伍任务已修改 · 待保存")
+        self.sync_team_row(r)
+        if role != "pave":
+            self.refresh_pave_table()
+
+    def set_visibility_enabled(self, enabled):
+        for row in range(self.live.rowCount()):
+            box = self.live.cellWidget(row, 0)
+            if isinstance(box, QCheckBox):
+                box.setEnabled(enabled)
+
+    def visible_toggled(self, r, checked):
+        t = self.profile.teams[r]
+        if checked:
+            self.set_team_role(r, t.saved_role or "idle")
+        else:
+            self.set_team_role(r, "hidden")
+        self.refresh_live()
+        self.update_hidden_hint()
+
+    def edit_team_detail(self, r):
+        t = self.profile.teams[r]
+        dialog = TeamDetailDialog(t, self.profile, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        t.target_group, t.backup_points = dialog.values()
+        self.sync_team_row(r)
+        self.saved_label.setText("队伍细节已修改 · 待保存")
+
+    def update_hidden_hint(self):
+        hidden = [t for t in self.profile.teams if t.role == "hidden"]
+        self.hidden_hint.setVisible(bool(hidden))
+        if not hidden:
+            return
+        self.hidden_hint.setText(f"已隐藏 {len(hidden)} 队 · 点此恢复")
+        menu = QMenu(self.hidden_hint)
+        for t in hidden:
+            action = menu.addAction(f"恢复 {t.display}")
+            action.triggered.connect(lambda _=False, team=t: self.restore_team(team.key))
+        self.hidden_hint.setMenu(menu)
+
+    def restore_team(self, key):
+        for r, t in enumerate(self.profile.teams):
+            if t.key == key:
+                self.set_team_role(r, t.saved_role or "idle")
+        self.refresh_live()
+        self.update_hidden_hint()
+
+    def make_targets(self, layout=None, section=True):
+        if layout is None:
+            layout = self.page("战场目标", "以坐标为准，名称仅作备注。按列表从上到下尝试同组已启用目标；建筑变化不影响定位。")
+        elif section:
+            self.page_section(layout, "武勋目标", "按坐标识别，名称只作备注；同一组内从上到下尝试已启用的目标。")
         self.target_table = table(["启用", "名称备注", "X", "Y", "目标组", "指令顺序（点击编辑）", "尝试顺序"])
         self.target_table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         header = self.target_table.horizontalHeader()
@@ -705,23 +1079,25 @@ class Window(QMainWindow):
         row.addWidget(button("复制游戏地址", lambda:self.copy_addresses(self.target_table)))
         row.addStretch()
         layout.addLayout(row)
-        n = QLabel("列表上方优先；同组内先尝试第一个启用目标，指令全部不可用才换下一个目标。可按 Ctrl / Shift 多选后一并移动。\n坐标必须与游戏详情一致；营帐变空地、箭塔或易主后，仍只尝试你允许的指令。新目标默认关闭。")
-        n.setObjectName("notice")
-        n.setWordWrap(True)
-        layout.addWidget(n)
+        self.collapsible(layout, "顺序与坐标核对",
+                         "列表上方优先；同组内先尝试第一个启用目标，指令全部不可用才换下一个目标。"
+                         "可按 Ctrl / Shift 多选后一并移动。坐标必须与游戏详情一致；"
+                         "营帐变空地、箭塔或易主后，仍只尝试你允许的指令。新目标默认关闭。")
 
-    def make_pave(self):
-        layout = self.page("铺路路线", "按坐标顺序逐段攻占；到点停留后继续下一段。目标不相邻时游戏会自动铺路，脚本只负责核对与提交。")
-        layout = self.scroll_settings(layout)
-        f, inner = card("铺路路线", "每队一条路线；列表顺序就是推进顺序，部队到达并停留后才派下一段")
-        self.pave_table = table(["启用", "路线名称", "队伍", "路线（按顺序）", "段数", "编辑"])
+    def make_pave(self, layout=None, section=True):
+        if layout is None:
+            layout = self.page("铺路路线", "按坐标顺序逐段攻占；到点停留后继续下一段。目标不相邻时游戏会自动铺路，脚本只负责核对与提交。")
+        elif section:
+            self.page_section(layout, "铺路路线", "先在这里建好路线，再到“部队任务”把路线分配给一支主城队伍。")
+        f, inner = card("铺路路线", "这里建路线、编辑坐标；由哪支队执行，在“部队任务”里选")
+        self.pave_table = table(["路线名称", "执行队伍", "路线（按顺序）", "段数", "编辑"])
         self.pave_table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         header = self.pave_table.horizontalHeader()
         header.setStretchLastSection(False)
-        for column, width in ((0, 55), (1, 150), (2, 80), (4, 55), (5, 105)):
+        for column, width in ((0, 170), (1, 120), (3, 55), (4, 120)):
             header.setSectionResizeMode(column, QHeaderView.ResizeMode.Interactive)
             self.pave_table.setColumnWidth(column, width)
-        header.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
         self.pave_table.setMinimumHeight(230)
         inner.addWidget(self.pave_table)
         row = QHBoxLayout()
@@ -730,38 +1106,63 @@ class Window(QMainWindow):
         row.addWidget(button("重置铺路进度", lambda: self.start("pave-reset")))
         row.addStretch()
         inner.addLayout(row)
-        tip = QLabel("点“编辑路线”粘贴游戏地址（空地(571,243)空地(566,240)）或坐标（571,243; 566,240），"
-                     "再像地点优先级一样上移/下移/置顶/置底调整顺序。\n"
-                     "已完成段数会保存；队伍停在任意位置（主城或城外）都会恢复当前段继续铺。\n"
-                     "到点判定只看角标状态（停留），途中遇敌/战斗会暂停推进、等现场恢复。")
-        tip.setObjectName("notice")
-        tip.setWordWrap(True)
-        inner.addWidget(tip)
+        self.collapsible(inner, "路线规则与恢复",
+                         "点“编辑路线”可直接粘贴游戏地址或坐标，再上移/下移调整顺序。"
+                         "已完成段数会保存；队伍停在任意位置都会恢复当前段继续铺。"
+                         "到点判定只看角标状态（停留），途中遇敌或战斗会暂停推进、等现场恢复。")
         layout.addWidget(f)
 
     def add_pave_route(self):
-        names = {self.pave_table.item(r, 1).text() for r in range(self.pave_table.rowCount())
-                 if self.pave_table.item(r, 1)}
+        names = {self.pave_table.item(r, 0).text() for r in range(self.pave_table.rowCount())
+                 if self.pave_table.item(r, 0)}
         number = self.pave_table.rowCount() + 1
         while f"铺路 {number}" in names:
             number += 1
         self.insert_pave_route(PaveRoute(name=f"铺路 {number}", points=[]))
+        self.sync_routes_from_table()
+        self.saved_label.setText("已添加铺路路线 · 到“部队任务”里选给一支队伍后才会执行")
 
     def insert_pave_route(self, route):
         t = self.pave_table
         r = t.rowCount()
         t.insertRow(r)
         t.setRowHeight(r, 44)
-        cell_check(t, r, 0, route.enabled)
-        item(t, r, 1, route.name)
-        t.setCellWidget(r, 2, combo([(f"{i} 队", f"main:{i}") for i in range(1, 6)], route.team))
-        item(t, r, 3, pave_summary(route.points) if route.points else "（尚未添加坐标）", False)
-        item(t, r, 4, str(len(route.points)), False)
+        owner = next((team for team in self.profile.teams if team.role == "pave" and team.route == route.name), None)
+        item(t, r, 0, route.name)
+        item(t, r, 1, owner.display if owner else "未分配", False)
+        item(t, r, 2, pave_summary(route.points) if route.points else "（尚未添加坐标）", False)
+        item(t, r, 3, str(len(route.points)), False)
         editor = QPushButton("编辑路线 ✎")
         editor._points = [list(p) for p in route.points]
         editor.setToolTip("粘贴游戏地址、调整顺序、删除坐标点")
         editor.clicked.connect(lambda _, b=editor: self.edit_pave_route(b))
-        t.setCellWidget(r, 5, editor)
+        t.setCellWidget(r, 4, editor)
+
+    def sync_routes_from_table(self):
+        """把路线表写回配置；归属仍由队伍任务决定，路线自身只保存执行队伍。"""
+        old = {route.name: route for route in self.profile.pave_routes}
+        routes = []
+        for r in range(self.pave_table.rowCount()):
+            route = self.read_pave_route(r)
+            if route.name in old:
+                route.resume_after_return = old[route.name].resume_after_return
+                route.replenish = old[route.name].replenish
+            routes.append(route)
+        self.profile.pave_routes = routes
+        self.profile.normalize()
+        names = {route.name for route in routes}
+        cleared = [team for team in self.profile.teams
+                   if team.role == "pave" and team.route and team.route not in names]
+        for team in cleared:
+            team.role, team.route = "idle", ""
+        if cleared:
+            self.saved_label.setText("路线已删除或改名，相关队伍已改为空闲 · 待保存")
+
+    def refresh_pave_table(self):
+        self.sync_routes_from_table()
+        self.pave_table.setRowCount(0)
+        for route in self.profile.pave_routes:
+            self.insert_pave_route(route)
 
     def edit_pave_route(self, b):
         dialog = PaveRouteDialog(b._points, self, getattr(b, "_options", {}))
@@ -774,10 +1175,11 @@ class Window(QMainWindow):
         b._points = points
         b._options = dialog.options()
         for r in range(self.pave_table.rowCount()):
-            if self.pave_table.cellWidget(r, 5) is b:
-                item(self.pave_table, r, 3, pave_summary(points), False)
-                item(self.pave_table, r, 4, str(len(points)), False)
+            if self.pave_table.cellWidget(r, 4) is b:
+                item(self.pave_table, r, 2, pave_summary(points), False)
+                item(self.pave_table, r, 3, str(len(points)), False)
                 break
+        self.sync_routes_from_table()
         self.saved_label.setText("铺路路线已修改 · 待保存")
 
     def remove_pave_row(self):
@@ -786,18 +1188,21 @@ class Window(QMainWindow):
             return
         for r in sorted({i.row() for i in t.selectedIndexes()}, reverse=True):
             t.removeRow(r)
+        self.sync_routes_from_table()
+        self.refresh_pave_table()
 
     def read_pave_route(self, r):
         t = self.pave_table
-        name = (t.item(r, 1).text() if t.item(r, 1) else "").strip()
-        team = t.cellWidget(r, 2).currentData()
-        editor = t.cellWidget(r, 5)
+        name = (t.item(r, 0).text() if t.item(r, 0) else "").strip()
+        editor = t.cellWidget(r, 4)
         points = [list(p) for p in (editor._points if editor else [])]
-        return PaveRoute(name=name, team=team, points=points, enabled=t.cellWidget(r, 0).isChecked(), **getattr(editor, "_options", {}))
+        return PaveRoute(name=name, points=points, **getattr(editor, "_options", {}))
 
-    def make_recruitment(self):
-        layout = self.page("征兵与补粮", "主城自动补兵不足时使用备用地点。不会把预计主城预备兵加进城外兵力提前撤回。")
-        layout = self.scroll_settings(layout)
+    def make_recruitment(self, layout=None, section=True):
+        if layout is None:
+            layout = self.page("征兵与补粮", "主城自动补兵不足时使用备用地点。不会把预计主城预备兵加进城外兵力提前撤回。")
+        elif section:
+            self.page_section(layout, "补兵与粮食", "主城补不满时去备用点征满再回城；粮食低于触发值才屯田。")
         f, inner = card("备用征兵地点", "同队未指定备用点时，按列表从上到下尝试已启用地点")
         self.backup_enabled = QCheckBox("启用城外备用补兵：普通征满 → 回主城")
         self.backup_enabled.setChecked(self.profile.backup_enabled)
@@ -819,21 +1224,18 @@ class Window(QMainWindow):
         row.addWidget(button("删除选中地点", lambda:self.remove_row(self.backup_table)))
         row.addWidget(button("复制游戏地址", lambda:self.copy_addresses(self.backup_table)))
         inner.addLayout(row)
-        tip = QLabel("已为队伍指定备用点时优先遵守该设置。补兵点仍校验实际名称和调动菜单，确保能进驻征兵。")
-        tip.setObjectName("muted")
-        tip.setWordWrap(True)
-        inner.addWidget(tip)
+        self.collapsible(inner, "备用补兵规则",
+                         "队伍在“部队任务”里指定了补兵点顺序时优先遵守；没有指定就按这里的顺序尝试。"
+                         "补兵点仍会校验实际名称和调动菜单，确保能进驻征兵。")
         layout.addWidget(f)
-        f, inner = card("游戏隐藏显示", "游戏右下角小眼睛：眼睛=元素可见，带斜杠=隐藏已开启。勾选后每次开始任务前确保它是开启状态（带斜杠），全程保持。")
+        f, inner = card("游戏隐藏显示", "开始任务前确保游戏内隐藏已开启（小眼睛带斜杠），全程保持。")
         self.hide_before_run = QCheckBox("开始任务前打开游戏隐藏显示（小眼睛斜杠）")
         self.hide_before_run.setChecked(self.profile.hide_before_run)
         inner.addWidget(self.hide_before_run)
-        tip = QLabel("为什么打开：地图上没有部队模型、名字和建筑名，点坐标不会误选到别的队伍，也更快。任务结束不恢复。")
-        tip.setObjectName("muted")
-        tip.setWordWrap(True)
-        inner.addWidget(tip)
+        self.collapsible(inner, "为什么要打开隐藏显示",
+                         "地图上没有部队模型、名字和建筑名，点坐标不会误选到别的队伍，也更快。任务结束不恢复。")
         layout.addWidget(f)
-        f, inner = card("低粮补给", "低于触发库存进入补粮流程，达到恢复库存才恢复出击；每个 7 时刷新周期限制屯田次数。")
+        f, inner = card("低粮补给", "低于触发库存开始屯田，回到恢复库存才恢复出击。")
         self.food_enabled = QCheckBox("粮食不足时自动屯田补粮")
         self.food_enabled.setChecked(self.profile.food_enabled)
         inner.addWidget(self.food_enabled)
@@ -845,10 +1247,13 @@ class Window(QMainWindow):
         form.addRow("恢复库存",self.food_recover)
         form.addRow("本周期屯田上限",self.food_budget)
         inner.addLayout(form)
-        self.farm_position = QLabel("通过城务进入本人城内，在领土→开垦列表自动查找农田，定位后核对粮食收益和次数；无需填写地址或标定农田位置。")
+        self.farm_position = QLabel("屯田由脚本从城务进入城内自动定位，无需填写地址或标定农田位置。")
         self.farm_position.setWordWrap(True)
         self.farm_position.setObjectName("muted")
         inner.addWidget(self.farm_position)
+        self.collapsible(inner, "屯田怎么核对",
+                         "在领土→开垦列表自动查找同一行当前农田类型和主城内链接，"
+                         "定位后核对粮食收益和实际次数，次数不足时暂停新屯田。")
         layout.addWidget(f)
         self.rates = QPlainTextEdit()
         self.rates.setReadOnly(True)
@@ -859,9 +1264,11 @@ class Window(QMainWindow):
         inner.addWidget(button("读取征兵速度", lambda:self.start("rates")))
         layout.addWidget(f)
 
-    def make_dailies(self):
-        layout = self.page("签到与日常", "按账号记录每日完成状态；签到、月卡和寻访当天完成后，重启也不重复执行。")
-        layout = self.scroll_settings(layout)
+    def make_dailies(self, layout=None, section=True):
+        if layout is None:
+            layout = self.page("签到与日常", "按账号记录每日完成状态；签到、月卡和寻访当天完成后，重启也不重复执行。")
+        elif section:
+            self.page_section(layout, "每日任务", "当天完成过的任务不会重复执行；讨贼按队伍任务自动参与。")
         self.daily_checks = {}
         self.daily_results = {}
         f, inner = card("日常清单", "勾选需要执行的任务，下方显示任务说明或本次结果")
@@ -898,9 +1305,42 @@ class Window(QMainWindow):
         layout.addLayout(row)
         layout.addStretch()
 
+    def tab_layout(self, scroll=False):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(14, 12, 14, 12)
+        layout.setSpacing(8)
+        if not scroll:
+            return page, layout
+        area = QScrollArea()
+        area.setWidgetResizable(True)
+        area.setWidget(page)
+        return area, layout
+
+    def make_targets_pave(self):
+        layout = self.page("目标与铺路", "武勋目标按坐标和组选择；铺路路线按顺序逐段推进，到点停留后再派下一段。", scroll=False)
+        tabs = QTabWidget()
+        page, inner = self.tab_layout()
+        self.make_targets(inner, section=False)
+        tabs.addTab(page, "武勋目标")
+        page, inner = self.tab_layout()
+        self.make_pave(inner, section=False)
+        tabs.addTab(page, "铺路路线")
+        layout.addWidget(tabs, 1)
+
+    def make_supply_daily(self):
+        layout = self.page("补兵与日常", "备用补兵、低粮屯田和每日固定任务。所有操作先核对现场，不替游戏改设置。", scroll=False)
+        tabs = QTabWidget()
+        page, inner = self.tab_layout(scroll=True)
+        self.make_recruitment(inner, section=False)
+        tabs.addTab(page, "补兵与粮食")
+        page, inner = self.tab_layout(scroll=True)
+        self.make_dailies(inner, section=False)
+        tabs.addTab(page, "每日任务")
+        layout.addWidget(tabs, 1)
+
     def make_connection(self):
         layout = self.page("连接与配置", "切换电脑或账号时重新发现实例、校验主城。队伍与目标配置可以导入导出。")
-        layout = self.scroll_settings(layout)
         f, inner = card("MuMu 连接")
         form = QFormLayout()
         self.cli_path = QLineEdit(self.profile.cli_path)
@@ -925,23 +1365,26 @@ class Window(QMainWindow):
         row.addWidget(button("校验账号与主城",lambda:self.start("calibrate"),True))
         inner.addLayout(row)
         mainrow = QHBoxLayout()
-        self.main_address = QLineEdit(self.point_address(self.profile.main_city))
-        self.main_address.setPlaceholderText("粘贴本人主城地址：主公名字(X,Y)")
+        self.main_address = PasteLineEdit(self.point_address(self.profile.main_city))
+        self.main_address.setPlaceholderText("粘贴本人主城地址：主公名字(X,Y)；粘贴后自动应用")
         mainrow.addWidget(self.main_address, 1)
         mainrow.addWidget(button("应用主城地址", self.apply_main_address))
         mainrow.addWidget(button("复制主城地址", self.copy_main_address))
         self.main_address.returnPressed.connect(self.apply_main_address)
+        self.main_address.pasted.connect(lambda: QTimer.singleShot(0, self.apply_main_address))
         inner.addLayout(mainrow)
         self.account_label = QLabel("尚未校验" if not self.profile.main_city else f"{self.profile.account} · 主城 ({self.profile.main_city.x},{self.profile.main_city.y})")
         self.account_label.setObjectName("muted")
         inner.addWidget(self.account_label)
-        note = QLabel("首次使用：①选择 MuMu 安装目录内 nx_main/mumu-cli.exe；②自动发现实例，按名称和编号选中自己的游戏；"
-                      "③手动启动该实例并登录游戏，点击“发现游戏包名”；④校验账号与主城；⑤先监控，再开启任务。\n"
-                      "推荐 Windows 10/11 x64 + MuMu 5（本机基准见使用说明），横屏 1920×1080、简体中文；"
-                      "运行时可最小化 MuMu。切换账号请新建配置并重新校验。")
+        note = QLabel("首次使用：选 mumu-cli.exe → 发现实例 → 启动游戏 → 发现包名 → 校验账号与主城。")
         note.setObjectName("muted")
         note.setWordWrap(True)
         inner.addWidget(note)
+        self.collapsible(inner, "首次使用与运行环境",
+                         "选择 MuMu 安装目录内 nx_main/mumu-cli.exe；自动发现实例，按名称和编号选中自己的游戏；"
+                         "手动启动实例并登录游戏，点“发现游戏包名”；校验账号与主城；先监控，再开启任务。"
+                         "推荐 Windows 10/11 x64 + MuMu 5，横屏 1920×1080、简体中文；运行时可最小化 MuMu。"
+                         "切换账号请新建配置并重新校验。")
         layout.addWidget(f)
         f, inner = card("配置迁移与画面标定", "导出不包含本机安装路径。支持横屏 16:9；输入坐标按实际分辨率缩放。")
         row = QHBoxLayout()
@@ -963,7 +1406,7 @@ class Window(QMainWindow):
         layout.addWidget(f,1)
 
     def make_logs(self):
-        layout = self.page("日志与诊断", "本次运行的完整过程与异常统一在这里查看，包含顶部进度记录。保留最近 2000 条，原始记录仍在会话目录。")
+        layout = self.page("日志与诊断", "本次运行的完整过程与异常统一在这里查看，包含顶部进度记录。保留最近 2000 条，原始记录仍在会话目录。", scroll=False)
         row = QHBoxLayout()
         self.log_level = combo([("全部级别",""),("警告与错误","attention"),("仅错误","ERROR"),("仅信息","INFO")])
         self.log_level.currentIndexChanged.connect(self.refresh_logs)
@@ -996,23 +1439,28 @@ class Window(QMainWindow):
         layout.addWidget(self.log_view,1)
         self.log_lines = []
         self.log_records = []
-        note = QLabel("出征结果未确认时不再锁队等待人工核对：本轮停在该队，下一轮读取现场仍可出击就自动重派。"
-                      "“重新核对主城命令”只用于清理异常退出后残留的在途记录；暂停和停止不撤军。")
-        note.setObjectName("notice")
-        note.setWordWrap(True)
-        layout.addWidget(note)
+        self.collapsible(layout, "未确认出征怎么处理",
+                     "出征结果未确认时不锁队等待人工核对：本轮停在该队，下一轮读取现场仍可出击就自动重派。"
+                     "“重新核对主城命令”只用于清理异常退出后残留的在途记录；暂停和停止不撤军。")
 
     def fill_tables(self):
+        self.team_table.setRowCount(0)
+        self.live.setRowCount(0)
         self.observations.clear()
         self.decisions.clear()
         self.team_activity.clear()
         self.metrics["本次出征"].setText("0")
+        self.metrics["本次武勋"].setText("待读取")
+        self.metrics["本次武勋"].setToolTip("每 30 分钟读一次个人信息页的武勋；只作展示，不影响派兵。")
         self.team_table.setRowCount(len(self.profile.teams))
         self.live.setRowCount(len(self.profile.teams))
         for r,t in enumerate(self.profile.teams):
-            item(self.team_table,r,0,t.display)
-            cell_check(self.team_table,r,1,t.merit)
-            cell_check(self.team_table,r,2,t.bandits)
+            visible = QCheckBox()
+            visible.setToolTip("取消勾选 = 这支队伍不参与任何任务，也不会被读取")
+            visible.toggled.connect(lambda checked, row=r: self.visible_toggled(row, checked))
+            self.team_table.setCellWidget(r,0,visible)
+            item(self.team_table,r,1,t.display,False)
+            self.team_table.setCellWidget(r,2,self.role_cell(t, r))
             mode = combo([("百分比 %","percent"),("固定兵力","absolute")],t.min_mode)
             self.team_table.setCellWidget(r,3,mode)
             minimum = spin(t.minimum,1,100 if t.min_mode=="percent" else 1000000)
@@ -1023,11 +1471,20 @@ class Window(QMainWindow):
                 widget = spin(value,0,maximum)
                 widget.setButtonSymbols(QSpinBox.ButtonSymbols.NoButtons)
                 self.team_table.setCellWidget(r,column,widget)
-            item(self.team_table,r,7,t.target_group)
-            item(self.team_table,r,8,t.backup)
-            self.team_table.setCellWidget(r,9,combo([("武勋优先","merit"),("讨贼优先","bandits")],t.priority))
+            detail = QPushButton("详情")
+            detail.setObjectName("detailButton")
+            detail.setToolTip("配置该队的目标组和补兵点顺序")
+            detail.clicked.connect(lambda _, row=r: self.edit_team_detail(row))
+            self.team_table.setCellWidget(r,7,detail)
+            self.sync_team_row(r)
             for c,val in enumerate((t.display,"待识别","—","—","—","尚未读取")):
-                item(self.live,r,c,val,False)
+                item(self.live,r,c+1,val,False)
+            check = QCheckBox()
+            check.setToolTip("取消勾选 = 这支队伍不参与任何任务")
+            check.setChecked(t.role != "hidden")
+            check.toggled.connect(lambda checked, row=r: self.visible_toggled(row, checked))
+            self.live.setCellWidget(r,0,check)
+        self.refresh_live()
         for t,points in ((self.target_table,self.profile.targets),(self.backup_table,self.profile.backups)):
             t.setRowCount(0)
             for p in sorted(points, key=lambda p:p.priority):
@@ -1035,6 +1492,7 @@ class Window(QMainWindow):
         self.pave_table.setRowCount(0)
         for route in self.profile.pave_routes:
             self.insert_pave_route(route)
+        self.update_hidden_hint()
 
     def insert_point(self,t,p):
         r = t.rowCount()
@@ -1163,12 +1621,13 @@ class Window(QMainWindow):
 
     def shared_address_row(self, layout, target):
         row = QHBoxLayout()
-        editor = QLineEdit()
-        editor.setPlaceholderText("粘贴游戏地址，可连续多个：城池(100,200)营帐(120,210)")
+        editor = PasteLineEdit()
+        editor.setPlaceholderText("粘贴游戏地址，可连续多个：城池(100,200)营帐(120,210)；粘贴后自动识别")
         editor.setMaxLength(10000)
         row.addWidget(editor, 1)
         row.addWidget(button("识别并添加", lambda:self.add_shared_points(target)))
         editor.returnPressed.connect(lambda:self.add_shared_points(target))
+        editor.pasted.connect(lambda: QTimer.singleShot(0, lambda: self.add_shared_points(target)))
         layout.addLayout(row)
         tip = QLabel("支持连续、分行或中文括号。新增地点默认关闭，勾选后生效；相同坐标保留已有设置。")
         tip.setObjectName("muted")
@@ -1232,7 +1691,7 @@ class Window(QMainWindow):
             self.profile.main_city = Point(name=account, x=address.x, y=address.y, expected_name=account)
             self.main_address.setText(self.point_address(self.profile.main_city))
             self.account_label.setText(f"{account} · 主城 ({address.x},{address.y})")
-            self.metrics["账号与主城"].setText(f"{account}\n({address.x},{address.y})")
+            self.metrics["账号与主城"].setText(f"{account} ({address.x},{address.y})")
             self.status.setText("主城地址已填入，保存后生效；出征时仍核对现场归属")
             return True
         except ValueError as exc:
@@ -1260,7 +1719,7 @@ class Window(QMainWindow):
         for target, editor in ((self.target_table,self.target_address),(self.backup_table,self.backup_address)):
             if editor.text().strip():
                 self.add_shared_points(target, strict=True)
-        p = Profile.from_dict(self.profile.to_dict())
+        p = copy.deepcopy(self.profile)
         if self.main_address.text().strip():
             address = single_address(self.main_address.text())
             account = address.name or p.account
@@ -1282,17 +1741,20 @@ class Window(QMainWindow):
         p.bandit_interval = self.bandit_interval.value()
         p.bandit_allow_assist = self.bandit_allow_assist.isChecked()
         for r,t in enumerate(p.teams):
-            t.label = self.team_table.item(r,0).text().strip()
-            t.merit, t.bandits = self.team_table.cellWidget(r,1).isChecked(), self.team_table.cellWidget(r,2).isChecked()
-            t.min_mode, t.minimum = self.team_table.cellWidget(r,3).currentData(), self.team_table.cellWidget(r,4).value()
+            t.label = self.team_table.item(r,1).text().strip()
+            t.min_mode = self.team_table.cellWidget(r,3).currentData()
+            t.minimum = self.team_table.cellWidget(r,4).value()
             t.stamina, t.supply = self.team_table.cellWidget(r,5).value(), self.team_table.cellWidget(r,6).value()
-            t.target_group, t.backup = self.team_table.item(r,7).text().strip(), self.team_table.item(r,8).text().strip()
-            t.priority = self.team_table.cellWidget(r,9).currentData()
+            current = self.profile.teams[r]
+            t.role, t.saved_role = current.role, current.saved_role
+            t.route = current.route if t.role == "pave" else ""
+            t.target_group, t.backup_points = current.target_group, list(current.backup_points)
         p.targets, p.backups = [], []
         for table_, points in ((self.target_table,p.targets),(self.backup_table,p.backups)):
             for r in range(table_.rowCount()):
                 points.append(self.read_point(table_,r))
         p.pave_routes = [self.read_pave_route(r) for r in range(self.pave_table.rowCount())]
+        p.normalize()
         return p
 
     def save(self):
@@ -1350,13 +1812,15 @@ class Window(QMainWindow):
         self.monitor_button.setEnabled(False)
         self.save_button.setEnabled(False)
         self.profile_name.setEnabled(False)
-        for page in range(1,7):
+        for page in range(1, max(1, self.stack.count() - 1)):
             self.stack.widget(page).setEnabled(False)
+        self.set_visibility_enabled(False)
         if command in ("run", "scan"):
             self.observations.clear()
             self.decisions.clear()
             self.team_activity.clear()
             self.metrics["本次出征"].setText("0")
+            self.metrics["本次武勋"].setText("待读取")
             self.last_scan.setText("正在读取本次状态")
             self.refresh_live()
         self.run_state.setText("● 执行中" if command == "run" else "● 读取中" if command == "scan" else "● 处理中")
@@ -1396,8 +1860,9 @@ class Window(QMainWindow):
         self.monitor_button.setEnabled(True)
         self.save_button.setEnabled(True)
         self.profile_name.setEnabled(True)
-        for page in range(1,7):
+        for page in range(1, max(1, self.stack.count() - 1)):
             self.stack.widget(page).setEnabled(True)
+        self.set_visibility_enabled(True)
         self.run_state.setText("● 待启动")
         self.run_state.setStyleSheet("color:#79869a; font-weight:600;")
         if self.manager:
@@ -1477,6 +1942,23 @@ class Window(QMainWindow):
             self.refresh_live()
             team_name = next((p.display for p in self.profile.teams if p.key == value['team']),value['team'])
             self.append_log({"time":datetime.now().strftime("%H:%M:%S"),"level":"INFO", "message":f"{team_name} · {value.get('action','出征')} → {value['target']} 已确认"})
+        elif kind == "merit":
+            # 只作展示：当前武勋 + 本次任务累计。读数单位是“万”时标“约”。
+            unit = int(value.get("unit", 1)) or 1
+            delta = int(value.get("delta", 0))
+            current = int(value.get("value", 0))
+            if unit > 1:
+                text = f"{current/unit:.1f} 万（约 {delta/unit:+.1f}）"
+                log_delta = f"约 {delta/unit:+.1f} 万"
+            else:
+                text = f"{current}（{delta:+d}）"
+                log_delta = f"{delta:+d}"
+            self.metrics["本次武勋"].setText(text)
+            self.metrics["本次武勋"].setToolTip(
+                f"当前武勋 {value.get('text','')}；本次任务开始时 {value.get('base',0)}。"
+                "每 30 分钟读一次个人信息页，只作展示，不参与派兵。")
+            self.append_log({"time":datetime.now().strftime("%H:%M:%S"),"level":"INFO",
+                             "message":f"武勋 {value.get('text','')} · 本次累计 {log_delta}"})
         elif kind == "team_action":
             self.team_activity[value["team"]] = value
             self.refresh_live()
@@ -1502,6 +1984,15 @@ class Window(QMainWindow):
     def refresh_live(self):
         self.refresh_resource_age()
         for r,t in enumerate(self.profile.teams):
+            hidden = t.role == "hidden"
+            self.live.setRowHidden(r, hidden)
+            check = self.live.cellWidget(r, 0)
+            if isinstance(check, QCheckBox):
+                check.blockSignals(True)
+                check.setChecked(not hidden)
+                check.blockSignals(False)
+            if hidden:
+                continue
             obs = self.observations.get(t.key, {})
             activity = self.team_activity.get(t.key)
             state = activity["state"] if activity else obs.get("state", "unknown")
@@ -1518,14 +2009,14 @@ class Window(QMainWindow):
             shown = display_label(obs.get("marker_label"), state, labels)
             values = [f"{t.display} · {obs['identity']}" if obs.get("identity") else t.display, shown, f"{obs['strength']}/{obs['maximum']}" if obs.get("strength") is not None else "待识别", f"{obs.get('stamina') if obs.get('stamina') is not None else '—'} / {obs.get('supply') if obs.get('supply') is not None else '—'}", f"{obs.get('pool','未知')} {obs['reserve']}/{obs['capacity']}" if obs.get("reserve") is not None else obs.get("pool","未知"), reason]
             for c,val in enumerate(values):
-                item(self.live,r,c,val,False)
-                self.live.item(r,c).setToolTip(str(val))
+                item(self.live,r,c+1,val,False)
+                self.live.item(r,c+1).setToolTip(str(val))
             color = "#b87422" if state in ("unknown","wounded","retrying") else "#2f6bbb" if state in ("marching","returning","confirming","return_confirming") else "#248565"
-            self.live.item(r,1).setForeground(QBrush(QColor(color)))
+            self.live.item(r,2).setForeground(QBrush(QColor(color)))
             if obs.get("observed_at"):
                 age = max(0,round(time.time()-obs["observed_at"]))
-                for c in (2,3,4):
-                    self.live.item(r,c).setToolTip(f"{values[c]}\n数值读取于 {datetime.fromtimestamp(obs['observed_at']):%H:%M:%S}，约 {age} 秒前")
+                for c in (3,4,5):
+                    self.live.item(r,c).setToolTip(f"{values[c-1]}\n数值读取于 {datetime.fromtimestamp(obs['observed_at']):%H:%M:%S}，约 {age} 秒前")
 
     def refresh_resource_age(self):
         if self.resource_refresh_pending:
@@ -1700,7 +2191,7 @@ class AddAccountDialog(QDialog):
         self.copy_settings.setChecked(True)
         layout.addLayout(form)
         layout.addWidget(self.copy_settings)
-        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons = dialog_buttons()
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
@@ -1716,12 +2207,13 @@ class AccountManagerWindow(QMainWindow):
         self.closing = False
         self.windows = []
         self.setWindowTitle(f"三谋助手  {__version__}")
-        screen = self.screen()
-        available = screen.availableGeometry() if screen else None
-        width = max(900, available.width()-40) if available else 1440
-        height = max(500, available.height()-60) if available else 960
-        self.resize(min(1440, width), min(960, height))
-        self.setMinimumSize(min(1120, width), min(820, height))
+        available = self.screen().availableGeometry() if self.screen() else None
+        avail_w = available.width() if available else 1440
+        avail_h = available.height() if available else 940
+        width = min(1680, max(940, avail_w - 48))
+        height = min(1040, max(580, avail_h - 64))
+        self.resize(width, height)
+        self.setMinimumSize(min(940, avail_w), min(580, avail_h))
         self.setStyleSheet(STYLE)
         root = QWidget()
         root.setObjectName("content")
@@ -1760,7 +2252,7 @@ class AccountManagerWindow(QMainWindow):
 
     def _append_account(self, account):
         window = Window(self.data_dir, account=account, manager=self)
-        window.setMinimumSize(900, 500)
+        window.setMinimumSize(880, 480)
         self.windows.append(window)
         self.account_stack.addWidget(window)
         self.account_combo.addItem(account.name, account.id)

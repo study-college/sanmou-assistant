@@ -81,7 +81,7 @@ def joiner(tmp_path):
         return game
 
     policy = profile.teams[4]
-    policy.bandits = True
+    policy.role = "bandits"
     obs = Observation(policy.key, state="home", strength=33000, maximum=33000,
                       stamina=200, supply=100, wounded=False, auto_refill=True)
     rally = {"text": "20级贼寇 神兵丨东风神 集结中..00:14:53", "join": (1290, 375)}

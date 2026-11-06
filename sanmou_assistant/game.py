@@ -26,6 +26,18 @@ def _vcall(vision, name, default, *args):
     return default if method is None else method(*args)
 
 
+def stays_at_backup(phase, home, coord, city):
+    """自然征兵的队伍只在确认回到主城坐标后，才解除“城外征满”阶段。
+
+    2026-11-04 实机：涪县征兵时角标读到“空闲”，LEGACY_STATE 把空闲一律当 home，
+    程序据此清了 backup 阶段并从征兵点直接拉线。这里以发兵记录为准：
+    只要没确认回到主城，就按城外处理（交给 decide 走“够兵→回城”）。
+    """
+    if phase != "backup" or home:
+        return False
+    return city is None or coord != city
+
+
 class GameError(RuntimeError):
     pass
 
@@ -416,6 +428,9 @@ class Game:
                 self.close_panel(image)
             elif page == "overview":
                 self.close_panel(image)
+            elif page == "profile":
+                # 个人信息页只用于读武勋；用左上返回箭头退出，不点其他功能入口。
+                self.close_panel(image)
             elif page == "deployment":
                 self.emit("status", "返回沙盘 · 关闭出征选择页")
                 self.close_panel(image)
@@ -748,8 +763,6 @@ class Game:
                     obs.state, obs.location = state, coord
             if obs.state == "unknown" or obs.strength is None and obs.state not in ("marching", "returning", "active"):
                 self.save_image(overview, f"{policy.key}-state-unconfirmed", True)
-            if self.j.phase(policy.key) == "backup" and state in ("outside", "unknown") and coord and any((b.x, b.y) == coord for b in self.p.backups):
-                obs.state = "outside"
         # 单帧角标是当前状态的最高优先级证据：同帧读出五头像右下的真实状态。
         # 认不出（unknown）时保留旧流程结果，不猜；主城分支仍以详情页的重伤/兵力为准。
         if marker:
@@ -759,6 +772,14 @@ class Game:
             obs.marker_at = time.time()
             if marker["state"] != "unknown" and not home:
                 obs.state = LEGACY_STATE.get(marker["state"], obs.state)
+        # 自然征兵的队伍只能从主城出发。2026-11-04 实机：涪县征兵期间角标读到“空闲”，
+        # LEGACY_STATE 把空闲一律当 home，程序据此清了 backup 阶段并从征兵点直接拉线。
+        # 这里以发兵记录为准：没确认回到主城坐标就按城外处理，交给 decide() 走“够兵→回城”。
+        city = (self.p.main_city.x, self.p.main_city.y) if self.p.main_city else None
+        phase = self.j.phase(policy.key) if self.j is not None else ""
+        if stays_at_backup(phase, home, coord, city):
+            obs.state = "outside"
+            obs.location = coord
         # 批量详情保留各队实际读取时间；地图状态使用本次定位时间，均不从旧日志恢复。
         obs.observed_at = detail_observed_at if detail_observed_at is not None else time.time()
         self.emit("observation", asdict(obs))
@@ -911,6 +932,38 @@ class Game:
         names = sorted([t for t in heroes if 510 < t.y < 554 and re.match(r"\d+", t.text)], key=lambda t:t.x)
         obs.identity = "/".join(re.sub(r"^[\d\s]+", "", t.text) for t in names)
         return obs
+
+    def read_merit(self):
+        """点头像进个人信息页读“武勋”累计值；只读、不点其他入口，读完回沙盘。
+
+        用户 2026-11-04：这个数只放总览给使用者看“这轮挂机刷了多少”，不参与派兵；
+        读不到就跳过本轮，绝不重试成环或改点旧坐标。
+        """
+        image = self.ensure_sandbox()
+        if self.v.page(image) != "sandbox":
+            raise GameError("未确认沙盘，不打开个人信息页")
+        self.d.tap(75, 70, 1.2)
+        image = self.capture_clear("profile-open", True)
+        page = self.v.page(image)
+        if page != "profile":
+            self.save_image(image, "profile-unconfirmed", True)
+            try:
+                self.ensure_sandbox()
+            except GameError:
+                pass
+            raise RecognitionUnavailable(f"个人信息页未确认（{page}），本轮不读武勋")
+        value, text = _vcall(self.v, "profile_merit", (None, ""), image)
+        self.save_image(image, "profile-merit", False)
+        back = self.v.navigation_back_point(image, require_title=False)
+        if not back:
+            self.save_image(image, "profile-back-unconfirmed", True)
+            raise RecognitionUnavailable("个人信息页返回箭头未确认，等待重读")
+        self.d.tap(back["x"], back["y"], .8)
+        if self.v.page(self.capture()) != "sandbox":
+            self.ensure_sandbox()
+        if value is None:
+            raise RecognitionUnavailable("个人信息页武勋数值未识别")
+        return value, text
 
     def go_to(self, point: Point):
         image = self.ensure_sandbox()
@@ -1305,9 +1358,15 @@ class Game:
                                "state": "marching", "action": "攻占"})
         return reason
 
-    def recall(self, policy: TeamPolicy, obs: Observation, manual=False):
-        if obs.strength is None or obs.maximum is None or obs.maximum <= 0 or (not manual and obs.strength != obs.maximum) or obs.wounded is not False or obs.state not in (("outside", "recruiting", "guarding") if manual else ("outside", "recruiting")):
-            raise GameError("备用征兵尚未满兵或状态不明，不回城")
+    def recall(self, policy: TeamPolicy, obs: Observation, manual=False, minimum=None):
+        # 用户 2026-11-04：自然征兵只要兵力达到本队出击下限就回城，不要求征到满兵；
+        # 未指定 minimum 时仍按满兵（保持手动/旧调用语义）。
+        need = obs.maximum if minimum is None else minimum
+        if (obs.strength is None or obs.maximum is None or obs.maximum <= 0
+                or (not manual and need is not None and obs.strength < need)
+                or obs.wounded is not False
+                or obs.state not in (("outside", "recruiting", "guarding") if manual else ("outside", "recruiting"))):
+            raise GameError("备用征兵尚未达到回城兵力或状态不明，不回城")
         if not self.account_checked and not self.verify_account():
             raise GameError("回城前账号未核对，不提交")
         y = (245, 383, 520, 660, 785)[policy.slot-1]
@@ -1497,7 +1556,7 @@ class Game:
         for policy in self.p.teams:
             if policy.key in reserved:
                 continue
-            if not policy.bandits or policy.group != "main" or policy.merit and policy.priority == "merit":
+            if policy.role != "bandits" or policy.group != "main":
                 continue
             if self.j.pending(policy.key) or self.j.failure_streak(policy.key) >= 3:
                 continue

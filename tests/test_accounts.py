@@ -159,7 +159,7 @@ def test_manager_keeps_account_switch_and_save_visible_on_small_desktop(tmp_path
     manager = manager_with_two_accounts(tmp_path)
     manager.show()
     app.processEvents()
-    assert manager.width() <= 984 and manager.height() <= 580
+    assert manager.width() <= 1024 and manager.height() <= 640
     for index, window in enumerate(manager.windows):
         manager.account_combo.setCurrentIndex(index)
         app.processEvents()

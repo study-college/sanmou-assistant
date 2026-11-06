@@ -61,12 +61,20 @@ def test_main_portraits_verifies_actual_first_page_without_blind_repeated_swipes
     assert len(inputs) == swipes
 
 
+def _sample(root, rel):
+    """实机样本按 7 天滚动淘汰；文件已过期时跳过，而不是让整包测试报红。"""
+    path = root / rel
+    if not path.is_file():
+        pytest.skip(f"实机样本已按截图策略淘汰：{rel}")
+    return cv2.imdecode(np.fromfile(path, dtype=np.uint8), cv2.IMREAD_COLOR)
+
+
 def test_today_real_dotted_pager_and_unknown_page_remain_readable():
     root = Path(__file__).resolve().parents[1]
     v = Vision()
-    for path in [root/'artifacts/audit-2026-10-18/pager-dots-real.png',
-                 root/'data/sessions/20261018-171050/173231_645678-unknown-page.png']:
-        image = cv2.imdecode(np.fromfile(path, dtype=np.uint8), cv2.IMREAD_COLOR)
+    for rel in ('artifacts/audit-2026-10-18/pager-dots-real.png',
+                'data/sessions/20261018-171050/173231_645678-unknown-page.png'):
+        image = _sample(root, rel)
         assert image is not None
         assert v.portrait_page(image) == 1
         assert v.page(image) == 'sandbox'
@@ -75,7 +83,7 @@ def test_today_real_dotted_pager_and_unknown_page_remain_readable():
 def test_real_second_page_pager_moves_with_shorter_portrait_list():
     root = Path(__file__).resolve().parents[1]
     v = Vision()
-    image = cv2.imdecode(np.fromfile(root/'artifacts/audit-2026-10-18/second-page-real.png',dtype=np.uint8),cv2.IMREAD_COLOR)
+    image = _sample(root, 'artifacts/audit-2026-10-18/second-page-real.png')
     assert v.portrait_page(image) == 2
     assert v.page(image) == 'sandbox'
     # 第2页页码抹去后不能从三张头像、军力条或地图名字猜2。
@@ -86,7 +94,7 @@ def test_real_second_page_pager_moves_with_shorter_portrait_list():
 def test_real_stationary_merit_team_is_not_marching_because_of_tile_menu(tmp_path):
     root = Path(__file__).resolve().parents[1]
     v = Vision()
-    image = cv2.imdecode(np.fromfile(root/'data/sessions/20261018-112345/152357_016680-main_1-located.png',dtype=np.uint8),cv2.IMREAD_COLOR)
+    image = _sample(root, 'data/sessions/20261018-112345/152357_016680-main_1-located.png')
     policy = TeamPolicy(slot=1)
     game = Game(None,v,Profile(),SimpleNamespace(phase=lambda _: 'merit'),tmp_path,lambda *a: None)
     assert v.stationary_return_visible(image,1)

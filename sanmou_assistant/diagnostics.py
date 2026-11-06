@@ -49,12 +49,31 @@ def read_events(path: Path):
     return records
 
 
+def all_events(path: Path):
+    """流式读取整份事件文件；长会话的计数不能只算尾部 2000 行。"""
+    if not path.is_file():
+        return
+    with path.open("rb") as stream:
+        for raw in stream:
+            try:
+                yield json.loads(raw.decode("utf-8", errors="replace"))
+            except ValueError:
+                continue
+
+
+def event_counts(path: Path):
+    counts = Counter()
+    for record in all_events(path):
+        counts[record.get("event")] += 1
+    return counts
+
+
 def write_session_report(folder: Path, error=""):
     records = read_events(folder / "events.jsonl")
     attention = [r for r in records if r.get("event") in ("error", "diagnostic") or
                  (r.get("event") == "log" and r.get("value", {}).get("level") in ("WARN", "ERROR"))]
     summary = {"environment": environment(), "error": error,
-               "session": folder.name, "event_counts": dict(Counter(r.get("event") for r in records)),
+               "session": folder.name, "event_counts": dict(event_counts(folder / "events.jsonl")),
                "attention": attention[-40:], "last_events": records[-20:]}
     (folder / "diagnosis.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
     body = html.escape(json.dumps(summary, ensure_ascii=False, indent=2))

@@ -51,7 +51,7 @@ def test_team_standing_on_target_keeps_the_configured_action_order():
     p = Profile(account="测试", main_city=Point(x=100, y=200),
                 targets=[Point(name="山道", x=636, y=286, actions=["attack", "guard", "occupy", "march"])])
     t = p.teams[0]
-    t.merit = True
+    t.role = "merit"
     obs = Observation(t.key, state="outside", strength=33000, maximum=33000, stamina=100, supply=100,
                       wounded=False, location=(636, 286), marker_state="stationary")
     # 站在目标格上照样要下指令，而且候选动作就是配置里那一串，不能被改写成“驻守/行军”。

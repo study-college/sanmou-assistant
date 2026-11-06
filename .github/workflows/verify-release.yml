@@ -6,7 +6,7 @@ on:
       tag:
         description: Release tag to download and verify
         required: true
-        default: v0.8.3
+        default: v0.9.0
         type: string
 
 permissions:

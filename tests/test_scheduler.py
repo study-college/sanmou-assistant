@@ -10,7 +10,7 @@ from sanmou_assistant.models import Observation, Point, Profile, TeamPolicy, dec
 def ready():
     p = Profile(account="测试", main_city=Point(x=100,y=200),targets=[Point(name="战场",x=120,y=200)])
     t = p.teams[0]
-    t.merit = True
+    t.role = "merit"
     o = Observation(t.key,state="home",strength=33000,maximum=33000,stamina=80,supply=100,wounded=False,auto_refill=True)
     return p,t,o
 
@@ -36,15 +36,18 @@ def test_unknown_auxiliary_reading_does_not_block_dispatch(ready,field):
     assert decide(p,t,o,1000000).action == "merit"
 
 
-def test_backup_waits_for_full_without_predicted_pool(ready):
+def test_backup_returns_once_threshold_reached(ready):
+    """2026-11-04：自然征兵只要够出击下限就回城，不要求征到满兵。"""
     p,t,o = ready
     p.backup_enabled = True
     p.backups = [Point(name="营帐",x=80,y=200)]
     o.strength = 20000
     o.reserve = 100000
     assert decide(p,t,o,1000000).action == "transfer"
-    o.state, o.strength = "recruiting",32999
+    o.state, o.strength = "recruiting", 29699
     assert decide(p,t,o,1000000,"backup").action == "wait"
+    o.strength = 29700
+    assert decide(p,t,o,1000000,"backup").action == "return"
     o.strength = 33000
     assert decide(p,t,o,1000000,"backup").action == "return"
     assert decide(p,t,o,1000000,"").action == "wait"
@@ -109,16 +112,21 @@ def test_profile_migration_and_validation(ready):
     with pytest.raises(ValueError):
         Profile.from_dict(bad)
     assert "已" not in " ".join(Profile().validate())
-    restored.teams[5].merit = True
+    restored.teams[5].role = "merit"
     assert any("亲卫" in e for e in restored.validate(active=True))
 
 
 def test_bandit_policy_uses_its_own_real_strength_limits(ready):
     p,t,o = ready
-    t.merit,t.bandits = False,True
+    t.role = "bandits"
     assert decide(p,t,o,1000000).action == "bandits"
     o.strength = 26342
     assert bandit_decision(p,t,o,1000000).action == "wait"
+    # 2026-11-04：游戏内自动补兵没开时，理由要写清楚，脚本不替用户改设置。
+    o.auto_refill = False
+    assert "自动补兵未开启" in bandit_decision(p,t,o,1000000).reason
+    o.auto_refill = True
+    assert "自动补兵未开启" not in bandit_decision(p,t,o,1000000).reason
     t.min_mode,t.minimum = "absolute",26000
     assert bandit_decision(p,t,o,1000000).action == "bandits"
     o.wounded = None
@@ -153,7 +161,7 @@ def test_marker_state_decides_whether_a_team_can_be_dispatched(ready):
 
 def test_bandit_dispatch_accepts_outside_and_building_stays(ready):
     p,t,o = ready
-    t.merit,t.bandits = False,True
+    t.role = "bandits"
     o.state = "outside"
     o.marker_state = "stationary"
     assert bandit_decision(p,t,o,1000000).action == "bandits"

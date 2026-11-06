@@ -82,7 +82,7 @@ def test_startup_other_device_login_saves_evidence_and_stops_without_orders(tmp_
 def batch(tmp_path):
     profile = Profile(account="测试",main_city=Point(x=100,y=200),targets=[Point(name="战场",x=120,y=200)])
     for team in profile.teams[:3]:
-        team.merit = True
+        team.role = "merit"
     worker = Worker(profile,tmp_path,"run",False)
     worker.journal = Journal(tmp_path/"runtime.sqlite","test")
     game = FakeGame(worker)
@@ -339,7 +339,7 @@ def test_exhausted_bandits_skip_navigation_until_cycle_changes_or_assist_enabled
     from sanmou_assistant.journal import cycle_key
     worker, game, _ = batch
     worker.profile.dailies['bandits'] = True
-    worker.profile.teams[4].bandits = True
+    worker.profile.teams[4].role = "bandits"
     worker.journal.observe_bandit_availability('assist', 0, cycle_key('bandits'))
     game.bandits = lambda *a: pytest.fail('次数归零后不再打开讨贼列表')
     assert not worker.bandits_due()
@@ -428,7 +428,7 @@ def test_food_recovery_prevents_whole_battle_batch(batch):
 def test_bandit_check_closes_window_and_uses_independent_interval(batch,monkeypatch,failure):
     worker,game,teams = batch
     worker.profile.dailies["bandits"] = True
-    worker.profile.teams[4].bandits = True
+    worker.profile.teams[4].role = "bandits"
     worker.profile.bandit_interval = 180
     def bandits(commit):
         game.calls.append(("bandits",commit))
@@ -455,7 +455,7 @@ def test_bandit_check_closes_window_and_uses_independent_interval(batch,monkeypa
 def test_stop_during_bandit_check_does_not_issue_cleanup_click(batch):
     worker,game,teams = batch
     worker.profile.dailies['bandits'] = True
-    worker.profile.teams[4].bandits = True
+    worker.profile.teams[4].role = "bandits"
     def bandits(commit):
         worker.stop()
         raise Stopped()
@@ -494,8 +494,8 @@ def test_stop_after_first_submission_prevents_the_second(batch):
 def test_run_coexists_with_periodic_bandits_without_interrupting_battle_batch(tmp_path,monkeypatch):
     profile = Profile(account="测试",main_city=Point(x=100,y=200),targets=[Point(name="战场",x=120,y=200)])
     for policy in profile.teams[:3]:
-        policy.merit = True
-    profile.teams[4].bandits = True
+        policy.role = "merit"
+    profile.teams[4].role = "bandits"
     profile.dailies = {"bandits":True}
     worker = Worker(profile,tmp_path,"run",False)
     game = FakeGame(worker)
@@ -558,7 +558,8 @@ def test_reused_target_requires_current_coordinate_and_name(actual,expected):
         assert calls == [(120,200)]
 
 
-def test_backup_cycle_survives_restart_and_waits_for_full_before_return(batch,monkeypatch):
+def test_backup_cycle_survives_restart_and_returns_at_threshold(batch,monkeypatch):
+    """2026-11-04：自然征兵够出击下限就回城；回主城后才允许再拉线刷武勋。"""
     worker,game,teams = batch
     team = teams[1]
     clock = [1000.0]
@@ -570,7 +571,7 @@ def test_backup_cycle_survives_restart_and_waits_for_full_before_return(batch,mo
         dispatch(policy,obs,point,kind,reuse_target)
         worker.journal.set_phase(policy.key,'backup' if kind == 'transfer' else 'merit')
     game.dispatch = accepted_dispatch
-    def recall(policy,obs):
+    def recall(policy,obs,manual=False,minimum=None):
         game.calls.append(('return',policy.key))
         ident = worker.journal.prepare(policy.key,'return','主城')
         worker.journal.finish(ident,'accepted')
@@ -587,10 +588,12 @@ def test_backup_cycle_survives_restart_and_waits_for_full_before_return(batch,mo
     worker.journal.close()
     worker.journal = Journal(__import__('pathlib').Path(db),'test')
     observe('marching',location=(85,185))
-    observe('recruiting',32566,reserve=100000,location=(80,180))
+    # 低于 90% 出击下限 29,700：继续在征兵点等，不回城也不许从征兵点拉线。
+    observe('recruiting',29699,reserve=100000,location=(80,180))
     assert not any(c[0] == 'return' for c in game.calls)
     assert worker.orders == 1
-    observe('outside',33000,location=(80,180))
+    # 达到下限即回城，不要求征到 33,000 满兵。
+    observe('outside',29700,location=(80,180))
     assert worker.journal.phase(team.key) == 'returning'
     assert sum(c[0] == 'return' for c in game.calls) == 1
     observe('returning',location=(90,190))
@@ -642,7 +645,7 @@ def test_bandits_uncertain_order_at_home_is_rejected_after_cooldown(tmp_path):
     worker.journal = Journal(tmp_path/"runtime.sqlite", "test")
     game = FakeGame(worker)
     policy = profile.teams[4]
-    policy.bandits = True
+    policy.role = "bandits"
     ident = worker.journal.prepare("main:5", "bandits", "20级贼寇")
     worker.journal.finish(ident, "uncertain")
     worker.observe_team(game, policy)

@@ -21,7 +21,7 @@ from sanmou_assistant.worker import Worker
 
 def _game(tmp_path):
     profile = Profile(account="测试", main_city=Point(x=100, y=200))
-    profile.teams[0].merit = True
+    profile.teams[0].role = "merit"
     journal = Journal(tmp_path / "runtime.sqlite", "scope")
     return Game(None, SimpleNamespace(), profile, journal, tmp_path, lambda *a: None), profile, journal
 
@@ -141,7 +141,7 @@ def test_unconfirmed_cooldown_never_exceeds_one_minute(tmp_path):
 def test_self_check_releases_a_dispatchable_team_after_two_idle_rounds(tmp_path):
     worker = Worker(Profile(), tmp_path)
     worker.command, worker.dry_run = "run", False
-    worker.profile.teams[0].merit = True
+    worker.profile.teams[0].role = "merit"
     events, logs = [], []
     worker.publish = lambda kind, value: events.append((kind, value))
     game = SimpleNamespace(log=lambda message, level="INFO": logs.append((level, message)))
@@ -162,7 +162,7 @@ def test_self_check_releases_a_dispatchable_team_after_two_idle_rounds(tmp_path)
 def test_self_check_does_not_warn_for_a_team_that_did_dispatch(tmp_path):
     worker = Worker(Profile(), tmp_path)
     worker.command, worker.dry_run = "run", False
-    worker.profile.teams[0].merit = True
+    worker.profile.teams[0].role = "merit"
     events = []
     worker.publish = lambda kind, value: events.append((kind, value))
     game = SimpleNamespace(log=lambda *a, **k: events.append(("game-log", a)))
@@ -177,7 +177,7 @@ def test_self_check_does_not_warn_for_a_team_that_did_dispatch(tmp_path):
 def test_self_check_ignores_busy_teams(tmp_path):
     worker = Worker(Profile(), tmp_path)
     worker.command, worker.dry_run = "run", False
-    worker.profile.teams[0].merit = True
+    worker.profile.teams[0].role = "merit"
     events = []
     worker.publish = lambda kind, value: events.append((kind, value))
     game = SimpleNamespace(log=lambda *a, **k: events.append(("game-log", a)))

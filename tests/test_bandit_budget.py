@@ -11,7 +11,7 @@ from sanmou_assistant.models import Observation, Profile
 def bandits(tmp_path):
     profile = Profile()
     policy = profile.teams[4]
-    policy.bandits = True
+    policy.role = "bandits"
     quota = ['reward', 1]
     calls = []
     rally = {'text':'20级贼寇', 'join':[1290,375]}

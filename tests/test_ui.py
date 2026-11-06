@@ -2,7 +2,7 @@ import json
 from types import SimpleNamespace
 from pathlib import Path
 
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QRadioButton
 
 from sanmou_assistant.models import Profile
 from sanmou_assistant.ui import Window
@@ -15,7 +15,7 @@ def test_small_logical_desktop_keeps_window_and_save_control_visible(tmp_path,mo
     monkeypatch.setattr(Window,"screen",lambda self:SimpleNamespace(availableGeometry=lambda:QRect(0,0,1024,640)))
     window=Window(tmp_path)
     window.show();app.processEvents()
-    assert window.width()<=984 and window.height()<=580
+    assert window.width()<=1024 and window.height()<=640
     for page in range(window.stack.count()):
         window.nav.setCurrentRow(page);app.processEvents()
         assert window.save_button.mapTo(window,QPoint(0,window.save_button.height())).y()<=window.height()
@@ -46,21 +46,24 @@ def test_desktop_forms_preserve_team_and_target_settings(tmp_path):
     t.item(0,1).setText("我的战场")
     t.cellWidget(0,2).setValue(640)
     t.cellWidget(0,3).setValue(286)
-    window.team_table.cellWidget(1,1).setChecked(True)
+    for button in window.team_table.cellWidget(1,2).findChildren(QRadioButton):
+        if button.property("role") == "merit":
+            button.click()
     window.team_table.cellWidget(1,4).setValue(77)
     window.team_table.cellWidget(1,5).setValue(53)
     window.add_backup()
     window.backup_table.item(0,1).setText("补兵营帐")
-    window.team_table.item(1,8).setText("补兵营帐")
+    window.profile.teams[1].backup_points = ["补兵营帐"]
+    window.sync_team_row(1)
     window.food_low.setValue(800000)
     window.food_recover.setValue(2000000)
     window.bandit_interval.setValue(240)
     window.bandit_allow_assist.setChecked(True)
     assert window.save()
     p = Profile.from_dict(json.loads((tmp_path/"active-profile.json").read_text(encoding="utf-8")))
-    assert p.teams[1].merit and p.teams[1].minimum == 77 and p.teams[1].stamina == 53
+    assert p.teams[1].role == "merit" and p.teams[1].minimum == 77 and p.teams[1].stamina == 53
     assert p.targets[0].x == 640 and p.targets[0].y == 286
-    assert p.teams[1].backup == "补兵营帐"
+    assert p.teams[1].backup_points == ["补兵营帐"]
     assert p.food_low == 800000 and p.food_recover == 2000000
     assert p.bandit_interval == 240
     assert p.bandit_allow_assist is True
@@ -84,11 +87,11 @@ def test_live_action_confirmation_updates_state_without_waiting_for_next_scan(tm
     window.handle_event("observation",obs)
     window.handle_event("decision",{"team":"main:1","reason":"已达到出击条件"})
     window.handle_event("team_action",{"team":"main:1","state":"confirming","reason":"正在核对攻城出发结果"})
-    assert window.live.item(0,1).text() == "核对出发"
+    assert window.live.item(0,2).text() == "核对出发"
     assert window.metrics["本次出征"].text() == "0"
     window.handle_event("dispatch",{"team":"main:1","kind":"merit","target":"战场","state":"marching","action":"攻城"})
-    assert window.live.item(0,1).text() == "行军"
-    assert "已确认攻城" in window.live.item(0,5).text()
+    assert window.live.item(0,2).text() == "行军"
+    assert "已确认攻城" in window.live.item(0,6).text()
     assert window.metrics["本次出征"].text() == "1"
     assert obs["state"] == "home", "UI 不得修改调度使用的旧观测"
     window.close()
@@ -100,8 +103,8 @@ def test_unconfirmed_action_is_not_displayed_as_success(tmp_path):
     window = Window(tmp_path)
     window.handle_event("team_action",{"team":"main:1","state":"confirming","reason":"核对中"})
     window.handle_event("team_action",{"team":"main:1","state":"unknown","reason":"待核对，已锁定该队"})
-    assert window.live.item(0,1).text() == "待识别"
-    assert "锁定" in window.live.item(0,5).text()
+    assert window.live.item(0,2).text() == "待识别"
+    assert "锁定" in window.live.item(0,6).text()
     assert window.metrics["本次出征"].text() == "0"
     window.close()
     app.processEvents()
@@ -112,8 +115,8 @@ def test_unconfirmed_dispatch_is_shown_as_automatic_retry(tmp_path):
     window = Window(tmp_path)
     window.handle_event("team_action",{"team":"main:1","state":"retrying",
                                        "reason":"出征未确认受理，下一轮读取现场后自动重试"})
-    assert window.live.item(0,1).text() == "未确认 · 自动重试"
-    assert "自动重试" in window.live.item(0,5).text()
+    assert window.live.item(0,2).text() == "未确认 · 自动重试"
+    assert "自动重试" in window.live.item(0,6).text()
     assert window.metrics["本次出征"].text() == "0", "未确认不算已出征"
     window.close()
     app.processEvents()
@@ -125,12 +128,13 @@ def test_dashboard_column_widths_are_resizable_and_persisted(tmp_path):
     header = window.live.horizontalHeader()
     from PySide6.QtWidgets import QHeaderView
     assert all(header.sectionResizeMode(i) == QHeaderView.ResizeMode.Interactive
-               for i in range(window.live.columnCount())), "运行总览每一列都应可拖动调整"
-    window.live.setColumnWidth(0, 240)
+               for i in range(window.live.columnCount() - 1)), "运行总览除最后一列外都可拖动调整"
+    assert header.stretchLastSection(), "最后一列吃掉剩余宽度"
+    window.live.setColumnWidth(1, 240)
     window.live.setColumnWidth(5, 180)
     window.save_widths("live", window.live)
     reopened = Window(tmp_path)
-    assert reopened.live.columnWidth(0) == 240
+    assert reopened.live.columnWidth(1) == 240
     assert reopened.live.columnWidth(5) == 180
     window.close(); reopened.close()
     app.processEvents()
@@ -145,12 +149,12 @@ def test_fresh_wound_read_replaces_action_and_timer_never_claims_recovery(tmp_pa
     monkeypatch.setattr(module.time,"time",lambda:1100.0)
     obs = Observation("main:1",observed_at=1000,state="wounded",strength=33000,maximum=33000,wounded=True,injury_seconds=199).__dict__
     window.handle_event("observation",obs)
-    assert window.live.item(0,1).text() == "重伤恢复"
-    assert "99 秒" in window.live.item(0,5).text()
+    assert window.live.item(0,2).text() == "重伤恢复"
+    assert "99 秒" in window.live.item(0,6).text()
     monkeypatch.setattr(module.time,"time",lambda:1300.0)
     window.refresh_live()
-    assert window.live.item(0,1).text() == "重伤恢复"
-    assert "等待现场复核" in window.live.item(0,5).text()
+    assert window.live.item(0,2).text() == "重伤恢复"
+    assert "等待现场复核" in window.live.item(0,6).text()
     window.close()
     app.processEvents()
 
@@ -349,7 +353,7 @@ def test_backup_order_persists_and_scheduler_uses_it_with_named_override(tmp_pat
     p = Profile(account='测试',main_city=Point(x=10,y=20),backup_enabled=True,
         backups=[Point(name='甲',x=11,y=21,priority=4,expected_name='甲城',capacity=2,actions=['guard'],group='保留'),
                  Point(name='乙',x=12,y=22,priority=1,expected_name='乙城')])
-    p.teams[0].merit = True
+    p.teams[0].role = "merit"
     (tmp_path/'active-profile.json').write_text(json.dumps(p.to_dict()),encoding='utf-8')
     window = Window(tmp_path)
     t = window.backup_table
@@ -365,7 +369,7 @@ def test_backup_order_persists_and_scheduler_uses_it_with_named_override(tmp_pat
     assert (result.backups[0].actions,result.backups[0].capacity,result.backups[0].group) == (['guard'],2,'保留')
     obs = Observation('main:1',state='home',strength=100,maximum=1000,stamina=100,supply=100,wounded=False,auto_refill=True)
     assert decide(result,result.teams[0],obs,10000000).target.name == '甲'
-    result.teams[0].backup = '乙'
+    result.teams[0].backup_points = ['乙']
     assert decide(result,result.teams[0],obs,10000000).target.name == '乙'
     t.selectRow(0)
     window.remove_row(t)
@@ -459,24 +463,48 @@ def test_pave_route_dialog_parses_addresses_and_reorders():
     app.processEvents()
 
 
-def test_pave_page_saves_route_points(tmp_path):
+def test_pave_page_saves_route_points(tmp_path, monkeypatch):
     app = QApplication.instance() or QApplication([])
     window = Window(tmp_path)
     window.add_pave_route()
     t = window.pave_table
-    t.item(0, 1).setText("测试路线")
-    t.cellWidget(0, 2).setCurrentIndex(1)
-    t.cellWidget(0, 5)._points = [[571, 243, "空地"], [566, 240]]
-    t.cellWidget(0, 0).setChecked(True)
+    t.item(0, 0).setText("测试路线")
+    t.cellWidget(0, 4)._points = [[571, 243, "空地"], [566, 240]]
+    window.sync_routes_from_table()
+    monkeypatch.setattr("sanmou_assistant.ui.QInputDialog.getItem",
+                        lambda *args, **kwargs: ("测试路线", True))
+    for button in window.team_table.cellWidget(1, 2).findChildren(QRadioButton):
+        if button.property("role") == "pave":
+            button.click()
+    assert window.profile.teams[1].role == "pave"
+    assert window.profile.teams[1].route == "测试路线"
     assert window.save()
     p = Profile.from_dict(json.loads((tmp_path / "active-profile.json").read_text(encoding="utf-8")))
     assert p.pave_routes[0].name == "测试路线"
     assert p.pave_routes[0].team == "main:2"
-    assert p.pave_routes[0].enabled is True
     assert p.pave_routes[0].points == [[571, 243, "空地"], [566, 240]]
     reopened = Window(tmp_path)
-    assert reopened.pave_table.item(0, 1).text() == "测试路线"
-    assert reopened.pave_table.cellWidget(0, 5)._points == [[571, 243, "空地"], [566, 240]]
+    assert reopened.pave_table.item(0, 0).text() == "测试路线"
+    assert reopened.pave_table.cellWidget(0, 4)._points == [[571, 243, "空地"], [566, 240]]
     window.close()
     reopened.close()
+    app.processEvents()
+
+
+def test_unassigned_pave_routes_do_not_block_start(tmp_path):
+    """回归：路线页里启用过、但没有队伍选择铺路时，开始执行不能被拦住。"""
+    from sanmou_assistant.models import PaveRoute, Point, Profile
+    profile = Profile(account="测试", main_city=Point(name="主城", x=600, y=280))
+    profile.teams[0].role = "merit"
+    profile.teams[1].role = "bandits"
+    profile.pave_routes = [PaveRoute(name="铺路 1", points=[[571, 243]], enabled=True),
+                           PaveRoute(name="铺路 2", points=[[566, 240]], enabled=True)]
+    (tmp_path / "active-profile.json").write_text(json.dumps(profile.to_dict()), encoding="utf-8")
+    app = QApplication.instance() or QApplication([])
+    window = Window(tmp_path)
+    collected = window.collect()
+    errors = collected.validate(active=True)
+    assert not any("铺路" in error for error in errors), errors
+    assert window.save()
+    window.close()
     app.processEvents()

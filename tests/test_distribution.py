@@ -73,9 +73,13 @@ def test_feedback_is_readable_bounded_and_does_not_follow_external_images(tmp_pa
 
 def test_only_paving_also_requires_account_and_rejects_guard():
     from sanmou_assistant.models import Profile, PaveRoute
-    profile = Profile(pave_routes=[PaveRoute(name="route", team="main:2", points=[[1, 2]], enabled=True)])
+    profile = Profile(pave_routes=[PaveRoute(name="route", points=[[1, 2]])])
+    profile.teams[1].role, profile.teams[1].route = "pave", "route"
+    profile.normalize()
     assert any("主城校验" in value for value in profile.validate(active=True))
-    profile.pave_routes[0].team = "guard:1"
+    profile.teams[5].role, profile.teams[5].route = "pave", "route"
+    profile.teams[1].role, profile.teams[1].route = "idle", ""
+    profile.normalize()
     assert any("亲卫" in value for value in profile.validate())
 
 

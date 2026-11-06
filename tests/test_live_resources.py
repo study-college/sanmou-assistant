@@ -142,7 +142,7 @@ def test_all_three_teams_use_shared_stock_even_if_later_dispatch_frames_hide_it(
     profile = Profile(food_enabled=True, targets=[Point(name='目标', x=10, y=20)])
     teams = profile.teams[:3]
     for team in teams:
-        team.merit = True
+        team.role = "merit"
     worker = Worker(profile, tmp_path, 'run', False)
     worker.journal = Journal(tmp_path/'runtime.sqlite', 'test')
     game.grain = 6000000

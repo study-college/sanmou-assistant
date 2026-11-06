@@ -515,6 +515,11 @@ class Vision:
             return "territory"
         if "部队总览" in header:
             return "overview"
+        # 个人信息页（点头像进入）：左上标题 + 个人数据/武勋栏共同确认，避免把聊天里
+        # 的同名词当页面。武勋读数只在这一个已确认页面上取。
+        if "个人信息" in header and ("个人数据" in self.joined(image, (1150, 640, 1900, 790))
+                                     or "武勋" in self.joined(image, (1500, 430, 1720, 520))):
+            return "profile"
         if "部队" in header and ("阵" in header or "交换" in self.joined(image, (310, 95, 410, 270))):
             return "team"
         if "城务" in header:
@@ -641,7 +646,7 @@ class Vision:
     def navigation_close_point(self, image, page):
         if self.page(image) != page:
             return None
-        if page in ("team", "guide", "affairs", "drill", "campaign", "activity", "welfare", "visit", "visit_result", "alliance"):
+        if page in ("team", "guide", "affairs", "drill", "campaign", "activity", "welfare", "visit", "visit_result", "alliance", "profile"):
             point = self.navigation_back_point(image, require_title=False)
             return (point["x"], point["y"]) if point else None
         rects = {"overview": (1680, 55, 1860, 190), "reserve": (1680, 55, 1860, 190),
@@ -1138,6 +1143,29 @@ class Vision:
         obs.auto_refill = self.checked(image, *checkbox) if checkbox else None
         obs.note = "兵力已交叉核对" if obs.strength is not None else "兵力总数与三名武将数值未通过交叉核对"
         return obs
+
+    def profile_merit(self, image) -> tuple[int | None, str]:
+        """个人信息页右上角的“武勋”数值（实机样本 501.5万）。
+
+        读数只用于展示“这轮挂机大概涨了多少武勋”，不参与派兵判断；读不到就返回
+        (None, "")，调用方记一条日志后继续，不重试成环。
+        """
+        def pick(spans):
+            found = []
+            for t in spans:
+                text = t.text.replace(",", "").replace(" ", "")
+                if re.fullmatch(r"\d+(?:\.\d+)?[万亿]?", text):
+                    value = quantity(text)
+                    if value is not None:
+                        found.append((value, text))
+            return found[0] if len(found) == 1 else (None, "")
+
+        value, text = pick(self.read(image, (1675, 432, 1880, 516)))
+        if value is not None:
+            return value, text
+        # 字号或描边变化时整条数字可能左移；扩一圈仍要求只有一个纯数字，避免读到繁荣值。
+        spans = self.read(image, (1690, 425, 1900, 520))
+        return pick(spans)
 
     def grain(self, image) -> int | None:
         # 资源数字为浅色，前线玩家名为彩色描边；先移除背景文字，再核对库存与容量。

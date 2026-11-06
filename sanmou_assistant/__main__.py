@@ -6,6 +6,30 @@ import sys
 from pathlib import Path
 
 
+def window_icon_path():
+    """开发目录与 PyInstaller 打包目录都能找到图标。"""
+    candidates = [Path(__file__).resolve().parent / "assets" / "app.ico"]
+    runtime = getattr(sys, "_MEIPASS", "")
+    if runtime:
+        candidates.append(Path(runtime) / "sanmou_assistant" / "assets" / "app.ico")
+    candidates.append(Path(sys.executable).resolve().parent / "sanmou_assistant" / "assets" / "app.ico")
+    return next((p for p in candidates if p.exists()), None)
+
+
+def apply_window_identity(app):
+    """设置任务栏图标与独立的应用标识，避免源码运行时显示 Python 图标。"""
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("SanmouAssistant.Desktop.0.9")
+        except (AttributeError, OSError):
+            pass
+    path = window_icon_path()
+    if path:
+        from PySide6.QtGui import QIcon
+        app.setWindowIcon(QIcon(str(path)))
+
+
 def profile_location(data: Path, explicit: Path | None = None, account_id: str = ""):
     if explicit:
         if account_id:
@@ -48,6 +72,7 @@ def main():
     from PySide6.QtCore import QTimer
     app = QApplication(sys.argv[:1])
     app.setApplicationName("三谋助手")
+    apply_window_identity(app)
     if args.scan or args.command:
         from .worker import Worker
         from datetime import datetime
@@ -74,7 +99,7 @@ def main():
         worker.start()
         app.exec()
         worker.wait()
-        (folder / "result.json").write_text(json.dumps(results,ensure_ascii=False,indent=2),encoding="utf-8")
+        # result.json 由 Worker 在退出时统一写（含界面手动停止的情况），这里不再重复写。
         return 1 if any(r["event"]=="error" for r in results) else 0
     from .ui import AccountManagerWindow
     window = AccountManagerWindow(data)
