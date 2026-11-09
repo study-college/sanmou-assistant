@@ -35,9 +35,9 @@
   届时需要用“部队行选槽位”的结构方式重新实机校准，不能再引入颜色判据。
 - 本版提供 Windows 完整包，源码与完整包由同一标签构建。
 
-## 证据
+## 证据与范围
 
-- [63 队伍读取与页码解耦](63-team-read-without-page-number-2026-11-09.md)
-- `artifacts/diagnosis-2026-11-09-pager/pager-roi-before-after.png`
-- `artifacts/diagnosis-2026-11-09-pager/repro_no_page_gate.py`
-- `artifacts/diagnosis-2026-11-09-pager/receipt.json`
+- 源码变更见 `CHANGELOG.md` 与本次提交；完整包附带源码、校验清单和 SHA256。
+- 验证范围：本机全量测试、公开仓库独立测试、2026-11-09 两次实机只监控扫描、
+  Windows 构建与打包 exe 的 Qt/OpenCV/ONNX/OCR 检查。
+- 亲卫队/第二页未纳入本版；其他账号、赛季布局和长期无人值守仍需分别验证。
