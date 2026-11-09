@@ -137,6 +137,18 @@ def test_bandit_policy_uses_its_own_real_strength_limits(ready):
     assert bandit_decision(p,t,o,1000000).action == "wait"
 
 
+def test_bandit_food_gate_only_applies_when_merit_team_selected(ready):
+    # 用户 2026-11-09：没有刷武勋队时粮食多少都无所谓，讨贼照常。
+    p,t,o = ready
+    t.role = "bandits"
+    p.food_enabled = True
+    o.state, o.marker_state = "home", "idle"
+    o.strength, o.maximum = 33000, 33000
+    assert bandit_decision(p,t,o,1,food_gate=True).action == "wait"
+    assert "等待补粮" in bandit_decision(p,t,o,1,food_gate=True).reason
+    assert bandit_decision(p,t,o,1,food_gate=False).action == "bandits"
+
+
 def test_marker_state_decides_whether_a_team_can_be_dispatched(ready):
     p,t,o = ready
     # 忙碌（占领/建筑内征兵等）不能派

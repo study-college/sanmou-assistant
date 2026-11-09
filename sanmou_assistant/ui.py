@@ -520,6 +520,8 @@ class Window(QMainWindow):
         self.observations = {}
         self.decisions = {}
         self.team_activity = {}
+        # 最近一次检测到的实际主队槽位；None 表示本次任务还没读过。
+        self.team_slots = None
         self.latest_evidence = ""
         self.latest_mark = None
         self.paused = False
@@ -716,6 +718,7 @@ class Window(QMainWindow):
         layout.addLayout(row)
         controls = QHBoxLayout()
         self.scan_button = button("读取全部队伍", lambda:self.start("scan"))
+        self.scan_button.setToolTip("读取队伍并确认本次游戏里实际有几队；没有的槽位随后会在设置里锁住")
         controls.addWidget(self.scan_button)
         self.refresh_button = button("刷新画面与资源", self.request_refresh)
         controls.addWidget(self.refresh_button)
@@ -886,7 +889,7 @@ class Window(QMainWindow):
         self.update_hidden_hint()
 
     def make_teams(self):
-        layout = self.page("部队任务", "每支队伍只做一件事：刷武勋、讨贼或铺路；暂时不用的队伍可以在运行总览里隐藏。", scroll=False)
+        layout = self.page("部队任务", "每支队伍只做一件事：刷武勋、讨贼或铺路。第一次先点“读取全部队伍”确认本次实际有几队；没有的槽位会自动锁住，保留配置但不读取、不派兵。", scroll=False)
         self.team_table = table(["显示", "队伍", "任务", "兵力方式", "出击下限", "体力", "补给", "目标组 / 补兵点"])
         header = self.team_table.horizontalHeader()
         header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
@@ -934,26 +937,58 @@ class Window(QMainWindow):
         row.addStretch()
         return holder
 
+    def team_available(self, t):
+        """这支队伍本次是否真的存在，能不能在界面里设置/使用。
+
+        启动确认前（team_slots 还没读到）不拦，避免第一次打开什么都不能配；
+        读到部队清单后，没有的主城槽位和亲卫行都锁住。
+        """
+        if t.group == "guard":
+            return False
+        if self.team_slots is None:
+            return True
+        return t.slot in self.team_slots
+
     def sync_team_row(self, r):
         t = self.profile.teams[r]
+        available = self.team_available(t)
+        editable = available and t.role != "hidden"
         box = self.team_table.cellWidget(r, 0)
         box.blockSignals(True)
         box.setChecked(t.role != "hidden")
+        box.setEnabled(available)
         box.blockSignals(False)
         holder = self.team_table.cellWidget(r, 2)
         for button in holder.findChildren(QRadioButton):
             role = button.property("role")
             button.blockSignals(True)
             button.setChecked(t.role == role)
-            button.setEnabled(t.role != "hidden")
+            button.setEnabled(editable)
             button.blockSignals(False)
         detail = self.team_table.cellWidget(r, 7)
-        detail.setText(self.team_detail_summary(t))
-        detail.setEnabled(t.role in ("merit", "bandits", "pave"))
+        detail.setText(self.team_detail_summary(t) if available else "未拥有")
+        detail.setEnabled(editable)
+        for c in (3, 4, 5, 6):
+            widget = self.team_table.cellWidget(r, c)
+            if widget:
+                widget.setEnabled(editable)
+        name = t.display if available else f"{t.display}（未拥有）"
+        cell = self.team_table.item(r, 1)
+        if cell:
+            cell.setText(name)
+            cell.setToolTip("本次部队列表里没有这支队伍，不能设置或使用" if not available else "")
         for c in range(self.team_table.columnCount()):
             cell = self.team_table.item(r, c)
             if cell:
-                cell.setForeground(QBrush(QColor("#9aa7b8" if t.role == "hidden" else "#27374d")))
+                cell.setForeground(QBrush(QColor("#9aa7b8" if (t.role == "hidden" or not available) else "#27374d")))
+
+    def apply_team_presence(self, slots):
+        """把本次实际队伍应用到设置页：没有的槽位锁住，不让人配置/启用。"""
+        self.team_slots = set(slots or [])
+        for r, t in enumerate(self.profile.teams):
+            if t.group == "main":
+                self.sync_team_row(r)
+        self.refresh_live()
 
     def choose_pave_route(self, r):
         t = self.profile.teams[r]
@@ -986,7 +1021,7 @@ class Window(QMainWindow):
 
     def team_role_clicked(self, r, role):
         t = self.profile.teams[r]
-        if t.role == "hidden":
+        if t.role == "hidden" or not self.team_available(t):
             return
         if role == "pave":
             name = self.choose_pave_route(r)
@@ -1017,11 +1052,14 @@ class Window(QMainWindow):
     def set_visibility_enabled(self, enabled):
         for row in range(self.live.rowCount()):
             box = self.live.cellWidget(row, 0)
-            if isinstance(box, QCheckBox):
-                box.setEnabled(enabled)
+            if isinstance(box, QCheckBox) and row < len(self.profile.teams):
+                box.setEnabled(enabled and self.team_available(self.profile.teams[row]))
 
     def visible_toggled(self, r, checked):
         t = self.profile.teams[r]
+        if not self.team_available(t):
+            self.sync_team_row(r)
+            return
         if checked:
             self.set_team_role(r, t.saved_role or "idle")
         else:
@@ -1031,6 +1069,8 @@ class Window(QMainWindow):
 
     def edit_team_detail(self, r):
         t = self.profile.teams[r]
+        if not self.team_available(t):
+            return
         dialog = TeamDetailDialog(t, self.profile, self)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
@@ -1455,6 +1495,9 @@ class Window(QMainWindow):
         self.team_table.setRowCount(len(self.profile.teams))
         self.live.setRowCount(len(self.profile.teams))
         for r,t in enumerate(self.profile.teams):
+            if t.group == "guard":
+                # 三个自动任务只用主城队伍；亲卫不参与，设置页也不再占一行。
+                self.team_table.setRowHidden(r, True)
             visible = QCheckBox()
             visible.setToolTip("取消勾选 = 这支队伍不参与任何任务，也不会被读取")
             visible.toggled.connect(lambda checked, row=r: self.visible_toggled(row, checked))
@@ -1930,6 +1973,9 @@ class Window(QMainWindow):
             self.decisions.pop(value["key"], None)
             self.refresh_live()
             self.last_scan.setText(f"最新读数 · {datetime.now():%H:%M:%S}")
+        elif kind == "team_presence":
+            # 本次实际有几队：没有的槽位在设置和总览里锁住，不能配置/启用。
+            self.apply_team_presence(value.get("slots") or [])
         elif kind == "decision":
             self.decisions[value["team"]] = value["reason"]
             self.refresh_live()
@@ -1990,8 +2036,22 @@ class Window(QMainWindow):
             if isinstance(check, QCheckBox):
                 check.blockSignals(True)
                 check.setChecked(not hidden)
+                check.setEnabled(self.team_available(t))
                 check.blockSignals(False)
             if hidden:
+                continue
+            if t.group == "guard":
+                # 三个自动任务只使用主城队伍；亲卫不参与，也不再占运行总览的行。
+                self.live.setRowHidden(r, True)
+                continue
+            if (t.group == "main" and self.team_slots is not None
+                    and t.slot not in self.team_slots):
+                values = [t.display, "未拥有", "—", "—", "—",
+                          "本赛季尚未获得该队；不读取、不派兵，获得后下一轮自动纳入"]
+                for c, val in enumerate(values):
+                    item(self.live, r, c + 1, val, False)
+                    self.live.item(r, c + 1).setToolTip(str(val))
+                self.live.item(r, 2).setForeground(QBrush(QColor("#9aa7b8")))
                 continue
             obs = self.observations.get(t.key, {})
             activity = self.team_activity.get(t.key)

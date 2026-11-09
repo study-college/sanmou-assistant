@@ -99,7 +99,7 @@ def test_dispatch_survives_an_unconfirmed_frame_and_tries_next_action(tmp_path):
     game.account_checked = True
     game.d = SimpleNamespace(tap=lambda *a, **k: None, control=SimpleNamespace(sleep=lambda s: None))
     game.v = SimpleNamespace(page=lambda image: "deployment",
-                             deployment_status=lambda image, slot: "unknown",
+                             deployment_status=lambda image, slot, center_x=None: "unknown",
                              deploy_button_enabled=lambda image: True,
                              deployment_hint=lambda image: "",
                              joined=lambda image, rect: "")

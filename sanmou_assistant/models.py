@@ -391,9 +391,9 @@ def observation_expired(profile: Profile, obs: Observation, now: Optional[float]
     return (time.time() if now is None else now) - obs.observed_at > max(120,profile.poll_seconds*2)
 
 
-def decide(profile: Profile, policy: TeamPolicy, obs: Observation, grain: Optional[int], phase: str = "", now: Optional[float] = None) -> Decision:
+def decide(profile: Profile, policy: TeamPolicy, obs: Observation, grain: Optional[int], phase: str = "", now: Optional[float] = None, food_gate: bool = True) -> Decision:
     if policy.role == "bandits":
-        return bandit_decision(profile,policy,obs,grain,now)
+        return bandit_decision(profile,policy,obs,grain,now,food_gate=food_gate)
     if policy.role == "pave":
         return Decision(reason="铺路任务，由铺路路线推进")
     if policy.role != "merit":
@@ -418,7 +418,7 @@ def decide(profile: Profile, policy: TeamPolicy, obs: Observation, grain: Option
         return Decision(reason="城外自然征兵中，等兵力达到出击下限再回城")
     if obs.state not in ("home", "outside"):
         return Decision(reason="队伍尚未确认空闲，保留当前任务")
-    if profile.food_enabled and grain is not None and grain < profile.food_low:
+    if food_gate and profile.food_enabled and grain is not None and grain < profile.food_low:
         return Decision(reason="全局粮食库存低于下限，等待补粮")
     if obs.strength is not None and obs.maximum is not None and obs.strength < policy.threshold(obs.maximum):
         order = {name: i for i, name in enumerate(policy.backup_points)}
@@ -437,7 +437,7 @@ def decide(profile: Profile, policy: TeamPolicy, obs: Observation, grain: Option
     return Decision("merit", "当前队伍可尝试出击", targets[0]) if targets else Decision(reason="没有启用的战场目标")
 
 
-def bandit_decision(profile: Profile, policy: TeamPolicy, obs: Observation, grain: Optional[int], now: Optional[float] = None) -> Decision:
+def bandit_decision(profile: Profile, policy: TeamPolicy, obs: Observation, grain: Optional[int], now: Optional[float] = None, food_gate: bool = True) -> Decision:
     if policy.role != "bandits" or policy.group != "main":
         return Decision(reason="该队未启用可执行的讨贼")
     # 用户 2026-11-02：停留在外面或调动到营帐里，同样可以拉出去；忙碌/未识别不派。
@@ -464,7 +464,7 @@ def bandit_decision(profile: Profile, policy: TeamPolicy, obs: Observation, grai
         return Decision(reason="讨贼：等待体力")
     if obs.supply is not None and obs.supply < policy.supply:
         return Decision(reason="讨贼：等待补给")
-    if profile.food_enabled and grain is not None and grain < profile.food_low:
+    if food_gate and profile.food_enabled and grain is not None and grain < profile.food_low:
         return Decision(reason="讨贼：等待补粮")
     return Decision("bandits","讨贼：队伍在主城，等可加入集结")
 

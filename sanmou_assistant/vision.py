@@ -565,9 +565,9 @@ class Vision:
         if self.find(image, ["出城"], (15, 1000, 180, 1075), exact=True):
             return "city"
         if "武将" in bottom and ("同盟" in bottom or "职业" in bottom):
-            if self.portrait_page(image) is not None:
-                return "sandbox"
-            # 页面与队伍分页分开确认；此处认出沙盘不授予任何队伍槽位资格。
+            # 沙盘页型只由底栏 + 顶部资源栏确认，不读队伍页码。
+            # 2026-11-09：页码属于右侧头像列表的分页状态，与“这是不是沙盘”无关；
+            # 把它当页型条件会让地图底色影响页面判断。
             top = self.joined(image, (0, 30, 900, 115)).replace(" ", "")
             if "繁荣" in top and "道路" in top:
                 return "sandbox"
@@ -826,66 +826,6 @@ class Vision:
                 return CityFarmSelection(f"{level}级农田", level, first, int(match[1]))
         return None
 
-    def portrait_page(self, image):
-        number = self._portrait_page_at(image,0)
-        if number is not None:
-            return number
-        # 第2页只有三张头像，页码随列表上移270像素；不能据此假定已经回到第1页。
-        number = self._portrait_page_at(image,-270)
-        return 2 if number == 2 else None
-
-    def _portrait_page_at(self, image, offset):
-        # 行军队名可能压在页码上沿；先读页码自身，避免把“1/2”合并成“2”。
-        hsv = cv2.cvtColor(image[855+offset:885+offset,1770:1910],cv2.COLOR_BGR2HSV)
-        white = cv2.inRange(hsv,(0,0,150),(179,65,255))
-        canvas = cv2.cvtColor(255-white,cv2.COLOR_GRAY2BGR)
-        canvas = cv2.copyMakeBorder(canvas,20,20,20,20,cv2.BORDER_CONSTANT,value=(255,255,255))
-        text = self.joined(canvas,(0,0,canvas.shape[1],canvas.shape[0])).replace(" ","").replace("／","/").strip(".")
-        match = re.fullmatch(r"([12])/2",text)
-        if match:
-            return int(match[1])
-        # 数字 1/7 可能是斜杠误读，但单路读数不能据此决定队伍页。
-        hint = re.fullmatch(r"([12])[71]2",text)
-        hint = int(hint[1]) if hint else None
-        for rect in ((1770,855,1910,885),(1770,841,1910,889)):
-            x0,y0,x1,y1 = rect
-            text = self.joined(image,(x0,y0+offset,x1,y1+offset)).replace(" ","")
-            match = re.search(r"(?<!\d)([12])/2(?!\d)",text)
-            if match:
-                return int(match[1]) if hint in (None,int(match[1])) else None
-        # 半透明分页条会透出彩色行军名，检测OCR可能只截到首位。
-        # 老裁剪只认明确斜杠；紧凑红/白滤色两路均达 .9 且页数一致，才容忍斜杠→1/7。
-        # 2026-10-18 故障图紧凑两路实读为“172.”与“.172”，保留边缘句点归一化。
-        groups = (
-            (((1815,850,1875,884), "legacy-red", .8), ((1818,855,1865,878), "raw", .7)),
-            (((1819,855,1865,878), "red", .9), ((1819,854,1864,879), "white", .9)),
-        )
-        for group in groups:
-            readings = []
-            for rect, mode, minimum in group:
-                self.checkpoint()
-                x0,y0,x1,y1 = rect
-                crop = image[y0+offset:y1+offset,x0:x1]
-                if mode in ("red", "legacy-red"):
-                    crop = cv2.cvtColor(255-cv2.inRange(crop[:,:,2],130 if mode == "legacy-red" else 160,255),cv2.COLOR_GRAY2BGR)
-                elif mode == "white":
-                    hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
-                    crop = cv2.cvtColor(255-cv2.inRange(hsv,(0,0,160),(179,65,255)),cv2.COLOR_GRAY2BGR)
-                if mode in ("red", "white"):
-                    crop = cv2.copyMakeBorder(crop,8,8,8,8,cv2.BORDER_CONSTANT,value=(255,255,255))
-                results,_ = self.ocr(crop,use_det=False,use_cls=False)
-                self.checkpoint()
-                if not results or len(results) != 1:
-                    readings.append(None)
-                    continue
-                label,score = results[0]
-                pattern = r"([12])[/71]2" if mode in ("red", "white") else r"([12])/2"
-                match = re.fullmatch(pattern,label.replace(" ","").replace("／","/").strip("."))
-                readings.append(int(match[1]) if match and score >= minimum else None)
-            if None not in readings:
-                return readings[0] if readings[0] == readings[1] and hint in (None,readings[0]) else None
-        return None
-
     def deployment_strength(self, image, slot):
         if not 1 <= slot <= 5:
             return None
@@ -1060,8 +1000,10 @@ class Vision:
         return None
 
     def full_team_rows(self, image):
+        # 2026-11-08 新赛季左侧列表整体上移：部队一在 y≈149，五队在 y≈601。
+        # 旧赛季在 y≈221..674；取 90..810 的并集，兼容两种布局。
         rows = {}
-        for text in self.read(image, (0, 170, 430, 810), minimum=.75):
+        for text in self.read(image, (0, 90, 430, 810), minimum=.75):
             match = re.fullmatch(r"部队([一二三四五])", text.text.replace(" ", ""))
             if match:
                 slot = "一二三四五".index(match[1]) + 1
@@ -1274,13 +1216,15 @@ class Vision:
                 slots[key] = (int(match[1]), int(match[2]))
         return slots
 
-    def deployment_status(self, image, slot: int) -> str:
-        x = 25 + (slot-1)*249
+    def deployment_status(self, image, slot: int, center_x=None) -> str:
+        # 少队时卡片整组居中；调用方给 center_x 就按卡片左边缘读，没给才退回旧五列。
+        x = (round(center_x) - 125) if center_x is not None else 25 + (slot-1)*249
         value = self.joined(image, (x, 750, x+235, 821))
         if "重伤" in value:
             return "wounded"
         # 铺路/攻占过程中卡片会显示占领倒计时；队伍参战时会显示“战斗”。
-        for label, state in (("战斗", "fighting"), ("占领", "occupying"), ("返回", "returning"),
+        for label, state in (("集结", "outside"), ("战斗", "fighting"),
+                             ("占领", "occupying"), ("返回", "returning"),
                              ("征兵", "recruiting"), ("驻守", "guarding"), ("行军", "marching"),
                              ("调动", "outside"), ("停留", "outside"), ("空闲", "home")):
             if label in value:

@@ -369,7 +369,7 @@ class MarkerVision:
     def checked(self, image, x, y):
         return False
 
-    def deployment_status(self, image, slot):
+    def deployment_status(self, image, slot, center_x=None):
         self.status_calls += 1
         return "outside" if self.status_calls <= 2 else self.status_after
 

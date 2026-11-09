@@ -1,4 +1,4 @@
-"""主队五队状态定义（由用户校准，2026-11-02）。
+"""主队状态定义（由用户校准，2026-11-02；支持 1～5 队）。
 
 角标含义只能来自用户明确给出的标准答案；本文件是那份答案的代码化。
 新增状态必须先在 `artifacts/team-marker-calibration/` 留下带真值的帧，
@@ -10,6 +10,7 @@ from __future__ import annotations
 # state key -> 游戏内状态名
 STATES = {
     "idle": "空闲",
+    "training": "练兵（可出击）",
     "transfer": "调动",
     "transfer_stay": "调动停留",
     "march": "行军",
@@ -28,6 +29,11 @@ RULES = {
     "idle": (
         "部队在主城中且不在其他状态时的默认状态；可执行任何指令；进入空闲时恢复满补给。"
         "主队头像没有角标。"
+    ),
+    "training": (
+        "用户 2026-11-08 确认：智能练兵。部队中武将体力均满且空闲在主城时自动进入练兵，"
+        "武将可持续获得经验；体力未满自动取消。绿色持枪人影角标，仍可正常行动，"
+        "调度上等同空闲，可派出。"
     ),
     "transfer_stay": (
         "部队被调动进城外建筑（营帐、城池等）后停留在建筑里的状态，用户称“调动停留”。"
@@ -75,6 +81,7 @@ RULES = {
 # transfer_stay 是建筑内停留，旧体系没有对应值，先按 outside 显示，不能据此判定可出击。
 LEGACY_STATE = {
     "idle": "home",
+    "training": "home",
     "transfer": "marching",
     "transfer_stay": "outside",
     "march": "marching",
@@ -91,7 +98,7 @@ LEGACY_STATE = {
 # 用户 2026-11-02 明确的出兵口径：
 # 停留（城外任意地上）、空闲（主城）、调动停留（营帐/城池里）都可以拉出去；
 # 忙碌（占领、建筑内自然征兵等）不派；在路上、驻守、撤退、战斗、排队、未识别都不派。
-DISPATCHABLE = ("idle", "stationary", "transfer_stay")
+DISPATCHABLE = ("idle", "training", "stationary", "transfer_stay")
 ENGAGED = ("queued_battle", "fighting", "guard")
 MOVING = ("march", "transfer", "retreat")
 

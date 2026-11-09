@@ -84,6 +84,7 @@ def batch(tmp_path):
     for team in profile.teams[:3]:
         team.role = "merit"
     worker = Worker(profile,tmp_path,"run",False)
+    worker.active_slots = set(range(1, 6))  # 本文件验证五队批次；启动清单已确认五队存在。
     worker.journal = Journal(tmp_path/"runtime.sqlite","test")
     game = FakeGame(worker)
     yield worker,game,profile.teams[:3]

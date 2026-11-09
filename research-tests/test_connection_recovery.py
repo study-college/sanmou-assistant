@@ -21,15 +21,13 @@ def vision():
 
 
 @pytest.mark.parametrize('name', ['pager-lines.png', 'pager-labels.png', 'current-readonly.png'])
-def test_real_latest_failures_require_complete_pager_and_recognize_sandbox(vision, name):
+def test_real_sandbox_frames_need_no_team_page_number(vision, name):
     image = cv2.imread(str(ROOT/name))
     assert image is not None
-    assert vision.portrait_page(image) == 1
     assert vision.page(image) == 'sandbox'
     hidden = image.copy()
     hidden[841:889,1770:1910] = 0
-    assert vision.portrait_page(hidden) is None
-    # 沙盘页型可由资源栏与导航确认，队伍页码仍须单独核对。
+    # 队伍页码不属于沙盘页型证据；抹掉/没有页码也必须认出沙盘。
     assert vision.page(hidden) == 'sandbox'
 
 

@@ -262,7 +262,7 @@ def joining(tmp_path):
     vision.find = lambda image, labels, *a, **k: (
         Text("参与集结", 1, 960, 893, (0, 0, 0, 0)) if labels == ["参与集结"] and config["button"] else
         Text("出征", 1, 1700, 990, (0, 0, 0, 0)) if "出征" in labels and config["submit"] else None)
-    vision.deployment_status = lambda image, _: config["after_status"] if image is frames["after"] else config["status"]
+    vision.deployment_status = lambda image, _, center_x=None: config["after_status"] if image is frames["after"] else config["status"]
     vision.deployment_strength = lambda *a: config["strength"]
     j = Journal(tmp_path / "runtime.sqlite", "test-account")
     game = Game(device, vision, profile, j, tmp_path, lambda k, v: events.append((k, v)))

@@ -10,7 +10,7 @@ from pathlib import Path
 
 from PySide6.QtCore import QThread, Signal
 
-from .game import DispatchUnconfirmed, Game, GameError, NavigationRecovered, NetworkRecovered, ObservationExpired, PaveUnknown, RecognitionUnavailable
+from .game import DispatchUnconfirmed, Game, GameError, NavigationRecovered, NetworkRecovered, ObservationExpired, PaveUnknown, RecognitionUnavailable, TeamAbsent
 from .evidence import EvidenceStore
 from .journal import Journal
 from .models import Decision, Observation, Profile, decide, observation_expired
@@ -98,6 +98,13 @@ class Worker(QThread):
         self.merit_failures = 0
         self.wait_log_at = {}        # “可派/不可派原因”限频日志
         self.published = []
+        # 本赛季实际拥有的主队槽位；None 表示尚未读取。启动时确认一次，运行期间固定。
+        self.active_slots = None
+        self.roster_checked = False
+        # 每次任务启动都重新核实主城坐标；不是每轮巡检都做。
+        self.home_checked = False
+        # 本次是否有实际刷武勋队；粮食检查和讨贼补粮门槛只跟随它。
+        self.merit_active = False
 
     def request_refresh(self):
         self.refresh_requested.set()
@@ -124,6 +131,127 @@ class Worker(QThread):
         city = self.profile.main_city
         return (f"{self.profile.package}|{self.profile.account}|"
                 f"{city.x if city else '?'}|{city.y if city else '?'}")
+
+    def ensure_home(self, game):
+        """每次任务启动核实一次主城坐标。
+
+        用户 2026-11-08：主城位置以后会变，不能固定沿用上次坐标。启动后先回城、
+        出城（若回城进入城内）、点主城中心，读坐标和归属名；位置变了就更新并保存。
+        只做一次，不是每轮巡检；读不到就重试，仍读不到才停止，绝不拿旧坐标继续派兵。
+        """
+        if self.home_checked:
+            return self.profile.main_city
+        last_error = ""
+        for attempt in range(3):
+            self.control.checkpoint()
+            try:
+                game.calibrate_home()
+            except NetworkRecovered:
+                raise
+            except (GameError, RecognitionUnavailable) as exc:
+                last_error = str(exc)
+                try:
+                    game.ensure_sandbox()
+                except (GameError, RecognitionUnavailable) as sandbox_error:
+                    last_error = f"{last_error}；回到沙盘也失败：{sandbox_error}"
+                self.control.sleep(1)
+                continue
+            self.home_checked = True
+            return self.profile.main_city
+        raise GameError(f"启动时未能核实主城坐标：{last_error or '未读到主城'}")
+
+    def ensure_roster(self, game):
+        """启动时读一次游戏部队列表，确认本次运行实际有几支主队。
+
+        用户 2026-11-08：队伍数量是启动时的事实，运行期间不变；以游戏左侧
+        “部队一/二/…”为准，不看右侧头像。读不到就重试几次，仍读不到才停止，
+        绝不按配置里的 5 队去点空槽位。
+        """
+        if self.active_slots is not None:
+            return self.active_slots
+        team1 = next((t for t in self.profile.teams if t.group == "main" and t.slot == 1), None)
+        if team1 is None:
+            raise GameError("配置中没有主城第 1 队，无法读取部队列表")
+        # 优先用非第 1 队做只读探针，避免去点正在集结/出征的第 1 队；
+        # 该队不存在时再退回第 1 队。探针只点头像和部队总览，不派兵。
+        probe = next((t for t in sorted(self.profile.teams, key=lambda t: t.slot)
+                      if t.group == "main" and t.slot != 1), team1)
+        last_error = ""
+        for attempt in range(3):
+            self.control.checkpoint()
+            try:
+                game.read_roster(probe.slot)
+            except TeamAbsent as exc:
+                last_error = str(exc)
+                if probe is not team1:
+                    probe = team1
+                    continue
+            except NetworkRecovered:
+                raise
+            except (GameError, RecognitionUnavailable) as exc:
+                last_error = str(exc)
+                if probe is not team1 and attempt == 0:
+                    probe = team1
+                    continue
+                game.ensure_sandbox()
+            if game.active_slots:
+                self.active_slots = set(game.active_slots)
+                break
+            if not last_error:
+                last_error = "部队总览没有读到有效行"
+            self.control.sleep(1)
+        if self.active_slots is None:
+            raise GameError(f"未能从游戏部队列表确认本次队伍：{last_error or '未读到行'}")
+        configured = sorted(t.slot for t in self.profile.teams
+                            if t.group == "main" and t.participating)
+        missing = [slot for slot in configured if slot not in self.active_slots]
+        message = (f"本次启动确认 {len(self.active_slots)} 支主队"
+                   f"（槽位 {sorted(self.active_slots)}）；按实际队伍工作，运行期间不再重读")
+        if missing:
+            message += f"；配置中的 {missing} 队当前没有，已跳过"
+        game.log(message, "INFO")
+        self.merit_active = any(t.role == "merit" and self.team_present(t.key)
+                                for t in self.profile.teams)
+        game.food_gate = self.merit_active
+        return self.active_slots
+
+    def team_present(self, key):
+        """配置里的队伍键是否在当前实际队伍中；只对 main:N 生效。"""
+        text = str(key)
+        if not text.startswith("main:"):
+            return True
+        try:
+            slot = int(text.split(":", 1)[1])
+        except ValueError:
+            return True
+        # None 只出现在启动确认之前；正式批次开始前 ensure_roster 一定已经写入集合。
+        return self.active_slots is None or slot in self.active_slots
+
+    def active_policies(self, policies):
+        """只保留主城队伍里本次部队列表实际存在的那几支。
+
+        启动确认之前返回空列表，绝不回退到“配置里有 5 队”。
+        """
+        if self.active_slots is None:
+            return []
+        return [t for t in policies if t.group == "main" and self.team_present(t.key)]
+
+    @staticmethod
+    def has_merit_team(policies):
+        """本次是否有队伍选择刷武勋；粮食检查只跟随刷武勋。"""
+        return any(t.role == "merit" for t in policies)
+
+    def food_recovery_state(self, policies, grain, stored=False):
+        """粮食恢复标记：只有存在刷武勋队、补粮开关打开时才可能为真。
+
+        用户 2026-11-09：没有队伍刷武勋时，粮食多少都无所谓，不触发屯田；
+        其他讨贼/铺路/日常照常。grain 未读到时保留已有恢复标记，避免误放行。
+        """
+        if not self.has_merit_team(policies) or not self.profile.food_enabled:
+            return False
+        if grain is None:
+            return bool(stored)
+        return (stored or grain < self.profile.food_low) and grain < self.profile.food_recover
 
     def run(self):
         self.folder.mkdir(parents=True, exist_ok=True)
@@ -202,11 +330,8 @@ class Worker(QThread):
                 return
             vision = Vision(self.control)
             vision.emit = self.publish
-            scope = f"{self.profile.package}|{self.profile.account}|{self.profile.main_city.x if self.profile.main_city else '?'}|{self.profile.main_city.y if self.profile.main_city else '?'}"
-            self.journal = Journal(self.folder.parent / "runtime.sqlite", scope)
-            self.initial_pending = {row[0] for policy in self.profile.teams for row in self.journal.pending(policy.key)}
-            game = Game(device, vision, self.profile, self.journal, self.folder, self.publish)
-            game.reserved_teams = self.pave_team_keys()
+            # 主城尚未核实前先不建 Journal；核实后按新主城坐标建立 scope，避免沿用旧城键。
+            game = Game(device, vision, self.profile, None, self.folder, self.publish)
             game.live_resources = True
             game.resource_refresh_requested = self.refresh_requested
             self.control.on_pause = lambda: game.passive_refresh(paused=True)
@@ -263,8 +388,17 @@ class Worker(QThread):
                     continue
             else:
                 raise GameError("游戏网络反复断开，停止操作")
+            # 每次任务启动都重新核实主城；位置变了就在这里更新，后面所有定位都用新坐标。
+            self.ensure_home(game)
+            scope = (f"{self.profile.package}|{self.profile.account}|"
+                     f"{self.profile.main_city.x if self.profile.main_city else '?'}|"
+                     f"{self.profile.main_city.y if self.profile.main_city else '?'}")
+            self.journal = Journal(self.folder.parent / "runtime.sqlite", scope)
+            game.j = self.journal
+            self.initial_pending = {row[0] for policy in self.profile.teams
+                                    for row in self.journal.pending(policy.key)}
+            game.reserved_teams = self.pave_team_keys()
             if self.command == "calibrate":
-                game.calibrate_home()
                 self.publish("status", "账号与主城已校验")
                 return
             if self.command == "rates":
@@ -272,12 +406,17 @@ class Worker(QThread):
                 self.publish("status", "征兵所已读取")
                 return
             if self.command == "farming":
+                # 屯田只跟随刷武勋；没有刷武勋队时不执行，即使手动点屯田检查。
+                if not any(t.role == "merit" for t in self.profile.teams):
+                    self.publish("status", "没有刷武勋队；屯田只跟随刷武勋，本次不屯田")
+                    return
                 game.farming(not self.dry_run)
                 self.publish("status","屯粮检查结束")
                 return
             if self.command == "review":
+                self.ensure_roster(game)
                 for policy in self.profile.teams:
-                    if policy.group != "main":
+                    if policy.group != "main" or not self.team_present(policy.key):
                         continue
                     obs = game.scan_team(policy)
                     if obs.state in ("home", "wounded") and obs.strength is not None:
@@ -285,14 +424,18 @@ class Worker(QThread):
                 self.publish("status", "已核对在主城的队伍；城外未知命令继续保留")
                 return
             if self.command == "dailies":
+                self.ensure_roster(game)
                 self.do_dailies(game)
                 self.publish("status", "日常检查结束")
                 return
             if self.command == "return":
+                self.ensure_roster(game)
                 for policy in self.profile.teams:
-                    if policy.group != "main" or not self.journal.phase(policy.key):
+                    if policy.group != "main" or not self.team_present(policy.key) or not self.journal.phase(policy.key):
                         continue
                     obs = self.observe_team(game, policy)
+                    if obs is None:
+                        continue
                     if self.journal.pending(policy.key):
                         self.publish("decision", {"team":policy.key,"action":"wait","reason":"上一笔回城或出征尚未结清，先继续核对，不重复回城"})
                         continue
@@ -320,19 +463,28 @@ class Worker(QThread):
                     return
                 try:
                     self.publish("status", "监控中 · 正在读取队伍" if self.command == "scan" else "只监控" if self.dry_run else "运行中")
-                    if not self.profile.account or not self.profile.main_city:
-                        game.calibrate_home()
+                    if not self.roster_checked:
+                        self.ensure_roster(game)
+                        self.roster_checked = True
                     policies = ([t for t in self.profile.teams if not t.role == "hidden"] if self.command == "scan"
                                 else [t for t in self.profile.teams if t.role in ("merit", "bandits")])
-                    if self.command == "run" and self.profile.food_enabled:
+                    # 只处理主城队伍里本次部队列表实际存在的那几支；亲卫不参与这三个功能。
+                    policies = self.active_policies(policies)
+                    # 粮食只跟随“刷武勋”：没有刷武勋队时，粮食多少都不屯田，
+                    # 也不因粮食恢复标记拦住讨贼/铺路/日常。
+                    merit_active = self.has_merit_team(policies)
+                    self.merit_active = merit_active
+                    game.food_gate = merit_active
+                    if merit_active and self.command == "run" and self.profile.food_enabled:
                         game.ensure_sandbox()
-                        if game.grain is not None:
-                            food_recovery = (food_recovery or game.grain < self.profile.food_low) and game.grain < self.profile.food_recover
-                            self.journal.set_flag("food_recovery",food_recovery)
+                        food_recovery = self.food_recovery_state(policies, game.grain, food_recovery)
+                        self.journal.set_flag("food_recovery", food_recovery)
                         if food_recovery:
                             game.farming(not self.dry_run, force=True)
-                            food_recovery = game.grain is None or game.grain < self.profile.food_recover
-                            self.journal.set_flag("food_recovery",food_recovery)
+                            food_recovery = self.food_recovery_state(policies, game.grain, food_recovery)
+                            self.journal.set_flag("food_recovery", food_recovery)
+                    else:
+                        food_recovery = False
                     game.reserved_teams = self.pave_team_keys()
                     # 2026-11-04：武勋只作展示——本次任务第一次读数作基线，之后每 30 分钟一次。
                     # 读不到就跳过一次，不影响任何派兵。
@@ -342,10 +494,10 @@ class Worker(QThread):
                     if self.command == "run" and self.bandits_due() and any(t.role == "bandits" for t in policies):
                         self.check_bandits(game,allow_execute=not food_recovery)
                     limited = self.order_limit_reached()
-                    # 粮食恢复标记按已读库存重算：低于触发值才置位，达到恢复值就解除。
-                    # 只读扫描也按事实重算（不写盘），避免上一轮残留标记把这一轮判成"恢复中"。
-                    if self.profile.food_enabled and game.grain is not None:
-                        fresh_recovery = (food_recovery or game.grain < self.profile.food_low) and game.grain < self.profile.food_recover
+                    # 粮食恢复标记按已读库存重算：只有刷武勋时才可能置位；
+                    # 没有刷武勋队时保持 false，讨贼/铺路/日常不受粮食影响。
+                    if merit_active and self.profile.food_enabled and game.grain is not None:
+                        fresh_recovery = self.food_recovery_state(policies, game.grain, food_recovery)
                         if fresh_recovery != food_recovery:
                             food_recovery = fresh_recovery
                             if self.command == "run" and not self.dry_run:
@@ -460,6 +612,10 @@ class Worker(QThread):
     def observe_team(self, game, policy):
         try:
             obs = game.scan_team(policy)
+        except TeamAbsent as exc:
+            # 本赛季尚未拥有的槽位不是故障：不读详情、不派兵、不写 WARN。
+            self.publish("observation", Observation(policy.key, note=str(exc)).__dict__)
+            return None
         except NetworkRecovered:
             raise
         except GameError as exc:
@@ -502,7 +658,8 @@ class Worker(QThread):
     def team_decision(self, game, policy, obs, food_recovery):
         if self.command == "run" and not self.dry_run and policy.key in self.pave_team_keys():
             return Decision(reason="该队保留给未完成的铺路路线")
-        decision = decide(self.profile, policy, obs, game.grain, self.journal.phase(policy.key))
+        decision = decide(self.profile, policy, obs, game.grain, self.journal.phase(policy.key),
+                          food_gate=self.merit_active)
         if food_recovery and decision.action in ("merit", "transfer"):
             decision = Decision(reason="粮食恢复中，等待达到恢复库存")
         if self.journal.pending(policy.key):
@@ -624,7 +781,7 @@ class Worker(QThread):
             if not game.verify_account():
                 raise RecognitionUnavailable("账号与主城尚未核对通过，等待下一轮重读")
         observations = []
-        # 快路径（0.7.2+）：先一帧读出五队状态，只对"可能派出/有待核对订单"的队读详情。
+        # 快路径（0.7.2+）：先一帧读出本次部队列表里各队状态，只对"可能派出/有待核对订单"的队读详情。
         # 忙碌、行军、驻守等队伍本轮不派兵，没必要再逐队开详情，省掉分钟级扫描。
         markers = {}
         fast = self.command == "run" and not self.dry_run and hasattr(game, "read_all_marker_states")
@@ -661,6 +818,8 @@ class Worker(QThread):
                     observations.append((policy, obs))
                     continue
                 obs = self.observe_team(game, policy)
+                if obs is None:
+                    continue
                 self.note_progress(policy, obs)
                 observations.append((policy, obs))
         batch = getattr(game, "team_reading_batch", None)
@@ -817,10 +976,15 @@ class Worker(QThread):
         self.publish("log", {"time": datetime.now().strftime("%H:%M:%S"), "level": "INFO", "message": message})
 
     def pave_team_keys(self):
-        """仍有未完成铺路路线的队伍；含 blocked（故障暂停也要保留归属）。"""
+        """仍有未完成铺路路线的队伍；含 blocked（故障暂停也要保留归属）。
+
+        本赛季尚未拥有的队伍不占用保留位，也不阻断其他队伍。
+        """
         keys = set()
         for route in self.profile.pave_routes:
             if not route.team or not route.points:
+                continue
+            if not self.team_present(route.team):
                 continue
             progress = self.journal.pave_progress(route.name)
             if progress["fingerprint"] and progress["fingerprint"] != self.pave_fingerprint(route):
@@ -897,6 +1061,10 @@ class Worker(QThread):
             policy = next((t for t in self.profile.teams if t.key == route.team), None)
             if policy is None or policy.group != "main":
                 continue
+            if not self.team_present(policy.key):
+                self.log_once(f"pave-absent:{route.name}",
+                              f"铺路路线 {route.name} 所属的 {policy.display} 尚未拥有，暂不推进", every=3600)
+                continue
             progress = self.journal.pave_progress(route.name)
             fingerprint = self.pave_fingerprint(route)
             if progress["fingerprint"] and progress["fingerprint"] != fingerprint:
@@ -923,6 +1091,8 @@ class Worker(QThread):
                 continue
             self.journal.set_phase(policy.key, "pave")
             obs = self.observe_team(game, policy)
+            if obs is None:
+                continue
             if obs.state == "wounded" or obs.wounded is True:
                 self.journal.set_pave(route.name, progress["idx"], "recovering", "重伤中，等待现场确认恢复")
                 self.publish("decision", {"team": policy.key, "action": "wait", "reason": "铺路：等待重伤恢复"})
@@ -956,6 +1126,8 @@ class Worker(QThread):
                     progress = self.journal.pave_progress(route.name)
                     # 刚才可能导航核对目标，派出前必须重新读取本队，不能沿用过期观测。
                     obs = self.observe_team(game, policy)
+                    if obs is None:
+                        continue
                 else:
                     self.publish("decision", {"team": policy.key, "action": "wait", "reason": "铺路仍在进行或状态待确认；按现场等待"})
                     continue
@@ -1030,7 +1202,8 @@ class Worker(QThread):
         return False
 
     def bandits_enabled_today(self):
-        return bool(self.profile.dailies.get("bandits") and any(t.role == "bandits" for t in self.profile.teams)
+        teams = [t for t in self.profile.teams if t.role == "bandits" and self.team_present(t.key)]
+        return bool(self.profile.dailies.get("bandits") and teams
                     and (self.profile.bandit_allow_assist or self.journal is None or not self.journal.bandits_exhausted()))
 
     def bandits_due(self):
@@ -1076,7 +1249,8 @@ class Worker(QThread):
             processed += int(not recurring or result is not False)
             if max_tasks and processed >= max_tasks:
                 break
-        if self.command == "dailies" and daily.get("bandits") and any(t.role == "bandits" for t in self.profile.teams):
+        if self.command == "dailies" and daily.get("bandits") and any(
+                t.role == "bandits" and self.team_present(t.key) for t in self.profile.teams):
             self.check_bandits(game)
         if daily.get("career"):
             self.publish("daily", {"task":"career","result":"职业技能的消耗与入口待校验，本版保留设置但不执行"})

@@ -84,6 +84,10 @@ class DispatchUnconfirmed(GameError):
         self.status = status          # 提交后读到的卡状态（出征页）
 
 
+class TeamAbsent(GameError):
+    """本赛季该主队槽位尚未拥有；不读取、不派兵，也不是故障。"""
+
+
 class RallyJoinRejected(GameError):
     """集结已确认不可加入（如满员）且奖励次数未被消耗；可换其他集结有限重试。"""
 
@@ -102,6 +106,11 @@ class ActionUnavailable(GameError):
 
 
 class Game:
+    # 启动时从部队列表确认的主队槽位；None=尚未确认（只用于启动读取第1队）。
+    # 放在类上，测试或旧工具用 __new__ 构造 Game 时也不会缺字段。
+    active_slots = None
+    # 本次是否有实际刷武勋队；False 时粮食低也不拦讨贼/铺路。
+    food_gate = True
     # 只读库存刷新间隔。每次刷新要截图 + 页面识别 + 读数，和派兵抢同一个 OCR 线程；
     # 5 秒一次时等待期间几乎一直在识别，反而拖慢真正的游戏操作。
     RESOURCE_INTERVAL = 10
@@ -109,6 +118,10 @@ class Game:
     # 出征页五张卡的横向中心（实机实测间距 250）与卡片中心高度。
     CARD_X = (135, 385, 635, 885, 1135)
     CARD_Y = 880
+    # 2026-11-08 实机：出征卡槽不是固定五列，而是按实际队伍数整体居中。
+    # 两队在 x≈519/768（卡宽 250、间距 250），五队仍是 x≈142..1142。
+    CARD_AREA_CENTER = 642
+    CARD_SPACING = 250
     # 出征按钮位置（实机实测）：1540–1895 × 932–1036。
     SUBMIT_POINT = (1717, 984)
     # 配置动作 -> 菜单图标文件名。
@@ -130,6 +143,10 @@ class Game:
         self.resource_observed_at = None
         self.network_attempts = []
         self.navigation_attempts = []
+        # 本赛季实际拥有的主队槽位；None 表示尚未检测，不能据此过滤配置。
+        self.active_slots = None
+        # 是否有实际刷武勋队；Worker 每轮写入，讨贼决定据此忽略粮食门槛。
+        self.food_gate = True
 
     def log(self, message, level="INFO"):
         self.emit("log", {"time": datetime.now().strftime("%H:%M:%S"), "level": level, "message": message})
@@ -475,24 +492,92 @@ class Game:
                 raise RecognitionUnavailable("当前页面暂未识别，等待画面恢复后自动重读")
         raise RecognitionUnavailable("本轮未能返回沙盘，稍后重新识别页面")
 
-    def main_portraits(self):
+    def note_team_roster(self, image):
+        """从部队页/部队总览左侧行确认本次运行实际拥有的主队。
+
+        用户 2026-11-08：队伍数量以游戏自己的部队列表为准，不看右侧头像；
+        启动时读一次，运行期间队伍数量视为不变。行号必须从 1 连续，
+        行号缺口说明 OCR 漏了一行，本次不确认，交给上层重试。
+        """
+        if self.active_slots is not None or image is None:
+            return bool(self.active_slots)
+        if self.v.page(image) != "overview":
+            # 部队详情页固定列 5 个槽位（空槽位也有“部队三/四/五”文字），
+            # 只有“部队总览”才只列实际拥有的队伍。
+            return False
+        reader = getattr(self.v, "full_team_rows", None)
+        if reader is None:
+            return False
+        rows = reader(image)
+        slots = {slot for slot in rows if 1 <= slot <= 5}
+        if not slots:
+            return False
+        if slots != set(range(1, max(slots) + 1)):
+            self.log(f"部队列表行号不连续（读到 {sorted(slots)}），本次不确认", "WARN")
+            return False
+        self.active_slots = slots
+        self.emit("team_presence", {"slots": sorted(slots)})
+        self.log(f"部队列表确认本次运行共 {len(slots)} 队：槽位 {sorted(slots)}")
+        return True
+
+    def open_team_page(self, slot):
+        """打开部队页（详情或总览），不读页码、不做“第 1 页”证明。
+
+        2026-11-09 根因：右侧头像页码是旧八队布局的分页状态，和“这是不是
+        当前队伍页”无关；用固定屏幕区域的颜色去猜页码，会让地图底色决定
+        三队能否读取。这里只做一件事：点本槽位头像，直到进入部队页/总览。
+        进入后由部队列表行和选中槽位核对身份；点错队不会变成读错队。
+        """
+        y = (245, 383, 520, 660, 785)[slot - 1]
         image = self.ensure_sandbox(refresh_grain=False)
-        swiped = False
         for attempt in range(3):
-            page_number = self.v.portrait_page(image)
-            if page_number == 1:
+            page = self.v.page(image)
+            if page in ("team", "overview"):
                 return image
-            if page_number == 2 and not swiped:
-                self.d.swipe(1841, 248, 1841, 776)
-                swiped = True
-            # 页码未知不滑动/点头像；滑动结果也必须重新截图确认。
-            if attempt < 2:
-                self.d.control.sleep(.5)
-                image = self.ensure_sandbox(refresh_grain=False)
-        self.save_image(image,"portrait-page-unreadable",True)
-        self.emit("vision", {"stage":"portrait_page", "page":page_number,
-                             "attempts":3, "swiped":swiped})
-        raise GameError("未确认部队列表第 1 页（已重读 3 次），停止本队读取")
+            if page == "sandbox":
+                self.d.tap(1840, y, .7)
+                image = self.wait_transition(self.capture(), expected=("sandbox", "overview", "team", "city"))
+                if self.v.page(image) == "sandbox":
+                    # 第一下可能只是选中地图，再点一次头像。
+                    self.d.tap(1840, y, .7)
+                    image = self.wait_transition(self.capture(), expected=("sandbox", "overview", "team", "city"))
+                if self.v.page(image) in ("team", "overview"):
+                    return image
+            if self.v.page(image) == "city":
+                # 头像进入内城：出城后重试，仍在沙盘上核对。
+                image = self.ensure_sandbox()
+                continue
+            image = self.ensure_sandbox()
+        self.save_image(image, f"team-page-unconfirmed-{slot}", True)
+        raise RecognitionUnavailable(f"未打开第 {slot} 队部队页，等待重读")
+
+    def read_roster(self, slot):
+        """打开“部队总览”，只读实际拥有的主队行。
+
+        用户 2026-11-08 实机：部队详情页固定列 5 个槽位（空槽位也有文字），
+        “部队总览”才只列实际队伍。这里只点探针队自己的头像；如果进了部队详情，
+        再点左下“部队总览”。不点其他队，避免碰正在集结的第一队。
+        """
+        for attempt in range(2):
+            image = self.open_team_page(slot)
+            page = self.v.page(image)
+            if page == "team":
+                button = self.v.find(image, ["部队总览"], (0, 740, 330, 940), exact=True)
+                if not button:
+                    self.save_image(image, "roster-overview-button-unreadable", True)
+                    self.ensure_sandbox()
+                    continue
+                self.d.tap(button.x, button.y, .8)
+                image = self.capture("roster-overview", True)
+                page = self.v.page(image)
+            if page == "overview" and self.note_team_roster(image):
+                self.close_panel(image)
+                self.ensure_sandbox()
+                return set(self.active_slots or ())
+            if page == "overview":
+                self.close_panel(image)
+            self.ensure_sandbox()
+        raise GameError("未从部队总览读到有效队伍列表")
 
     def wait_transition(self, image, expected=("sandbox","overview"), transitional=("unknown",)):
         for attempt in range(5):
@@ -530,27 +615,30 @@ class Game:
         raise GameError("页面切换未完成")
 
     def locate_team(self, slot):
-        image = self.main_portraits()
+        # 不再先证明“第 1 页”：头像列表只有一页时页码为什么读不到，与队伍读取无关。
+        # 定位只负责把镜头带到目标队；读到的数据随后由部队列表行/选中槽位核对。
+        image = self.ensure_sandbox(refresh_grain=False)
+        if self.active_slots is not None and slot not in self.active_slots:
+            raise TeamAbsent(f"主城 {slot} 队不在本次部队列表中（当前 {sorted(self.active_slots)} 队）")
         # 当前已选中的本队就在本人主城时，复用现场详情，免去重复切头像和拖图。
         if (image is not None and self.p.main_city
                 and self.v.home_team_visible(image, slot)
-                and self.v.map_coordinates(image) == (self.p.main_city.x, self.p.main_city.y)
-                and self.v.find(image, ["亲卫整编"], (1000, 595, 1668, 716))
-                and self.home_matches_account(image)):
+                and self.main_city_selected(image)):
             return image
         y = (245, 383, 520, 660, 785)[slot-1]
-        other_y = (245,383,520,660,785)[slot % 5]
-        self.d.tap(1840,other_y,.4)
-        image = self.wait_transition(self.capture(), expected=("sandbox", "overview", "city"))
-        if self.v.page(image) == "overview":
-            self.close_panel(image)
-        elif self.v.page(image) == "city":
-            self.ensure_sandbox()
+        # 2026-11-08 用户要求：第一队正在集结时不能碰。取消选中不再点另一支队，
+        # 只点目标队自己的头像；打开的详情/总览先关掉，再用地图往返拖动取消选中。
+        self.d.tap(1840, y, .7)
+        image = self.wait_transition(self.capture(), expected=("sandbox", "overview", "team", "city"))
+        if self.v.page(image) in ("overview", "team", "city"):
+            image = self.ensure_sandbox()
         # 拖动地图取消选择；点击地图空地会选中土地，再点头像反而打开行军确认页。
-        self.clear_map_selection()
+        self.clear_map_selection(image)
         # 反向拖回原视角，避免同在主城的头像没有重新居中时不断累积地图偏移。
         self.d.tap(1840, y, .8)
-        image = self.wait_transition(self.capture(), expected=("sandbox", "overview", "city"))
+        image = self.wait_transition(self.capture(), expected=("sandbox", "overview", "team", "city"))
+        if self.v.page(image) == "team":
+            image = self.ensure_sandbox()
         if self.v.page(image) == "city":
             # 主城头像在已定位状态下可能直接进内城；退出后仍须按坐标和归属核对。
             self.emit("status", "主城头像进入内城 · 出城后继续核对队伍")
@@ -571,21 +659,40 @@ class Game:
                 image = self.wait_transition(self.capture(), expected=("sandbox",))
         return image
 
+    def main_city_selected(self, image, coord=None):
+        """当前画面是否选中了自己主城。
+
+        旧赛季主城菜单有“亲卫整编”；2026-11-08 新赛季该菜单已换成行军/驻守/外观。
+        两种布局都认，但必须坐标一致且归属名匹配，不能只看坐标。
+        """
+        if not self.p.main_city:
+            return False
+        coord = coord if coord is not None else self.v.map_coordinates(image)
+        if coord != (self.p.main_city.x, self.p.main_city.y):
+            return False
+        if self.v.find(image, ["亲卫整编"], (1000, 595, 1668, 716)):
+            return True
+        return bool(self.home_matches_account(image))
+
     def calibrate_home(self):
         image = self.ensure_sandbox()
+        # 新赛季“回城”可能直接进入城内；先回沙盘，再点主城中心读取坐标和归属。
         self.d.tap(90, 1000, 1.0)
+        image = self.ensure_sandbox()
         self.d.tap(960, 512, 1.0)
         image = self.capture("home-calibration", True)
         coord = self.v.map_coordinates(image)
-        title = self.v.find(image, ["主公"], (325, 368, 742, 444))
-        castle = self.v.find(image, ["亲卫整编"], (1000, 595, 1668, 716))
         labels = self.v.read(image, (540, 370, 717, 437))
         owner = max(labels, key=lambda t: t.score).text if labels else ""
-        if not coord or not title or not castle or not owner:
-            raise GameError("回城后仍未确认主城归属、坐标和亲卫整编菜单")
+        if not coord or not owner:
+            raise GameError("回城后仍未确认主城坐标和归属名")
         if owner in ("主公", "驻城部队"):
             raise GameError("主城账号名称未识别")
+        if self.p.account and owner != self.p.account:
+            raise GameError(f"当前游戏账号 {owner} 与配置档 {self.p.account} 不符；请确认账号后再运行")
         self.p.account = owner
+        if not self.home_matches_account(image):
+            raise GameError("主城标题与归属名不一致，未确认主城")
         self.p.main_city = Point(name="我的主城", x=coord[0], y=coord[1], expected_name=owner)
         self.account_checked = True
         self.emit("calibrated", {"account": owner, "main_city": asdict(self.p.main_city)})
@@ -594,10 +701,8 @@ class Game:
     def check_account(self, image):
         if not self.p.main_city or not self.p.account:
             return
-        # 主城详情必须同时满足坐标、归属名和主城特有菜单。
-        coord = self.v.map_coordinates(image)
-        castle = self.v.find(image, ["亲卫整编"], (1000, 595, 1668, 716))
-        if coord == (self.p.main_city.x, self.p.main_city.y) and castle:
+        # 主城详情必须同时满足坐标、归属名和已选中主城；旧“亲卫整编”和新版菜单都认。
+        if self.main_city_selected(image):
             if not self.home_matches_account(image):
                 raise GameError("主城账号与配置档不符，请重新校验账号后运行")
             self.account_checked = True
@@ -670,6 +775,8 @@ class Game:
     def scan_team(self, policy: TeamPolicy) -> Observation:
         if policy.group != "main":
             return Observation(policy.key, note="亲卫槽位可配置，自动读数与出征待实机验收")
+        if self.active_slots is not None and policy.slot not in self.active_slots:
+            raise TeamAbsent(f"主城 {policy.slot} 队尚未拥有，跳过读取")
         self.emit("status", f"正在读取 {policy.display} · 定位与核对兵力")
         y = (245, 383, 520, 660, 785)[policy.slot-1]
         image = self.locate_team(policy.slot)
@@ -678,8 +785,8 @@ class Game:
         for attempt in range(3):
             coord = self.v.map_coordinates(image)
             home_coordinate = bool(self.p.main_city and coord == (self.p.main_city.x, self.p.main_city.y))
-            castle = self.v.find(image, ["亲卫整编"], (1000, 595, 1668, 716)) if home_coordinate else None
-            if coord is not None and (not home_coordinate or castle):
+            home_detail = self.main_city_selected(image, coord) if home_coordinate else False
+            if coord is not None and (not home_coordinate or home_detail):
                 break
             if coord is None:
                 marker = cv2.cvtColor(image[y+3:y+45,1840:1900], cv2.COLOR_BGR2HSV)
@@ -694,9 +801,7 @@ class Game:
             self.update_grain(image)
             self.next_resource_check = time.monotonic() + self.RESOURCE_INTERVAL
         coord = self.v.map_coordinates(image)
-        if self.p.main_city and self.v.home_team_visible(image, policy.slot) and not (
-                coord == (self.p.main_city.x, self.p.main_city.y)
-                and self.v.find(image, ["亲卫整编"], (1000, 595, 1668, 716))):
+        if self.p.main_city and self.v.home_team_visible(image, policy.slot) and not self.main_city_selected(image, coord):
             # 刚到家时头像已显示主城军旗，但镜头未选中城池；只按已确认军旗补核对主城。
             # 不能因为主动前往主城，就把原本仍在城外的队伍当作在家。
             image = self.go_to(self.p.main_city)
@@ -704,7 +809,7 @@ class Game:
                 raise GameError("主城定位后队伍标记变化，本次读数作废")
             coord = self.v.map_coordinates(image)
         self.check_account(image)
-        home = bool(self.p.main_city and coord == (self.p.main_city.x, self.p.main_city.y) and self.v.find(image, ["亲卫整编"], (1000, 595, 1668, 716)))
+        home = bool(self.p.main_city and self.main_city_selected(image, coord))
         # 与状态判定同一帧读角标，避免"兵马数值一帧、状态另一帧"。
         marker = self.read_team_marker(image, policy.slot)
         detail_observed_at = None
@@ -758,6 +863,9 @@ class Game:
                         obs = self.read_overview_batch(overview, policy)
                         detail_observed_at = self._team_overview_cache[policy.key][1]
                     else:
+                        # 头像入口不承担身份证明：总览里按槽位选中本队并核对高亮，
+                        # 点错头像也不会把别的队数据当成本队。
+                        overview = self.select_full_team_slot(overview, policy.slot)
                         obs = self.read_overview(overview, policy.key)
                         self.close_panel(overview)
                     obs.state, obs.location = state, coord
@@ -801,6 +909,8 @@ class Game:
         reader = self.marker_reader()
         if not reader:
             return None
+        if self.active_slots is not None and slot not in self.active_slots:
+            return None
         try:
             for attempt in range(2):
                 if _vcall(self.v, "frame_clear", True, image) and reader.avatars_visible(image):
@@ -818,9 +928,12 @@ class Game:
             return None
 
     def read_all_marker_states(self):
-        """一帧读出五队状态（约0.3秒）；画面不可用时返回空，调用方退回逐队读取。"""
+        """一帧读出本次部队列表里的队伍状态；画面不可用时返回空，调用方退回逐队读取。"""
         reader = self.marker_reader()
         if not reader:
+            return {}
+        slots = sorted(self.active_slots or ())
+        if not slots:
             return {}
         try:
             image = self.capture()
@@ -832,7 +945,7 @@ class Game:
             if not _vcall(self.v, "frame_clear", True, image) or not reader.avatars_visible(image):
                 return {}
             states = {}
-            for slot in range(1, 6):
+            for slot in slots:
                 marker = reader.read_slot(image, slot)
                 if marker["state"] in ("idle", "unknown") and _vcall(self.v, "team_wounded", False, image, slot):
                     marker = {**marker, "state": "wounded", "label": state_label("wounded"), "reason": "头像重伤文字"}
@@ -893,9 +1006,12 @@ class Game:
             page = self.v.page(image)
             if page not in ("team", "overview"):
                 break
-            fallback = (329, 437, 545, 653, 761) if page == "overview" else (221, 335, 448, 560, 674)
+            fallback = (329, 437, 545, 653, 761) if page == "overview" else (149, 262, 375, 488, 601)
             fallback_x = 264 if page == "overview" else 126
-            row = self.v.full_team_rows(image).get(slot)
+            rows = self.v.full_team_rows(image)
+            if rows and slot not in rows:
+                raise TeamAbsent(f"当前部队页没有第 {slot} 队（已识别 {sorted(rows)} 队）")
+            row = rows.get(slot)
             x, y = (row.x, row.y) if row else (fallback_x, fallback[slot-1])
             self.d.tap(x, y, .5)
             image = self.capture()
@@ -1094,13 +1210,50 @@ class Game:
             if icon and icon in buttons:
                 x, y, _score = buttons[icon]
                 return ACTION_NAMES[action], action, (x, y)
+        # 2026-11-08 实机：菜单动画/高光会让图标相似度在某一帧掉到阈值以下。
+        # 只重试一次、约 0.2 秒；仍不中才退回文字，避免无谓拖慢正常派兵。
+        if callable(getattr(self.d, "capture", None)):
+            self.d.control.sleep(.2)
+            fresh = self.capture("action-icons-retry")
+            if _vcall(self.v, "frame_clear", True, fresh):
+                retry_buttons = _vcall(self.v, "action_buttons", {}, fresh)
+                for action in point.actions:
+                    icon = self.ICON_FOR_ACTION.get(action)
+                    if icon and icon in retry_buttons:
+                        x, y, _score = retry_buttons[icon]
+                        return ACTION_NAMES[action], action, (x, y)
+                image = fresh
         labels = [ACTION_NAMES[a] for a in point.actions]
         button = self.v.find(image, labels, (1100, 150, 1800, 860), exact=True)
         if not button:
             raise GameError(f"目标 {point.name} 当前没有允许的动作 {labels}，稍后重读或换备用目标")
         chosen = button.text.replace(" ", "")
-        action = next((a for a in point.actions if ACTION_NAMES[a] == chosen), "transfer")
+        action = next((a for a in point.actions if ACTION_NAMES[a] == chosen), None)
+        if action is None:
+            # 2026-11-08 实机：新赛季“行军”按钮被 OCR 读成“研究”，但点击位置正确。
+            # 当前目标只配置了一条动作时，按配置动作执行，日志也用配置名；
+            # 多动作时仍拒绝，避免把另一个按钮当成配置动作。
+            if len(point.actions) == 1:
+                action = point.actions[0]
+                chosen = ACTION_NAMES[action]
+            else:
+                raise GameError(f"{point.name} 的动作文字未核对：读到 {chosen!r}")
         return chosen, action, (button.x, button.y)
+
+    def card_center(self, slot):
+        """出征页第 slot 队的卡片中心 x。
+
+        用户 2026-11-08 实机纠正：卡槽会按实际队伍数整体居中，不是固定五列。
+        已知实际队伍数时按“卡宽250、间距250、整组居中”计算；没读到清单时才退回旧五列。
+        """
+        slots = sorted(getattr(self, "active_slots", None) or ())
+        if not slots:
+            return self.CARD_X[slot - 1]
+        try:
+            index = slots.index(slot)
+        except ValueError:
+            index = slot - 1
+        return round(self.CARD_AREA_CENTER + (index - (len(slots) - 1) / 2) * self.CARD_SPACING)
 
     def _dispatch(self, policy: TeamPolicy, obs: Observation, point: Point, kind: str, reuse_target=False):
         if self.j.pending(policy.key):
@@ -1125,8 +1278,8 @@ class Game:
                                      "target": point.name, "reason": hint})
             self.log(f"{policy.display} / {point.name}：出征按钮不可用 —— {hint or '未读到上方说明'}", "WARN")
             raise GameError(f"出征按钮不可用：{hint or '未读到上方说明'}")
-        # 选队：点卡片正中间（五卡间距 250），不做选中确认。
-        card_x = self.CARD_X[policy.slot - 1]
+        # 选队：按本次实际队伍数计算卡片中心；少队时整组居中，不是固定五列。
+        card_x = self.card_center(policy.slot)
         self.d.tap(card_x, self.CARD_Y, .3)
         if kind == "transfer":
             image = self.capture()
@@ -1203,7 +1356,8 @@ class Game:
                 # 读得到且仍停在原地，才算“这条指令没成”，允许按顺序换下一条。
                 last = late if late is not None else after
                 last_page = self.v.page(last)
-                last_status = self.v.deployment_status(last, policy.slot) if last_page == "deployment" else ""
+                last_status = (self.v.deployment_status(last, policy.slot, self.card_center(policy.slot))
+                               if last_page == "deployment" else "")
                 marker_now = self.read_team_marker(last, policy.slot)
                 marker_state = (marker_now or {}).get("state")
                 if marker_state and marker_state != "unknown":
@@ -1237,7 +1391,7 @@ class Game:
         """
         page = self.v.page(image)
         if page == "deployment":
-            status = self.v.deployment_status(image, policy.slot)
+            status = self.v.deployment_status(image, policy.slot, self.card_center(policy.slot))
             if status in ("marching", "returning", "guarding", "outside"):
                 return True, status, f"结果页 deployment / {status}"
             return False, "confirmed", f"结果页 deployment / {status}"
@@ -1297,7 +1451,7 @@ class Game:
             self.emit("diagnostic", {"stage": "pave_departure_disabled", "team": policy.key,
                                      "target": name, "reason": hint})
             raise GameError(f"出征按钮不可用：{hint or '未读到上方说明'}")
-        card_x = self.CARD_X[policy.slot - 1]
+        card_x = self.card_center(policy.slot)
         self.d.tap(card_x, self.CARD_Y, .3)
         image = self.capture()
         # 自动回城一旦勾选，占领结束就会回城，无法继续下一段。
@@ -1558,10 +1712,13 @@ class Game:
                 continue
             if policy.role != "bandits" or policy.group != "main":
                 continue
+            if getattr(self, "active_slots", None) is not None and policy.slot not in self.active_slots:
+                continue  # 本次部队列表没有这支讨贼队，不读、不派。
             if self.j.pending(policy.key) or self.j.failure_streak(policy.key) >= 3:
                 continue
             obs = self.scan_team(policy)
-            decision = bandit_decision(self.p,policy,obs,self.grain)
+            decision = bandit_decision(self.p,policy,obs,self.grain,
+                                       food_gate=getattr(self, "food_gate", True))
             self.emit("decision",{"team":policy.key,"action":decision.action,"reason":decision.reason})
             if decision.action != "bandits":
                 continue
@@ -1623,10 +1780,10 @@ class Game:
         title = self.v.joined(image,(0,0,450,180))+self.v.joined(image,(750,0,1190,180))
         if not verified_rally or not any(s in title for s in ("讨贼","讨伐")):
             raise GameError("加入页任务不是已核对的讨贼，不派兵")
-        x = 200+(policy.slot-1)*249
-        self.d.tap(x,910,.2)
+        x = self.card_center(policy.slot)
+        self.d.tap(x, self.CARD_Y, .2)
         image = self.capture()
-        if self.v.deployment_status(image,policy.slot) not in ("home", "unknown", None):
+        if self.v.deployment_status(image, policy.slot, x) not in ("home", "unknown", None):
             raise GameError("讨贼出征卡片正在执行其他任务，本次跳过")
         route = self.v.joined(image,(750,108,1250,174))
         if any(s in route for s in ("阻挡","无法","超时")):
@@ -1642,7 +1799,7 @@ class Game:
         try:
             self.emit("team_action",{"team":policy.key,"state":"confirming","reason":"正在核对讨贼出发结果"})
             result_state = "confirmed"
-            self.d.tap(x,910,.08)
+            self.d.tap(x, self.CARD_Y, .08)
             self.d.tap(submit.x,submit.y,.5)
             # 成功/失败提示是短暂浮层：先抢一帧提示，再等流程关闭后取稳定页。
             toast = self.capture("bandit-join-toast",True)
@@ -1672,7 +1829,7 @@ class Game:
             result_text = self.v.joined(toast,(300,240,1650,900)) + self.v.joined(after,(470,240,1510,895))
             acknowledged = any(s in result_text for s in ("加入成功","集结成功"))
             if page == "deployment":
-                state = self.v.deployment_status(after,policy.slot)
+                state = self.v.deployment_status(after, policy.slot, self.card_center(policy.slot))
                 acknowledged = acknowledged or state in ("marching","guarding","outside")
                 if state in ("marching","guarding","outside"):
                     result_state = state

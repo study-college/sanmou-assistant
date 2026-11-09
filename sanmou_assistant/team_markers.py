@@ -1,4 +1,4 @@
-"""主队五队头像角标：单帧读取游戏状态。
+"""主队头像角标：按槽位单帧读取游戏状态（支持少队）。
 
 规则来源：用户在 2026-11-02 校准的角标含义，见 `team_states.py` 与
 `artifacts/team-marker-calibration/`。本模块只做三件事：
@@ -70,7 +70,7 @@ class TemplateError(RuntimeError):
 
 
 class TeamMarkerReader:
-    """从 1920×1080 单帧读出五队状态。"""
+    """从 1920×1080 单帧按槽位读出队伍状态。"""
 
     def __init__(self, template_dir: Path | None = None):
         self.template_dir = template_dir or Path(__file__).with_name("assets") / "team-markers"
@@ -104,14 +104,20 @@ class TeamMarkerReader:
 
     @staticmethod
     def avatars_visible(image: np.ndarray) -> bool:
-        """右侧五个头像是否在当前画面上（有血条即认为在）。切页/弹窗/动画时返回 False。"""
+        """右侧 HUD 是否已经出现（只作画面可用性判断，不用于数队伍）。
+
+        2026-11-08 用户明确：队伍数量以游戏部队列表为准，不看头像。
+        这里只要求右侧至少有一支队伍的血条，少队/空槽位不影响。
+        """
+        if image is None or image.shape[:2] != (1080, 1920):
+            return False
         hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
         s, v = hsv[:, :, 1], hsv[:, :, 2]
         for y in SLOT_Y:
             bar = (s[y + 51:y + 57, 1780:1900] > 90) & (v[y + 51:y + 57, 1780:1900] > 120)
-            if bar.mean() < .2:
-                return False
-        return True
+            if bar.mean() >= .2:
+                return True
+        return False
 
     @staticmethod
     def _window(image, slot):

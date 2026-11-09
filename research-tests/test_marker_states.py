@@ -20,6 +20,7 @@ def test_pave_arrival_requires_stationary_at_the_target():
 def test_fast_path_only_reads_details_for_teams_we_might_dispatch():
     assert needs_detail({"state": "stationary"}, False)          # 停留：要读兵力才能派
     assert needs_detail({"state": "idle"}, False)                # 空闲：要读兵力才能派
+    assert needs_detail({"state": "training"}, False)            # 智能练兵：等同空闲，可派
     assert needs_detail({"state": "transfer_stay"}, False)       # 营帐里：可能要派
     assert not needs_detail({"state": "busy"}, False)            # 忙碌：不派，省掉详情
     assert not needs_detail({"state": "march"}, False)           # 行军：不派
@@ -30,12 +31,24 @@ def test_fast_path_only_reads_details_for_teams_we_might_dispatch():
 
 
 def test_dispatch_rules_follow_the_learned_states():
-    assert can_dispatch("idle") and can_dispatch("stationary") and can_dispatch("transfer_stay")
+    assert (can_dispatch("idle") and can_dispatch("training")
+            and can_dispatch("stationary") and can_dispatch("transfer_stay"))
     for state in ("busy", "march", "transfer", "guard", "retreat", "fighting", "queued_battle", "unknown"):
         assert not can_dispatch(state)
     assert is_busy("busy")
     assert is_in_battle("fighting") and is_in_battle("queued_battle")
     assert is_moving("march") and is_moving("retreat") and is_moving("transfer")
+
+
+def test_training_marker_is_dispatchable_like_idle():
+    # 用户 2026-11-08：绿色持枪人影=智能练兵，等同空闲，武将体力满时可正常行动。
+    p = Profile(account="测试", main_city=Point(x=100, y=200),
+                targets=[Point(name="山道", x=636, y=286)])
+    t = p.teams[0]
+    t.role = "merit"
+    obs = Observation(t.key, state="home", strength=33000, maximum=33000,
+                      stamina=200, supply=100, wounded=False, marker_state="training")
+    assert decide(p, t, obs, 1000000).action == "merit"
 
 
 def test_overview_prefers_marker_label_and_falls_back_to_legacy():

@@ -101,6 +101,16 @@ def test_every_state_has_a_legacy_mapping_for_the_worker(reader):
     assert LEGACY_STATE["unknown"] == "unknown"
 
 
+def test_green_training_badge_is_learned_as_dispatchable_training(reader):
+    # 用户 2026-11-08：绿色持枪人影=智能练兵，等同空闲，可正常行动。
+    result = reader.read_slot(scene("artifacts/team-marker-calibration/frame-09-training/frame.png"), 2)
+    assert result["state"] == "training"
+    assert result["label"] == "练兵（可出击）"
+    from sanmou_assistant.team_states import LEGACY_STATE, can_dispatch
+    assert can_dispatch("training")
+    assert LEGACY_STATE["training"] == "home"
+
+
 def test_avatars_visible_requires_the_right_edge_column(reader):
     assert reader.avatars_visible(scene("artifacts/team-marker-calibration/frame-01/frame.png"))
     assert not reader.avatars_visible(np.zeros((1080, 1920, 3), dtype=np.uint8))

@@ -57,7 +57,7 @@ class FakeVision:
                 return SimpleNamespace(x=wanted[label][0], y=wanted[label][1])
         return None
 
-    def deployment_status(self, image, slot):
+    def deployment_status(self, image, slot, center_x=None):
         return image.vision.get("status", "home")
 
     def deployment_strength(self, image, slot):

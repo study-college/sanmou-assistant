@@ -77,6 +77,29 @@ def test_desktop_forms_preserve_team_and_target_settings(tmp_path):
     app.processEvents()
 
 
+def test_missing_teams_are_locked_and_guard_rows_hidden(tmp_path):
+    # 用户 2026-11-08：实际只有两队时，设置里不能再去配置/启用第 3、4、5 队。
+    app = QApplication.instance() or QApplication([])
+    window = Window(tmp_path)
+    window.apply_team_presence([1, 2])
+    # 第 1、2 队正常可设置。
+    for row in (0, 1):
+        assert window.team_table.cellWidget(row, 0).isEnabled()
+        assert any(button.isEnabled() for button in window.team_table.cellWidget(row, 2).findChildren(QRadioButton))
+    # 第 3 队没有：任务、兵力、兵力下限、详情全部锁住，并标明未拥有。
+    assert not window.team_table.cellWidget(2, 0).isEnabled()
+    assert all(not button.isEnabled() for button in window.team_table.cellWidget(2, 2).findChildren(QRadioButton))
+    assert not window.team_table.cellWidget(2, 3).isEnabled()
+    assert not window.team_table.cellWidget(2, 4).isEnabled()
+    assert not window.team_table.cellWidget(2, 7).isEnabled()
+    assert "未拥有" in window.team_table.item(2, 1).text()
+    assert not window.live.cellWidget(2, 0).isEnabled()
+    # 亲卫不参与三个功能，设置页不再显示。
+    assert window.team_table.isRowHidden(5)
+    window.close()
+    app.processEvents()
+
+
 def test_live_action_confirmation_updates_state_without_waiting_for_next_scan(tmp_path):
     app = QApplication.instance() or QApplication([])
     window = Window(tmp_path)

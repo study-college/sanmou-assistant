@@ -217,6 +217,13 @@
       "captured_at": "2026-11-02T17:1"
     },
     {
+      "state": "training",
+      "file": "training-1.png",
+      "source": "artifacts/team-marker-calibration/frame-09-training",
+      "slot": 2,
+      "captured_at": "2026-11-08T22:11:40+08:00"
+    },
+    {
       "state": "transfer",
       "file": "transfer-1.png",
       "source": "artifacts/team-marker-calibration/frame-04",

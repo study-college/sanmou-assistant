@@ -59,8 +59,8 @@ def test_march_with_rest_layers_is_a_deployment_page():
 def test_locate_home_portrait_can_exit_city_without_assuming_home():
     g = Game.__new__(Game)
     calls = []
-    g.main_portraits = lambda:None
-    g.clear_map_selection = lambda:None
+    g.p = Profile()
+    g.clear_map_selection = lambda *a, **k:None
     g.d = SimpleNamespace(tap=lambda *a:calls.append(("tap",a)), swipe=lambda *a:None)
     g.v = SimpleNamespace(page=lambda im, verify=True:im, map_coordinates=lambda im:(100,100))
     frames = iter(["sandbox","city"])
@@ -69,7 +69,7 @@ def test_locate_home_portrait_can_exit_city_without_assuming_home():
         assert im in expected
         return im
     g.wait_transition = transition
-    g.ensure_sandbox = lambda:calls.append(("exit-city",)) or "sandbox"
+    g.ensure_sandbox = lambda **kw:calls.append(("exit-city",)) or "sandbox"
     g.emit = lambda *a:None
     assert g.locate_team(1) == "sandbox"
     assert ("exit-city",) in calls
@@ -78,8 +78,8 @@ def test_locate_home_portrait_can_exit_city_without_assuming_home():
 def test_locate_center_can_enter_city_and_still_returns_for_home_verification():
     g = Game.__new__(Game)
     calls = []
-    g.main_portraits = lambda:None
-    g.clear_map_selection = lambda:None
+    g.p = Profile()
+    g.clear_map_selection = lambda *a, **k:None
     g.d = SimpleNamespace(tap=lambda *a:calls.append(('tap',a)), swipe=lambda *a:None)
     g.v = SimpleNamespace(page=lambda im, verify=True:im, map_coordinates=lambda im:None)
     frames = iter(['sandbox','sandbox','city'])
@@ -88,7 +88,7 @@ def test_locate_center_can_enter_city_and_still_returns_for_home_verification():
         assert im in expected
         return im
     g.wait_transition = transition
-    g.ensure_sandbox = lambda:calls.append(('exit-city',)) or 'sandbox'
+    g.ensure_sandbox = lambda **kw:calls.append(('exit-city',)) or 'sandbox'
     g.emit = lambda *a:None
     assert g.locate_team(1) == 'sandbox'
     assert ('exit-city',) in calls
@@ -115,8 +115,15 @@ def test_scan_startup_handles_summary_and_never_enables_reward_claims(tmp_path, 
         def ensure_sandbox(self, **kw):
             result = super().ensure_sandbox(**kw)
             return result
+        def calibrate_home(self):
+            # 本用例只验证启动摘要/日常；主城核实单独覆盖，这里用已保存的主城。
+            self.account_checked = True
+        def read_roster(self, slot):
+            self.active_slots = set(range(1, 6))
+            return self.active_slots
         def scan_team(self, policy):
             self.account_checked = True
+            self.active_slots = set(range(1, 6))
             self.state = "monthly"
             self.ensure_sandbox()
             return Observation(policy.key)
@@ -235,7 +242,7 @@ def test_dispatch_accepted_on_retry_is_recorded_as_accepted(dispatch_scene):
     g,policy,obs,state = dispatch_scene
     state["failure"] = ""
     submits = []
-    def status(image, slot):
+    def status(image, slot, center_x=None):
         return "marching" if len(submits) >= 2 else "home"
     g.v.deployment_status = status
     def tap(x,y,*a):

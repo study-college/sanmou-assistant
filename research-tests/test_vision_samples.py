@@ -166,30 +166,14 @@ def test_monthly_panels_are_never_an_unknown_stop(vision, relative, allowed):
     "explore-2026-10-17/095105-chat-open.png",
     "explore-2026-10-17/094841-guard-target.png",
 ])
-def test_sandbox_page_number_is_not_hidden_by_a_moving_army_name(vision,relative):
+def test_sandbox_is_recognized_without_team_page_number(vision,relative):
     image = cv2.imread(str(ROOT/relative))
     assert image is not None
-    assert vision.portrait_page(image) == 1
     assert vision.page(image) == "sandbox"
+    # 没有分页条/页码被行军名或地图盖住时，沙盘页型仍由资源栏与底栏确认。
     covered = image.copy()
     covered[841:889,1770:1910] = 0
-    assert vision.portrait_page(covered) is None
-    # 沙盘页型可由资源栏与导航确认，队伍页码仍须单独核对。
     assert vision.page(covered) == "sandbox"
-
-
-# 2026-10-17 实机证据：清晰的“1/2”在 red/white 两种独立预处理下都被高置信读成“172”，
-# 两种读数一致时接受为页码；互相冲突的读数依旧拒绝。
-# 112/212 同样只在紧凑高置信度读数一致时容忍，不能凭单路宽裁剪决定页码。
-@pytest.mark.parametrize("labels,expected",[(("172","172"),1),(("272","272"),2),(("112","112"),1),(("212","212"),2),(("1/2","2/2"),None)])
-def test_direct_pager_reads_do_not_guess_malformed_or_conflicting_numbers(labels,expected):
-    from itertools import cycle
-    vision = Vision.__new__(Vision)
-    vision.checkpoint = lambda: None
-    vision.joined = lambda *args: ""
-    results = cycle(labels)
-    vision.ocr = lambda *args,**kwargs: ([[next(results),.99]],0)
-    assert vision.portrait_page(np.zeros((1080,1920,3),dtype=np.uint8)) is expected
 
 
 def test_stylized_signin_count_keeps_all_digits_and_requires_matching_reads(vision):
@@ -444,7 +428,6 @@ def test_locating_an_unselected_city_still_requires_its_coordinates_and_owner(vi
         def capture(self): return self.image
     profile = Profile(account="测试主公",main_city=Point(x=607,y=291,expected_name="测试主公"))
     game = Game(Device(),vision,profile,None,tmp_path,lambda *args:None)
-    game.main_portraits = lambda:None
     image = game.locate_team(1)
     game.check_account(image)
     assert game.account_checked is expected_home
