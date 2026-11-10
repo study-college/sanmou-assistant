@@ -66,6 +66,13 @@ class PaveUnknown(GameError):
     """铺路命令已经点击提交，但结果未确认；订单保持待核对，不能重发。"""
 
 
+class PavePointUnavailable(GameError):
+    """当前铺路点没有“攻占”指令（常见于别人已铺到该点）。
+
+    用户 2026-11-10：这种情况跳过该点，直接攻占下一个点继续铺。
+    """
+
+
 class DispatchUnconfirmed(GameError):
     """提交后没读到受理证据。
 
@@ -893,6 +900,34 @@ class Game:
         self.emit("observation", asdict(obs))
         return obs
 
+    def scan_pave_team(self, policy):
+        """铺路等待期的轻量观测：只读本队坐标、角标和重伤，不打开总览/详情。
+
+        用户 2026-11-10：到阶段点后部队头像状态马上就会变，应马上衔接下一段；
+        等待期间不要反复开面板做无意义操作。兵力沿用最近一次完整读数（由
+        Worker.observe_pave_team 填充），本方法只负责现场位置与是否到点。
+        """
+        self.emit("status", f"正在读取 {policy.display} · 铺路快照")
+        image = self.locate_team(policy.slot)
+        for attempt in range(2):
+            coord = self.v.map_coordinates(image)
+            if coord is not None:
+                break
+            if attempt == 0:
+                self.d.control.sleep(.6)
+                image = self.wait_transition(self.capture())
+        marker = self.read_team_marker(image, policy.slot)
+        wounded = self.v.team_wounded(image, policy.slot)
+        obs = Observation(policy.key, state=LEGACY_STATE.get(marker["state"], "unknown") if marker else "unknown",
+                          location=coord, wounded=wounded, note="铺路快照")
+        if marker:
+            obs.marker_state = marker["state"]
+            obs.marker_label = marker["label"]
+            obs.marker_confidence = marker["confidence"]
+            obs.marker_at = time.time()
+        self.emit("observation", asdict(obs))
+        return obs
+
     def marker_reader(self):
         reader = getattr(self, "_marker_reader", None)
         if reader is None:
@@ -1082,26 +1117,33 @@ class Game:
         return value, text
 
     def go_to(self, point: Point):
-        image = self.ensure_sandbox()
-        # 上一个目标的详情会挡住缩放。地图往返拖动取消选中；左上“空地”会随活动入口变化。
-        if image is not None and self.v.page(image) == "sandbox" and self.v.map_coordinates(image) is not None:
-            self.clear_map_selection(image)
-        # 详情关闭后的比例不固定，单次缩放未必到地图层。只在已确认沙盘上
-        # 有限补一次缩放；未知页仅等待，不把“未打开”当作允许盲点。
+        """定位到地图坐标，以“实际到达的地块坐标”作为唯一放行条件。
+
+        2026-11-10 用户：不再把输入框回读当成放行条件。输入框是代理指标，
+        目标地块坐标才是结果；前往只移动镜头、不派兵不消耗，所以按结果校验
+        更稳，也不依赖输入框主题/字体/亮度。输入没生效或坐标不符时有界重输
+        一次，仍不对就停，绝不盲点攻占。
+        """
+        last = ""
         for attempt in range(2):
-            self.d.zoom_out()
-            self.d.control.sleep(.5)
-            image = self.wait_transition(self.capture(), ("worldmap", "sandbox"), ("unknown",))
-            if self.v.page(image) == "worldmap":
-                break
-        else:
-            self.save_image(image, "coordinate-map-not-open", True)
-            raise GameError("未打开坐标地图（已有限重读和缩放），停止定位")
-        self.d.tap(1483, 998)
-        self.d.text(f"{point.x}.{point.y}")
-        self.d.finish_coordinate_input()
-        # 输入法收起及文字刷新可能跨帧。只重读，不重发输入或点击前往。
-        for attempt in range(3):
+            image = self.ensure_sandbox()
+            # 上一个目标的详情会挡住缩放。地图往返拖动取消选中；左上“空地”会随活动入口变化。
+            if image is not None and self.v.page(image) == "sandbox" and self.v.map_coordinates(image) is not None:
+                self.clear_map_selection(image)
+            # 详情关闭后的比例不固定，单次缩放未必到地图层。只在已确认沙盘上
+            # 有限补一次缩放；未知页仅等待，不把“未打开”当作允许盲点。
+            for zoom in range(2):
+                self.d.zoom_out()
+                self.d.control.sleep(.5)
+                image = self.wait_transition(self.capture(), ("worldmap", "sandbox"), ("unknown",))
+                if self.v.page(image) == "worldmap":
+                    break
+            else:
+                self.save_image(image, "coordinate-map-not-open", True)
+                raise GameError("未打开坐标地图（已有限重读和缩放），停止定位")
+            self.d.tap(1483, 998)
+            self.d.text(f"{point.x}.{point.y}")
+            self.d.finish_coordinate_input()
             image = self.capture()
             page = self.v.page(image)
             if page == "blocked":
@@ -1110,27 +1152,36 @@ class Game:
             if page != "worldmap":
                 self.save_image(image, "coordinate-input-page-unconfirmed", True)
                 raise GameError("坐标输入后未确认地图页面，停止定位")
-            visible = self.v.map_input_coordinates(image)
-            if visible is not None:
-                break
-            if attempt < 2:
-                self.d.control.sleep(.4)
-        if visible != (point.x, point.y):
-            self.save_image(image, "coordinate-input-unconfirmed", True)
-            raise GameError(f"地图输入坐标未核对通过：读取 {visible}，要求 {(point.x, point.y)}")
-        button = self.v.find(image, ["前往"], (1650, 935, 1900, 1055))
-        if not button:
-            raise GameError("未识别地图前往按钮")
-        self.d.tap(button.x, button.y, 1)
-        self.wait_transition(self.capture(),("sandbox",),("unknown","worldmap"))
-        self.d.tap(960, 539, .5)
-        image = self.capture(f"target-{point.x}-{point.y}", True)
-        if self.v.map_coordinates(image) is None and self.v.page(image) == "sandbox":
-            # 目标中心有移动部队时可能选中部队；只试下方地块，仍必须核对原坐标。
-            self.d.tap(960,583,.4)
-            image = self.capture(f"target-ground-{point.x}-{point.y}",True)
-        self.verify_target(image, point)
-        return image
+            button = self.v.find(image, ["前往"], (1650, 935, 1900, 1055))
+            if not button:
+                raise GameError("未识别地图前往按钮")
+            self.d.tap(button.x, button.y, 1)
+            try:
+                image = self.wait_transition(self.capture(), ("sandbox",), ("unknown", "worldmap"))
+            except GameError:
+                # 仍停在坐标地图：输入未生效（空、旧值、没提交）。按结果重输一次。
+                check = self.capture()
+                if self.v.page(check) == "worldmap":
+                    last = "前往未生效（仍停在坐标地图）"
+                    self.save_image(check, "coordinate-not-taken", True)
+                    continue
+                raise
+            self.d.tap(960, 539, .5)
+            image = self.capture(f"target-{point.x}-{point.y}", True)
+            if self.v.map_coordinates(image) is None and self.v.page(image) == "sandbox":
+                # 目标中心有移动部队时可能选中部队；只试下方地块，仍必须核对原坐标。
+                self.d.tap(960,583,.4)
+                image = self.capture(f"target-ground-{point.x}-{point.y}",True)
+            coord = self.v.map_coordinates(image)
+            if coord != (point.x, point.y):
+                last = f"目标坐标 {coord}，要求 {(point.x, point.y)}"
+                self.save_image(image, "coordinate-target-mismatch", True)
+                if attempt == 0:
+                    continue
+                raise GameError(f"坐标定位两次仍未到达目标：{last}，不提交命令")
+            self.verify_target(image, point)
+            return image
+        raise GameError(f"坐标定位失败：{last or '未到达目标'}，不提交命令")
 
     def verify_target(self, image, point):
         coord = self.v.map_coordinates(image)
@@ -1412,6 +1463,46 @@ class Game:
             return accepted, state, f"结果页 sandbox / {activity}"
         return False, "confirmed", f"结果页 {page}"
 
+    def handle_supply_prompt(self, image, policy, target):
+        """出征后的补给提醒：勾选“本次不再提示”并确认，再继续核对出发。
+
+        2026-11-10 用户说明：补给下降到阶段阈值后，点出征会弹提醒，需要确认并
+        勾选“本次游戏不触发”，且不同阶段会各弹一次。脚本此前没有这条路径；
+        这里只在同时读到“补给”和确认按钮时处理，读不清只留证，不改点其他位置。
+        """
+        text = self.v.joined(image, (480, 180, 1440, 900)).replace(" ", "")
+        if "补给" not in text:
+            return False
+        confirm = self.v.find(image, ["确认", "确定"], (560, 500, 1360, 920), exact=True)
+        if confirm is None:
+            confirm = self.v.find(image, ["确认出征", "继续出征"], (560, 500, 1360, 920), exact=False)
+        if confirm is None:
+            return False
+        self.save_image(image, "pave-supply-prompt", True)
+        self.emit("supply_prompt", {"team": policy.key, "target": target, "text": text[:400]})
+        options = [t for t in self.v.read(image, (480, 360, 1440, 920), minimum=.75)
+                   if any(k in t.text.replace(" ", "") for k in ("不再提示", "不再提醒", "不触发", "本次"))]
+        if options:
+            label = options[0]
+            box = self.v.checkbox_before(image, label)
+            if box:
+                state = self.v.checked(image, *box)
+                if state is False:
+                    self.d.tap(*box, .35)
+                    image = self.capture()
+                    state = self.v.checked(image, *box)
+                if state:
+                    self.log(f"补给提醒：已勾选“{label.text}”", "INFO")
+                else:
+                    self.log(f"补给提醒：未能确认“{label.text}”已勾选，本次只确认", "WARN")
+            else:
+                self.log(f"补给提醒：未定位“{label.text}”前的复选框，本次只确认", "WARN")
+        else:
+            self.log("补给提醒：未读到本次不再提示选项，本次只确认", "WARN")
+        self.d.tap(confirm.x, confirm.y, 1.2)
+        self.log(f"{policy.display} 铺路：已确认补给提醒，继续核对出发", "INFO")
+        return True
+
     def pave_dispatch(self, policy: TeamPolicy, obs: Observation, target: tuple[int, int], ident: str):
         """按铺路路线派兵。订单由调用方先原子落库，本方法只负责核对与提交。
 
@@ -1429,13 +1520,18 @@ class Game:
         self.emit("status", f"{policy.display} · 正在定位铺路目标 {name}")
         image = self.go_to(Point("铺路目标", target[0], target[1]))
         buttons = _vcall(self.v, "action_buttons", {}, image)
+        if "occupy" not in buttons:
+            # 目标可能刚被别人铺到：重截一帧再读一次，避免把一次识别抖动当成“没有攻占”。
+            image = self.capture()
+            buttons = _vcall(self.v, "action_buttons", {}, image)
         if "occupy" in buttons:
             x, y, _score = buttons["occupy"]
             self.d.tap(x, y, .45)
         else:
             button = self.v.find(image, ["攻占"], (1080, 150, 1810, 880), exact=True)
             if not button:
-                raise GameError(f"目标 {name} 当前没有攻占指令")
+                self.save_image(image, "pave-point-unavailable", True)
+                raise PavePointUnavailable(f"目标 {name} 当前没有攻占指令")
             self.d.tap(button.x, button.y, .45)
         image = self.capture_clear("pave-preflight", True)
         page = self.v.page(image)
@@ -1487,6 +1583,14 @@ class Game:
                     accepted = True
                     reason = f"角标状态 {before_state}→{after_marker['state']}"
                     break
+                if self.handle_supply_prompt(after, policy, name):
+                    after = self.capture_clear("pave-supply-confirmed", True)
+                    after_marker = self.read_team_marker(after, policy.slot)
+                    if (after_marker and before_state and after_marker["state"] != "unknown"
+                            and after_marker["state"] != before_state):
+                        accepted = True
+                        reason = f"补给提醒确认后角标 {before_state}→{after_marker['state']}"
+                        break
                 page = self.v.page(after)
                 reason = f"结果页 {page}，角标状态仍为 {before_state or '未知'}"
                 if page == "deployment" and not _vcall(self.v, "deploy_button_enabled", True, after):

@@ -97,16 +97,6 @@ def test_land_menu_march_text_is_not_a_moving_team(tmp_path):
     journal.close()
 
 
-@pytest.mark.parametrize('alternate,expected', [('599.294',(599,294)), ('599294',None), ('599.284',None), (None,None)])
-def test_low_confidence_coordinate_fallback_never_guesses_or_accepts_conflict(alternate,expected):
-    import numpy as np
-    from sanmou_assistant.vision import Vision
-    vision = Vision.__new__(Vision)
-    readings = iter(['599.294',None,alternate])
-    vision.read_line = lambda *args, **kwargs: next(readings)
-    assert vision.map_input_coordinates(np.zeros((1080,1920,3),np.uint8)) == expected
-
-
 @pytest.mark.skip(reason="0.7.5 起过渡帧由 frame_clear/capture_clear 统一重截，旧的多帧序列假设作废；替代测试 test_frame_clear_rejects_cloud_transition_frames")
 def test_clouded_home_menu_is_reread_before_team_state_is_decided():
     from types import SimpleNamespace

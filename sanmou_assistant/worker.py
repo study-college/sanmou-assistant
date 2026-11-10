@@ -10,7 +10,9 @@ from pathlib import Path
 
 from PySide6.QtCore import QThread, Signal
 
-from .game import DispatchUnconfirmed, Game, GameError, NavigationRecovered, NetworkRecovered, ObservationExpired, PaveUnknown, RecognitionUnavailable, TeamAbsent
+from .game import (DispatchUnconfirmed, Game, GameError, NavigationRecovered, NetworkRecovered,
+                   ObservationExpired, PavePointUnavailable, PaveUnknown, RecognitionUnavailable,
+                   TeamAbsent)
 from .evidence import EvidenceStore
 from .journal import Journal
 from .models import Decision, Observation, Profile, decide, observation_expired
@@ -93,6 +95,8 @@ class Worker(QThread):
         self.wounded_probed = {}     # 刚看到重伤时先立刻读一次倒计时，避免干等 10 分钟
         self.merit_value = None      # 最近一次武勋读数
         self.merit_base = None       # 本次任务开始时的武勋
+        # 铺路快照沿用最近一次完整读数（兵力/伤情）；到点后不再为读数值多开一次总览。
+        self.pave_strength = {}
         self.merit_prev = None       # 上一次读数，用于单次增量
         self.next_merit_at = 0.0
         self.merit_failures = 0
@@ -544,7 +548,14 @@ class Worker(QThread):
                 except RecognitionUnavailable as exc:
                     if self.command != "run":
                         raise
-                    game.log(f"{exc}；本轮暂停输入，{self.profile.poll_seconds} 秒后自动重读", "WARN")
+                    # 2026-11-10 用户：跨天/活动等已识别弹层要自行关闭后继续铺路，不靠人工。
+                    try:
+                        game.ensure_sandbox(recover_navigation=True)
+                        game.log(f"{exc}；已关闭已识别弹层并继续监控", "INFO")
+                    except (RecognitionUnavailable, NavigationRecovered) as recover_exc:
+                        game.log(f"{exc}；弹层暂未读清（{recover_exc}），等待重读", "WARN")
+                    except GameError:
+                        raise
                     self.publish("status", f"等待重新识别 · {self.profile.poll_seconds} 秒后重试")
                     self.wait_for_next_check(game)
         except Stopped:
@@ -653,6 +664,26 @@ class Worker(QThread):
                 game.log(f"{policy.display} 的未确认命令已核对：队伍仍在主城，下一轮按策略自动重试","INFO")
         if obs.state == "home" and self.journal.phase(policy.key) in ("backup", "returning", "bandits", "guarding"):
             self.journal.set_phase(policy.key, "")
+        return obs
+
+    def observe_pave_team(self, game, policy, full=False):
+        """铺路专用观测：等待途中只读角标/坐标/重伤，到点才用完整读数派兵。
+
+        用户 2026-11-10：阶段点之间要尽快衔接，等待期间不要做无意义操作。
+        完整观测给出本段出发时的兵力与伤情；之后的行军/占领期沿用该读数。
+        """
+        cached = self.pave_strength.get(policy.key)
+        if full or cached is None:
+            obs = self.observe_team(game, policy)
+            if obs is not None and obs.strength is not None:
+                self.pave_strength[policy.key] = (obs.strength, obs.wounded)
+            return obs
+        obs = (game.scan_pave_team(policy) if hasattr(game, "scan_pave_team")
+               else self.observe_team(game, policy))
+        if obs.strength is None:
+            obs.strength = cached[0]
+        if obs.wounded is None:
+            obs.wounded = cached[1]
         return obs
 
     def team_decision(self, game, policy, obs, food_recovery):
@@ -1001,6 +1032,13 @@ class Worker(QThread):
                              ensure_ascii=False, sort_keys=True)
         return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:16]
 
+    @staticmethod
+    def pave_event(route, team, idx, status):
+        """铺路进度事件：给界面提供“?/?”和下一个目标，日志仍记录完整过程。"""
+        nxt = list(route.points[idx][:2]) if 0 <= idx < len(route.points) else None
+        return {"route": route.name, "team": team, "done": idx,
+                "total": len(route.points), "status": status, "next": nxt}
+
     def _recover_pave(self, game, policy, route, progress):
         """dispatching：订单已写但结果未知。只按现场核对，不重发。"""
         idx, intent, origin = progress["idx"], progress["intent"], progress["origin"]
@@ -1019,8 +1057,7 @@ class Worker(QThread):
             self.journal.settle_pave(intent, "accepted", route.name, new_idx, status,
                                      "恢复核对：已在目标点停留")
             game.log(f"{policy.display} 恢复核对：已到达铺路目标，路线 {status}")
-            self.publish("pave", {"route": route.name, "team": policy.key, "done": new_idx,
-                                  "total": len(route.points), "status": status})
+            self.publish("pave", self.pave_event(route, policy.key, new_idx, status))
         elif marker == "busy":
             # 占领、建筑内自然征兵等：队伍确实已经动了，只是还没停在目标点。
             self.journal.settle_pave(intent, "accepted", route.name, idx, "running",
@@ -1090,7 +1127,8 @@ class Worker(QThread):
             if time.time() < self.retry_at.get(f"pave:{route.name}", 0):
                 continue
             self.journal.set_phase(policy.key, "pave")
-            obs = self.observe_team(game, policy)
+            obs = self.observe_pave_team(
+                game, policy, full=progress["status"] not in ("running", "recovering"))
             if obs is None:
                 continue
             if obs.state == "wounded" or obs.wounded is True:
@@ -1100,12 +1138,16 @@ class Worker(QThread):
             idx = progress["idx"]
             marker = marker_of(obs)
             if marker in ("queued_battle", "fighting", "retreat"):
-                # 实战预留：铺路途中遇敌、战斗、被击退时不推进新段，按现场重新读取。
-                # 补给下降、被击退后的恢复策略尚未接入（用户要求先预留，不做）。
+                # 2026-11-10 用户：攻占空地时与守军战斗是铺路的正常过程，不当异常；
+                # 战斗结束后自动继续下一段。只有战斗后出现重伤才需要另行处理（下一阶段）。
                 name = {"queued_battle": "排队进入战斗", "fighting": "战斗中", "retreat": "撤退中"}[marker]
-                game.log(f"{policy.display} 铺路：角标显示{name}，暂停推进下一段，等现场恢复", "WARN")
-                self.publish("pave", {"route": route.name, "team": policy.key, "done": idx,
-                                      "total": len(route.points), "status": "waiting"})
+                if marker == "retreat":
+                    game.log(f"{policy.display} 铺路：角标显示{name}，暂停推进下一段，等现场恢复", "WARN")
+                else:
+                    self.log_once(f"pave-fight:{route.name}",
+                                  f"{policy.display} 铺路：与守军战斗中，正常等待结束后继续下一段",
+                                  every=600)
+                self.publish("pave", self.pave_event(route, policy.key, idx, "waiting"))
                 continue
             if progress["status"] in ("running", "recovering"):
                 target = tuple(route.points[idx][:2])
@@ -1115,8 +1157,7 @@ class Worker(QThread):
                     self.journal.set_pave(route.name, idx, status, "", fingerprint=fingerprint)
                     game.log(f"{policy.display} 已铺到 ({target[0]},{target[1]})"
                              + ("，路线完成" if status == "done" else "，继续下一段"))
-                    self.publish("pave", {"route": route.name, "team": policy.key, "done": idx,
-                                          "total": len(route.points), "status": status})
+                    self.publish("pave", self.pave_event(route, policy.key, idx, status))
                     if status == "done":
                         continue
                     progress = self.journal.pave_progress(route.name)
@@ -1161,6 +1202,21 @@ class Worker(QThread):
                 self.journal.mark_pave_unknown(ident, route.name, idx, str(exc))
                 self.retry_at[f"pave:{route.name}"] = time.time() + self.profile.retry_seconds
                 game.ensure_sandbox()
+                continue
+            except PavePointUnavailable as exc:
+                # 用户 2026-11-10：目标已被别人铺到/没有攻占时跳过该点，继续下一个点。
+                new_idx = idx + 1
+                status = "done" if new_idx >= len(route.points) else "idle"
+                self.journal.settle_pave(ident, "rejected", route.name, new_idx, status,
+                                         f"目标没有攻占指令，跳过该点：{exc}")
+                game.log(f"{policy.display} 铺路第 {idx+1} 段 {target} 没有攻占指令"
+                         "（可能已被别人铺到），按规则跳过并继续下一点", "INFO")
+                self.publish("pave", self.pave_event(route, policy.key, new_idx, status))
+                self.retry_at.pop(f"pave:{route.name}", None)
+                try:
+                    game.ensure_sandbox()
+                except GameError:
+                    pass
                 continue
             except ObservationExpired:
                 self.journal.settle_pave(ident, "rejected", route.name, idx, "idle", "读数过期，未提交")

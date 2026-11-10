@@ -239,10 +239,10 @@ class Profile:
                 errors.append(f"铺路路线 {route.name!r} 的启用状态无效")
             if type(route.resume_after_return) is not bool or route.replenish not in ("keep", "auto", "supply"):
                 errors.append(f"铺路路线 {route.name!r} 的恢复或补兵策略无效")
-            if route.team and not 1 <= len(route.points) <= 30:
-                errors.append(f"铺路路线 {route.name!r} 已分配给队伍，需要 1～30 个坐标")
-            elif len(route.points) > 30:
-                errors.append(f"铺路路线 {route.name!r} 最多 30 个坐标")
+            # 2026-11-10：取消每条路线 30 个坐标的上限。长路线（几十上百段）按顺序执行即可，
+            # 段数只影响推进时间，不构成配置错误；仍要求已分配的路线至少有一个坐标。
+            if route.team and not route.points:
+                errors.append(f"铺路路线 {route.name!r} 已分配给队伍，需要至少 1 个坐标")
             for point in route.points:
                 if (not isinstance(point, (list, tuple)) or not 2 <= len(point) <= 3
                         or any(type(point[i]) is not int or not 0 <= point[i] <= 3000 for i in (0, 1))

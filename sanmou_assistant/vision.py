@@ -676,12 +676,10 @@ class Vision:
                 return point
         return None
 
-    def labeled_checkbox(self, image, labels, rect):
-        label = self.find(image, labels, rect, exact=True)
-        if label is None:
-            return None
-        x0, y0 = max(0, round(label.box[0])-80), max(0, round(label.y)-28)
-        x1, y1 = round(label.box[0])-12, round(label.y)+28
+    def checkbox_before(self, image, label, gap=80):
+        """定位一行文字左侧的复选框方框中心；与 labeled_checkbox 同一套几何规则。"""
+        x0, y0 = max(0, round(label.box[0])-gap), max(0, round(label.y)-28)
+        x1, y1 = max(0, round(label.box[0])-12), round(label.y)+28
         # 定位方框本身，不把伸出边框的绿色勾当成方框轮廓。
         # 勾选后原 Canny 轮廓被切断且宽度变成 55px，反而只认得未勾选框。
         hsv = cv2.cvtColor(image[y0:y1, x0:x1], cv2.COLOR_BGR2HSV)
@@ -696,6 +694,12 @@ class Vision:
                 if abs(center[1]-label.y) <= 10 and not any(abs(cx-center[0]) < 8 and abs(cy-center[1]) < 8 for cx, cy in centers):
                     centers.append(center)
         return centers[0] if len(centers) == 1 else None
+
+    def labeled_checkbox(self, image, labels, rect):
+        label = self.find(image, labels, rect, exact=True)
+        if label is None:
+            return None
+        return self.checkbox_before(image, label)
 
     def active_task_visible(self, image):
         # 已定位自己队伍的沙盘菜单；仅用于等待，不推断作战种类或提交成功。
@@ -1156,36 +1160,6 @@ class Vision:
             if found:
                 values.append((int(found[1]), int(found[2])))
         return values[0] if len(set(values)) == 1 else None
-
-    def map_input_coordinates(self, image) -> tuple[int, int] | None:
-        # 输入框半透明，普通检测会把地图上的城名/等级合进来并漏掉小数点。
-        # 固定数值行提取明亮灰白字，去掉较暗的背景透字；两种阈值独立整行读取。
-        # 必须都有明确分隔符、完整读数且一致，不能把648277猜成648.277。
-        crop = image[975:1020,1425:1600]
-        if not crop.size:
-            return None
-        hsv = cv2.cvtColor(crop,cv2.COLOR_BGR2HSV)
-        values = []
-        for threshold in (130,160):
-            mask = cv2.inRange(hsv,(0,0,threshold),(179,60,255))
-            cleaned = cv2.cvtColor(255-mask,cv2.COLOR_GRAY2BGR)
-            cleaned = cv2.copyMakeBorder(cleaned,8,8,8,8,cv2.BORDER_CONSTANT,value=(255,255,255))
-            text = self.read_line(cleaned,minimum=.9)
-            if threshold == 160 and text is None and values:
-                # 部分数字笔画在160阈值处刚好断开，造成低置信；换更干净的180阈值再独立整行读取。
-                # 仍要求两路完整、有分隔符且一致；不为缺点/数字冲突补猜坐标。
-                mask = cv2.inRange(hsv,(0,0,180),(179,60,255))
-                alternate = cv2.cvtColor(255-mask,cv2.COLOR_GRAY2BGR)
-                alternate = cv2.copyMakeBorder(alternate,8,8,8,8,cv2.BORDER_CONSTANT,value=(255,255,255))
-                text = self.read_line(alternate,minimum=.9)
-            match = re.fullmatch(r"\s*(\d{1,4})\s*[,，·.]\s*(\d{1,4})\s*",text or "")
-            if not match:
-                return None
-            value = (int(match[1]),int(match[2]))
-            if any(n > 3000 for n in value):
-                return None
-            values.append(value)
-        return values[0] if values[0] == values[1] else None
 
     def auto_pave(self, image) -> dict | None:
         """攻占页的自动铺路标记：格数、整条链耗时、体力是否不消耗；普通攻占页返回 None。"""

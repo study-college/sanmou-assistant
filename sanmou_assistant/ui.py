@@ -106,6 +106,11 @@ QToolTip { background:#20314d; color:white; padding:7px; border:0; }
 """
 
 
+def set_clipboard(text: str) -> None:
+    """写系统剪贴板的唯一入口；测试替换它，避免跑测试时改掉使用者的剪贴板。"""
+    QApplication.clipboard().setText(text)
+
+
 def button(text, callback, primary=False):
     b = QPushButton(text)
     if primary:
@@ -273,7 +278,8 @@ class PaveRouteDialog(QDialog):
         row = QHBoxLayout()
         self.paste = PasteLineEdit()
         self.paste.setPlaceholderText("粘贴游戏地址或坐标，例如 空地(571,243)空地(566,240)")
-        self.paste.setMaxLength(10000)
+        # 铺路路线不再限制段数，粘贴框也别先卡住（10000 字符只够五百多段）。
+        self.paste.setMaxLength(200000)
         row.addWidget(self.paste, 1)
         row.addWidget(button("识别并添加", self.add_pasted))
         self.paste.returnPressed.connect(self.add_pasted)
@@ -520,6 +526,7 @@ class Window(QMainWindow):
         self.observations = {}
         self.decisions = {}
         self.team_activity = {}
+        self.pave_progress = {}
         # 最近一次检测到的实际主队槽位；None 表示本次任务还没读过。
         self.team_slots = None
         self.latest_evidence = ""
@@ -692,7 +699,7 @@ class Window(QMainWindow):
         row = QHBoxLayout()
         row.setSpacing(8)
         self.metrics = {}
-        for name, value in (("游戏连接", "未连接"), ("粮食库存", "待识别"), ("账号与主城", "未校验"), ("本次出征", "0"), ("本次武勋", "待读取")):
+        for name, value in (("游戏连接", "未连接"), ("粮食库存", "待识别"), ("账号与主城", "未校验"), ("本次出征", "0"), ("本次武勋", "待读取"), ("本次铺路", "—")):
             chip = QFrame()
             chip.setObjectName("metric")
             inner = QHBoxLayout(chip)
@@ -1489,9 +1496,12 @@ class Window(QMainWindow):
         self.observations.clear()
         self.decisions.clear()
         self.team_activity.clear()
+        self.pave_progress.clear()
         self.metrics["本次出征"].setText("0")
         self.metrics["本次武勋"].setText("待读取")
         self.metrics["本次武勋"].setToolTip("每 30 分钟读一次个人信息页的武勋；只作展示，不影响派兵。")
+        self.metrics["本次铺路"].setText("—")
+        self.metrics["本次铺路"].setToolTip("本次铺路进度：已完成段数 / 总段数")
         self.team_table.setRowCount(len(self.profile.teams))
         self.live.setRowCount(len(self.profile.teams))
         for r,t in enumerate(self.profile.teams):
@@ -1719,7 +1729,7 @@ class Window(QMainWindow):
         rows = sorted({i.row() for i in target.selectedIndexes()}) or list(range(target.rowCount()))
         check_column = 1 if target is self.target_table else 5
         addresses = [SharedAddress(target.item(r,check_column).text().strip() or target.item(r,1).text(), target.cellWidget(r,2).value(), target.cellWidget(r,3).value()).text() for r in rows]
-        QApplication.clipboard().setText("\n".join(addresses))
+        set_clipboard("\n".join(addresses))
         self.status.setText(f"已复制 {len(addresses)} 个游戏地址")
 
     def apply_main_address(self):
@@ -1744,7 +1754,7 @@ class Window(QMainWindow):
     def copy_main_address(self):
         try:
             address = single_address(self.main_address.text())
-            QApplication.clipboard().setText(address.text())
+            set_clipboard(address.text())
             self.status.setText("已复制主城游戏地址")
         except ValueError as exc:
             self.status.setText(str(exc))
@@ -1862,8 +1872,10 @@ class Window(QMainWindow):
             self.observations.clear()
             self.decisions.clear()
             self.team_activity.clear()
+            self.pave_progress.clear()
             self.metrics["本次出征"].setText("0")
             self.metrics["本次武勋"].setText("待读取")
+            self.metrics["本次铺路"].setText("—")
             self.last_scan.setText("正在读取本次状态")
             self.refresh_live()
         self.run_state.setText("● 执行中" if command == "run" else "● 读取中" if command == "scan" else "● 处理中")
@@ -1984,7 +1996,14 @@ class Window(QMainWindow):
                              "message":f"{team_name} · {value['reason']}"})
         elif kind == "dispatch":
             self.metrics["本次出征"].setText(str(int(self.metrics["本次出征"].text())+1))
-            self.team_activity[value["team"]] = {"state":value.get("state","confirmed"),"reason":f"已确认{value.get('action','出征')} → {value['target']}；继续监控"}
+            if value.get("kind") == "pave":
+                progress = self.pave_progress.get(value["team"], {})
+                done, total = progress.get("done", 0), progress.get("total", 0)
+                reason = f"铺路 {done}/{total} · 前往 {value['target']}"
+            else:
+                reason = f"已确认{value.get('action','出征')} → {value['target']}；继续监控"
+            self.team_activity[value["team"]] = {"state":value.get("state","confirmed"),"reason":reason,
+                                                 "target":value.get("target")}
             self.refresh_live()
             team_name = next((p.display for p in self.profile.teams if p.key == value['team']),value['team'])
             self.append_log({"time":datetime.now().strftime("%H:%M:%S"),"level":"INFO", "message":f"{team_name} · {value.get('action','出征')} → {value['target']} 已确认"})
@@ -2020,10 +2039,19 @@ class Window(QMainWindow):
             self.rates.setPlainText(text)
             self.append_log({"time":datetime.now().strftime("%H:%M:%S"),"level":"INFO","message":text})
         elif kind == "pave":
-            self.status.setText(f"铺路 · {value.get('route','')} · 已完成 {value.get('done',0)}/{value.get('total',0)} 段")
+            team = value.get("team")
+            self.pave_progress[team] = value
+            done, total = value.get("done", 0), value.get("total", 0)
+            self.metrics["本次铺路"].setText(f"{done}/{total}" if total else "—")
+            tip = f"{value.get('route', '')} · 已完成 {done}/{total} 段"
+            if value.get("next"):
+                tip += f" · 下一点 ({value['next'][0]},{value['next'][1]})"
+            self.metrics["本次铺路"].setToolTip(tip)
+            self.status.setText(f"铺路 · {value.get('route','')} · 已完成 {done}/{total} 段")
             self.append_log({"time":datetime.now().strftime("%H:%M:%S"),"level":"INFO",
-                             "message":f"铺路路线 {value.get('route','')}：{value.get('done',0)}/{value.get('total',0)} 段，"
+                             "message":f"铺路路线 {value.get('route','')}：{done}/{total} 段，"
                                        f"状态 {value.get('status','')}"})
+            self.refresh_live()
         elif kind == "error":
             self.nav.setCurrentRow(7)
 
@@ -2065,6 +2093,16 @@ class Window(QMainWindow):
                 reason = f"等待重伤结束（约 {remaining} 秒）" if remaining else "重伤计时已到，等待现场复核" if remaining == 0 else "等待重伤结束"
             elif not activity and t.key not in self.decisions and state in ("marching","returning","guarding","active","recruiting"):
                 reason = STATES[state]+"，继续监控"
+            if t.role == "pave" and t.key in self.pave_progress:
+                # 铺路队的进度常驻：?/?? 直接显示在这一行，详细过程在日志里。
+                prog = self.pave_progress[t.key]
+                done, total = prog.get("done", 0), prog.get("total", 0)
+                if prog.get("status") == "done" or (total and done >= total):
+                    reason = f"铺路完成 {done}/{total}"
+                else:
+                    nxt = prog.get("next")
+                    where = f" · 下一点 ({nxt[0]},{nxt[1]})" if nxt else ""
+                    reason = f"铺路 {done}/{total}{where}"
             labels = {**STATES,"confirming":"核对出发","confirmed":"已确认出发","return_confirming":"核对回城","return_confirmed":"回城已受理","fighting":"战斗中","retrying":"未确认 · 自动重试"}
             shown = display_label(obs.get("marker_label"), state, labels)
             values = [f"{t.display} · {obs['identity']}" if obs.get("identity") else t.display, shown, f"{obs['strength']}/{obs['maximum']}" if obs.get("strength") is not None else "待识别", f"{obs.get('stamina') if obs.get('stamina') is not None else '—'} / {obs.get('supply') if obs.get('supply') is not None else '—'}", f"{obs.get('pool','未知')} {obs['reserve']}/{obs['capacity']}" if obs.get("reserve") is not None else obs.get("pool","未知"), reason]

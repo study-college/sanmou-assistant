@@ -182,8 +182,11 @@ def test_fresh_wound_read_replaces_action_and_timer_never_claims_recovery(tmp_pa
     app.processEvents()
 
 
-def test_game_address_paste_for_targets_backups_and_main(tmp_path):
+def test_game_address_paste_for_targets_backups_and_main(tmp_path, monkeypatch):
     app = QApplication.instance() or QApplication([])
+    copied = []
+    # 测试不碰系统剪贴板：只验证界面交给 set_clipboard 的内容。
+    monkeypatch.setattr("sanmou_assistant.ui.set_clipboard", copied.append)
     window = Window(tmp_path)
     pasted = "涪县(595,277)测试玩家甲(619,282)测试主公(607,291)山道(636,286)测试玩家乙(634,286)"
     window.target_address.setText(pasted)
@@ -209,7 +212,7 @@ def test_game_address_paste_for_targets_backups_and_main(tmp_path):
     assert "无需填写地址" in window.farm_position.text()
     assert not profile.backups[0].enabled
     window.copy_addresses(window.backup_table)
-    assert QApplication.clipboard().text() == "涪县(595,277)"
+    assert copied == ["涪县(595,277)"]
     window.handle_event('calibrated',{'account':'新主公','main_city':{'name':'我的主城','x':201,'y':202,'expected_name':'新主公'}})
     assert window.collect().main_city.x == 201
     assert window.main_address.text() == "新主公(201,202)"
@@ -509,6 +512,33 @@ def test_pave_page_saves_route_points(tmp_path, monkeypatch):
     reopened = Window(tmp_path)
     assert reopened.pave_table.item(0, 0).text() == "测试路线"
     assert reopened.pave_table.cellWidget(0, 4)._points == [[571, 243, "空地"], [566, 240]]
+    window.close()
+    reopened.close()
+    app.processEvents()
+
+
+def test_pave_page_saves_long_route_without_truncating(tmp_path, monkeypatch):
+    """2026-11-10：取消 30 段上限后，118 段路线必须原样保存并在重开后完整显示。"""
+    app = QApplication.instance() or QApplication([])
+    points = [[100 + i, 200 + i] for i in range(118)]
+    window = Window(tmp_path)
+    window.add_pave_route()
+    t = window.pave_table
+    t.item(0, 0).setText("长路线")
+    t.cellWidget(0, 4)._points = [list(point) for point in points]
+    window.sync_routes_from_table()
+    monkeypatch.setattr("sanmou_assistant.ui.QInputDialog.getItem",
+                        lambda *args, **kwargs: ("长路线", True))
+    for button in window.team_table.cellWidget(1, 2).findChildren(QRadioButton):
+        if button.property("role") == "pave":
+            button.click()
+    assert window.profile.teams[1].route == "长路线"
+    assert window.save()
+    p = Profile.from_dict(json.loads((tmp_path / "active-profile.json").read_text(encoding="utf-8")))
+    assert p.pave_routes[0].points == points
+    reopened = Window(tmp_path)
+    assert reopened.pave_table.cellWidget(0, 4)._points == points
+    assert reopened.pave_table.item(0, 3).text() == "118"
     window.close()
     reopened.close()
     app.processEvents()

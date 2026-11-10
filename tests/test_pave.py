@@ -3,7 +3,7 @@ import time
 import numpy as np
 import pytest
 
-from sanmou_assistant.game import Game, GameError, PaveUnknown
+from sanmou_assistant.game import Game, GameError, PavePointUnavailable, PaveUnknown
 from sanmou_assistant.journal import Journal
 from sanmou_assistant.models import (Observation, PaveRoute, Point, Profile,
                                      pave_summary)
@@ -18,6 +18,7 @@ class FakeGame:
         self.account_checked = True
         self.reserved_teams = set()
         self.unknown = False
+        self.unavailable = False
 
     def scan_team(self, policy):
         self.calls.append(("scan", policy.key))
@@ -27,6 +28,8 @@ class FakeGame:
         self.calls.append(("pave", policy.key, tuple(target), ident))
         if self.unknown:
             raise PaveUnknown("测试：提交结果未知")
+        if self.unavailable:
+            raise PavePointUnavailable(f"测试：{target} 没有攻占")
 
     def ensure_sandbox(self):
         self.calls.append(("sandbox",))
@@ -216,6 +219,41 @@ def test_pave_next_segment_can_start_from_another_confirmed_standing_location(tm
     assert pave_calls(game)[0][2] == (566, 240)
 
 
+def test_pave_event_carries_progress_and_next_point():
+    route = PaveRoute(name="路线A", team="main:2", points=[[571, 243], [566, 240], [560, 235]], enabled=True)
+    event = Worker.pave_event(route, "main:2", 2, "idle")
+    assert event["done"] == 2 and event["total"] == 3
+    assert event["next"] == [560, 235] and event["status"] == "idle"
+    done = Worker.pave_event(route, "main:2", 3, "done")
+    assert done["next"] is None and done["done"] == done["total"]
+
+
+def test_pave_skips_point_without_occupy_and_continues_next_point(tmp_path):
+    """用户 2026-11-10：别人已铺到该点、菜单没有攻占时跳过该点，继续下一个点。"""
+    worker = make_worker(tmp_path, make_profile([[571, 243], [566, 240], [560, 235]]))
+    game = FakeGame(worker, {"main:2": observation("main:2", "outside", (607, 291))})
+    game.unavailable = True
+    worker.process_pave(game)
+    state = progress(worker)
+    assert state["idx"] == 1 and state["status"] == "idle"
+    assert state["intent"] == "" and worker.journal.pending("main:2") == []
+    game.unavailable = False
+    worker.retry_at.clear()
+    game.calls.clear()
+    worker.process_pave(game)
+    assert pave_calls(game)[0][2] == (566, 240)
+
+
+def test_pave_skip_last_point_marks_route_done(tmp_path):
+    worker = make_worker(tmp_path, make_profile([[571, 243]]))
+    game = FakeGame(worker, {"main:2": observation("main:2", "home", (607, 291))})
+    game.unavailable = True
+    worker.process_pave(game)
+    state = progress(worker)
+    assert state["idx"] == 1 and state["status"] == "done"
+    assert worker.journal.pending("main:2") == []
+
+
 def test_pave_unknown_submit_is_not_replayed_and_keeps_team_reserved(tmp_path):
     worker = make_worker(tmp_path, make_profile([[571, 243]]))
     game = FakeGame(worker, {"main:2": observation("main:2", "home", (607, 291))})
@@ -303,6 +341,19 @@ def test_pave_route_validation():
     profile.teams[2].role, profile.teams[2].route = "pave", "A"
     profile.normalize()
     assert any("同一条铺路路线" in error for error in profile.validate())
+
+
+def test_pave_route_has_no_coordinate_count_cap():
+    """2026-11-10：用户 118 段的长路线被旧的“1～30 个坐标”拦住，取消上限后应能保存。"""
+    profile = Profile(account="x", main_city=Point(name="主城", x=1, y=1))
+    points = [[100 + i, 200 + i] for i in range(118)]
+    profile.pave_routes = [PaveRoute(name="一队铺路", points=points, enabled=True)]
+    profile.teams[1].role, profile.teams[1].route = "pave", "一队铺路"
+    profile.normalize()
+    assert profile.validate() == []
+    restored = Profile.from_dict(profile.to_dict())
+    assert len(restored.pave_routes[0].points) == 118
+    assert restored.pave_routes[0].points[-1] == [217, 317]
 
 
 def test_pave_route_roundtrip_and_labels():
