@@ -17,7 +17,8 @@ from PySide6.QtCore import QUrl
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QLabel, QPushButton, QCheckBox, QComboBox, QSpinBox, QLineEdit, QFormLayout, QVBoxLayout, QHBoxLayout, QGridLayout, QStackedWidget, QListWidget, QListWidgetItem, QDialog, QDialogButtonBox, QTableWidget, QTableWidgetItem, QHeaderView, QFrame, QFileDialog, QMessageBox, QPlainTextEdit, QScrollArea, QSplitter, QAbstractItemView, QMenu, QTabWidget, QRadioButton, QInputDialog)
 
 from . import __version__
-from .models import Profile, Point, TeamPolicy, PaveRoute, pave_label, pave_summary, STATES, ACTION_NAMES, atomic_json, data_directory
+from .models import (Profile, Point, TeamPolicy, PaveRoute, line_target, pave_label, pave_summary,
+                     point_label, team_label, STATES, ACTION_NAMES, atomic_json, data_directory)
 from .team_states import display_label
 from .locations import SharedAddress, parse_addresses, single_address
 from .worker import Worker
@@ -372,17 +373,26 @@ class PaveRouteDialog(QDialog):
 
 
 class TeamDetailDialog(QDialog):
-    """单队任务细节：武勋目标组 + 有序补兵点。
+    """单队任务细节：按任务显示目标组、补兵点/营帐顺序。
 
-    默认收起在“部队任务”的详情按钮里，摘要始终显示在行内，避免功能被藏没。
+    - 拉线：目标组取自「目标与铺路 → 拉线目标」；补兵点就是回城后调动的营帐，
+      补不动时回城 → 按这里的顺序调动过去；到营帐后够线就拉、不够就自然征兵。
+    - 刷武勋/讨贼：目标组取自武勋目标，补兵点按顺序尝试。
     """
 
     def __init__(self, team, profile, parent=None):
         super().__init__(parent)
+        self.team = team
+        self.line_role = team.role == "line"
         self.setWindowTitle(f"{team.display} · 任务细节")
         self.resize(560, 460)
         layout = QVBoxLayout(self)
-        tip = QLabel("只有刷武勋时使用目标组；补兵点按列表顺序尝试，留空表示使用全部已启用补兵点。")
+        tip = QLabel(
+            "拉线队使用「目标与铺路 → 拉线目标」里的坐标：本队目标组内从上到下取第一个启用的目标。"
+            "补不动时回城，再按下面的补兵点顺序调动到营帐；到营帐后够线就拉、不够就自然征兵。"
+            if self.line_role else
+            "刷武勋与讨贼也使用目标组；“备用征兵地点”按顺序尝试，留空表示使用全部已启用的地点。"
+            "拉线队同样使用这里的补兵点（回城后调动的营帐）。")
         tip.setObjectName("muted")
         tip.setWordWrap(True)
         layout.addWidget(tip)
@@ -390,21 +400,21 @@ class TeamDetailDialog(QDialog):
         form = QFormLayout()
         self.group = QComboBox()
         self.group.setEditable(True)
-        groups = ["默认"] + sorted({p.group for p in profile.targets if p.group and p.group != "默认"})
+        source = profile.line_targets if self.line_role else profile.targets
+        groups = ["默认"] + sorted({p.group for p in source if p.group and p.group != "默认"})
         self.group.addItems(groups)
         self.group.setCurrentText(team.target_group or "默认")
-        form.addRow("武勋目标组", self.group)
-        self.line_target = QLineEdit(team.line_target)
-        self.line_target.setPlaceholderText("拉线目标，例如 602,707（只认坐标，不做多目标）")
-        form.addRow("拉线目标坐标", self.line_target)
+        form.addRow("拉线目标组" if self.line_role else "任务目标组", self.group)
         self.fallback = QComboBox()
-        self.fallback.addItem("回城免费补兵（慢）", "recall")
+        self.fallback.addItem("回城后去补兵点（营帐）补兵", "recall")
         self.fallback.addItem("停手等下一轮", "stop")
         self.fallback.setCurrentIndex(1 if team.refill_fallback == "stop" else 0)
-        form.addRow("补不动时", self.fallback)
+        if self.line_role:
+            form.addRow("拉线补不动时", self.fallback)
         layout.addLayout(form)
 
-        layout.addWidget(QLabel("本队补兵点（从上到下）"))
+        layout.addWidget(QLabel("补兵点 / 营帐（从上到下）" if self.line_role
+                                else "备用征兵地点（从上到下，刷武勋/讨贼/拉线回城后使用）"))
         self.points = QListWidget()
         for name in team.backup_points:
             self.points.addItem(QListWidgetItem(name))
@@ -421,7 +431,7 @@ class TeamDetailDialog(QDialog):
         row.addWidget(button("↑", lambda: self.move_point(-1)))
         row.addWidget(button("↓", lambda: self.move_point(1)))
         layout.addLayout(row)
-        note = QLabel("补兵点在地点列表里增删后，这里的同名条目会随之失效。")
+        note = QLabel("补兵点在地点列表里增删后，这里的同名条目会随之失效；留空表示使用全部已启用地点。")
         note.setObjectName("muted")
         note.setWordWrap(True)
         layout.addWidget(note)
@@ -453,9 +463,8 @@ class TeamDetailDialog(QDialog):
         self.points.setCurrentRow(target)
 
     def values(self):
-        return (self.group.currentText().strip() or "默认",
-                [self.points.item(i).text() for i in range(self.points.count())],
-                self.line_target.text().strip(),
+        points = [self.points.item(i).text() for i in range(self.points.count())]
+        return (self.group.currentText().strip() or "默认", points,
                 self.fallback.currentData())
 
 
@@ -932,6 +941,12 @@ class Window(QMainWindow):
     def team_detail_summary(self, t):
         if t.role == "pave":
             return f"路线：{t.route or '未选择'}"
+        if t.role == "line":
+            # 拉线只认「目标与铺路 → 拉线目标」里本组第一个启用的点；补兵点是回城后调动的营帐。
+            target = line_target(self.profile, t)
+            state = f"目标 {point_label(target)}" if target else "还没有启用的拉线目标"
+            backups = f"补兵点 {len(t.backup_points)} 个" if t.backup_points else "补兵点：自动"
+            return f"组：{t.target_group} · {state} · {backups}"
         parts = [f"组：{t.target_group}"]
         parts.append(f"补兵点 {len(t.backup_points)} 个" if t.backup_points else "补兵点：自动")
         return " · ".join(parts)
@@ -1122,7 +1137,7 @@ class Window(QMainWindow):
         dialog = TeamDetailDialog(t, self.profile, self)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
-        t.target_group, t.backup_points, t.line_target, t.refill_fallback = dialog.values()
+        t.target_group, t.backup_points, t.refill_fallback = dialog.values()
         self.sync_team_row(r)
         self.saved_label.setText("队伍细节已修改 · 待保存")
 
@@ -1171,6 +1186,47 @@ class Window(QMainWindow):
                          "列表上方优先；同组内先尝试第一个启用目标，指令全部不可用才换下一个目标。"
                          "可按 Ctrl / Shift 多选后一并移动。坐标必须与游戏详情一致；"
                          "营帐变空地、箭塔或易主后，仍只尝试你允许的指令。新目标默认关闭。")
+
+    def make_line_targets(self, layout=None, section=True):
+        """拉线目标：与武勋目标完全同一套表格和粘贴解析，只认坐标、名称仅作备注。"""
+        if layout is None:
+            layout = self.page("拉线目标", "按坐标识别，名称只作备注；拉线队取自己目标组里第一个启用的目标。")
+        elif section:
+            self.page_section(layout, "拉线目标", "和武勋目标一样按坐标与目标组管理；拉线队在上面的“部队任务”里选目标组。")
+        self.line_table = table(["启用", "名称备注", "X", "Y", "目标组", "指令顺序（点击编辑）", "尝试顺序"])
+        self.line_table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        header = self.line_table.horizontalHeader()
+        header.setStretchLastSection(False)
+        for column, width in ((1,150), (2,90), (3,90), (4,90)):
+            header.setSectionResizeMode(column,QHeaderView.ResizeMode.Interactive)
+            self.line_table.setColumnWidth(column,width)
+        header.setSectionResizeMode(5,QHeaderView.ResizeMode.Stretch)
+        self.line_address = self.shared_address_row(layout, self.line_table)
+        layout.addWidget(self.line_table, 1)
+        self.line_order_buttons = self.point_order_row(layout,self.line_table)
+        row = QHBoxLayout()
+        row.addWidget(button("添加拉线目标", self.add_line_target))
+        row.addWidget(button("删除选中目标", lambda:self.remove_row(self.line_table)))
+        row.addWidget(button("复制游戏地址", lambda:self.copy_addresses(self.line_table)))
+        row.addStretch()
+        layout.addLayout(row)
+        self.collapsible(layout, "拉线目标怎么用",
+                         "直接粘贴游戏地址，例如 水面(617,759)，点“识别并添加”后勾选启用；"
+                         "同一目标组内从上到下取第一个启用目标。拉线只认坐标，名称仅作备注；"
+                         "“指令顺序”和刷武勋目标一样由你排列（攻城/攻占/驻守/行军），脚本按这个顺序尝试。"
+                         "哪支队拉线在“部队任务”里选。")
+
+    def add_line_target(self):
+        names = {self.line_table.item(r,1).text() for r in range(self.line_table.rowCount())}
+        number = self.line_table.rowCount()+1
+        while f"拉线目标 {number}" in names:
+            number += 1
+        self.insert_point(self.line_table, Point(name=f"拉线目标 {number}", enabled=False,
+                                                actions=["occupy", "march"]))
+
+    def is_target_like(self, t):
+        """武勋目标与拉线目标共用同一套表格结构（启用/名称/X/Y/组/指令/顺序）。"""
+        return t is self.target_table or t is getattr(self, "line_table", None)
 
     def make_pave(self, layout=None, section=True):
         if layout is None:
@@ -1406,11 +1462,14 @@ class Window(QMainWindow):
         return area, layout
 
     def make_targets_pave(self):
-        layout = self.page("目标与铺路", "武勋目标按坐标和组选择；铺路路线按顺序逐段推进，到点停留后再派下一段。", scroll=False)
+        layout = self.page("目标与铺路", "武勋目标与拉线目标都按坐标和目标组选择；铺路路线按顺序逐段推进，到点停留后再派下一段。", scroll=False)
         tabs = QTabWidget()
         page, inner = self.tab_layout()
         self.make_targets(inner, section=False)
         tabs.addTab(page, "武勋目标")
+        page, inner = self.tab_layout()
+        self.make_line_targets(inner, section=False)
+        tabs.addTab(page, "拉线目标")
         page, inner = self.tab_layout()
         self.make_pave(inner, section=False)
         tabs.addTab(page, "铺路路线")
@@ -1571,7 +1630,8 @@ class Window(QMainWindow):
             detail.clicked.connect(lambda _, row=r: self.edit_team_detail(row))
             self.team_table.setCellWidget(r,7,detail)
             refill = QCheckBox("补兵")
-            refill.setToolTip("拉线：出征页出现“一键补兵”且兵力低于出击下限时点它（主城/营帐都可能出现）")
+            refill.setToolTip("拉线：兵力低于出击线时，出征页有“一键补兵”就点；"
+                              "补不动时回城，再按补兵点（营帐）调动过去继续")
             refill.setChecked(bool(t.refill_enabled))
             refill.toggled.connect(lambda checked, row=r: self.team_refill_toggled(row, checked))
             self.team_table.setCellWidget(r,8,refill)
@@ -1591,7 +1651,7 @@ class Window(QMainWindow):
             check.toggled.connect(lambda checked, row=r: self.visible_toggled(row, checked))
             self.live.setCellWidget(r,0,check)
         self.refresh_live()
-        for t,points in ((self.target_table,self.profile.targets),(self.backup_table,self.profile.backups)):
+        for t,points in ((self.target_table,self.profile.targets),(self.backup_table,self.profile.backups),(self.line_table,self.profile.line_targets)):
             t.setRowCount(0)
             for p in sorted(points, key=lambda p:p.priority):
                 self.insert_point(t,p)
@@ -1609,7 +1669,7 @@ class Window(QMainWindow):
         t.item(r,1).setData(Qt.ItemDataRole.UserRole,asdict(p))
         t.setCellWidget(r,2,spin(p.x,0,3000))
         t.setCellWidget(r,3,spin(p.y,0,3000))
-        if t is self.target_table:
+        if self.is_target_like(t):
             for column in (2,3):
                 t.cellWidget(r,column).setButtonSymbols(QSpinBox.ButtonSymbols.NoButtons)
             item(t,r,4,p.group)
@@ -1645,7 +1705,7 @@ class Window(QMainWindow):
         p.name = t.item(r,1).text().strip()
         p.x, p.y = t.cellWidget(r,2).value(), t.cellWidget(r,3).value()
         p.enabled = t.cellWidget(r,0).isChecked()
-        if t is self.target_table:
+        if self.is_target_like(t):
             p.group = t.item(r,4).text().strip()
             p.actions = list(t.cellWidget(r,5)._actions)
             p.priority = r+1
@@ -1750,7 +1810,8 @@ class Window(QMainWindow):
     def add_shared_points(self, target, text=None, strict=False):
         if not self.can_apply_addresses():
             return False
-        editor = self.target_address if target is self.target_table else self.backup_address
+        editor = (self.target_address if target is self.target_table else
+                  self.line_address if target is self.line_table else self.backup_address)
         text = editor.text() if text is None else text
         try:
             addresses = parse_addresses(text)
@@ -1780,7 +1841,7 @@ class Window(QMainWindow):
 
     def copy_addresses(self, target):
         rows = sorted({i.row() for i in target.selectedIndexes()}) or list(range(target.rowCount()))
-        check_column = 1 if target is self.target_table else 5
+        check_column = 1 if self.is_target_like(target) else 5
         addresses = [SharedAddress(target.item(r,check_column).text().strip() or target.item(r,1).text(), target.cellWidget(r,2).value(), target.cellWidget(r,3).value()).text() for r in rows]
         set_clipboard("\n".join(addresses))
         self.status.setText(f"已复制 {len(addresses)} 个游戏地址")
@@ -1822,7 +1883,7 @@ class Window(QMainWindow):
             item(t,r,6 if t is self.target_table else 4,r+1,False)
 
     def collect(self):
-        for target, editor in ((self.target_table,self.target_address),(self.backup_table,self.backup_address)):
+        for target, editor in ((self.target_table,self.target_address),(self.backup_table,self.backup_address),(self.line_table,self.line_address)):
             if editor.text().strip():
                 self.add_shared_points(target, strict=True)
         p = copy.deepcopy(self.profile)
@@ -1847,7 +1908,8 @@ class Window(QMainWindow):
         p.bandit_interval = self.bandit_interval.value()
         p.bandit_allow_assist = self.bandit_allow_assist.isChecked()
         for r,t in enumerate(p.teams):
-            t.label = self.team_table.item(r,1).text().strip()
+            # 设置页给“本次没有的队伍”显示“（未拥有）”；那是状态提示，不是名称，写回前去掉。
+            t.label = team_label(self.team_table.item(r,1).text().strip())
             t.min_mode = self.team_table.cellWidget(r,3).currentData()
             t.minimum = self.team_table.cellWidget(r,4).value()
             t.stamina, t.supply = self.team_table.cellWidget(r,5).value(), self.team_table.cellWidget(r,6).value()
@@ -1855,14 +1917,14 @@ class Window(QMainWindow):
             t.role, t.saved_role = current.role, current.saved_role
             t.route = current.route if t.role == "pave" else ""
             t.target_group, t.backup_points = current.target_group, list(current.backup_points)
-            t.line_target, t.refill_fallback = current.line_target, current.refill_fallback
+            t.refill_fallback = current.refill_fallback
             t.auto_refill = current.auto_refill
             refill_widget = self.team_table.cellWidget(r, 8)
             t.refill_enabled = bool(refill_widget.isChecked()) if isinstance(refill_widget, QCheckBox) else current.refill_enabled
             auto_widget = self.team_table.cellWidget(r, 9)
             t.auto_refill_pending = auto_widget.currentData() if isinstance(auto_widget, QComboBox) else None
-        p.targets, p.backups = [], []
-        for table_, points in ((self.target_table,p.targets),(self.backup_table,p.backups)):
+        p.targets, p.backups, p.line_targets = [], [], []
+        for table_, points in ((self.target_table,p.targets),(self.backup_table,p.backups),(self.line_table,p.line_targets)):
             for r in range(table_.rowCount()):
                 points.append(self.read_point(table_,r))
         p.pave_routes = [self.read_pave_route(r) for r in range(self.pave_table.rowCount())]

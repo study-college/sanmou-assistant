@@ -13,8 +13,9 @@ import cv2
 
 from .journal import Journal, cycle_key
 from .evidence import EvidenceStore, EvidenceLimitError
-from .models import ACTION_NAMES, Observation, Point, Profile, TeamPolicy, bandit_decision, observation_expired
-from .team_markers import TeamMarkerReader
+from .models import (ACTION_NAMES, Observation, Point, Profile, TeamPolicy, bandit_decision,
+                     observation_expired, point_label)
+from .team_markers import HUD_OFFSETS, TeamMarkerReader
 from .team_states import LEGACY_STATE, can_dispatch, label as state_label
 from .transport import Device, Stopped, TransportUnavailable
 from .vision import Vision, clock_seconds, pairs, quantity
@@ -380,6 +381,19 @@ class Game:
         self.d.swipe(1480, 575, 1580, 575, 250)
         return self.wait_transition(self.capture(), expected=(expected_page,))
 
+    def deselect_unknown_page(self):
+        """未知页面（例如战斗/攻城特效 + 建筑详情）先按用户确认的做法取消选中。
+
+        2026-11-13 实机：全屏“拆除 全体拉线”特效时页面识别为 unknown，左右滑动一次
+        （地图往返拖动）后建筑详情关闭、页面恢复 sandbox；特效文字本身还在，不影响读队。
+        只在重判为沙盘时返回 True，其他情况返回 False，由调用方继续等待。
+        """
+        self.d.swipe(1580, 575, 1480, 575, 250)
+        self.d.control.sleep(.5)
+        self.d.swipe(1480, 575, 1580, 575, 250)
+        image = self.capture()
+        return self.v.page(image) == "sandbox"
+
     def open_visit(self):
         image = self.ensure_sandbox()
         button = self.v.find(image, ["寻访"], (1680, 890, 1915, 1065), exact=True)
@@ -411,6 +425,11 @@ class Game:
         try:
             image = self.capture()
             state, _scores = self.v.hide_mode(image)
+            if state is None:
+                # 启动瞬间可能在移镜头/过渡：等半秒重读一次，避免把“没读清”当成“已开”。
+                self.d.control.sleep(.5)
+                image = self.capture()
+                state, _scores = self.v.hide_mode(image)
             if state != "open":
                 return state
             self.log("游戏隐藏显示未开启（小眼睛可见），任务开始前先打开", "INFO")
@@ -976,13 +995,13 @@ class Game:
         return obs
 
     def scan_pave_team(self, policy):
-        """铺路等待期的轻量观测：只读本队坐标、角标和重伤，不打开总览/详情。
+        """铺路/拉线等待期的轻量观测：只读本队坐标、角标和重伤，不打开总览/详情。
 
         用户 2026-11-10：到阶段点后部队头像状态马上就会变，应马上衔接下一段；
         等待期间不要反复开面板做无意义操作。兵力沿用最近一次完整读数（由
-        Worker.observe_pave_team 填充），本方法只负责现场位置与是否到点。
+        Worker.observe_pave_team / observe_line_team 填充），本方法只负责现场位置与状态。
         """
-        self.emit("status", f"正在读取 {policy.display} · 铺路快照")
+        self.emit("status", f"正在读取 {policy.display} · 轻量快照")
         image = self.locate_team(policy.slot)
         for attempt in range(2):
             coord = self.v.map_coordinates(image)
@@ -992,7 +1011,9 @@ class Game:
                 self.d.control.sleep(.6)
                 image = self.wait_transition(self.capture())
         marker = self.read_team_marker(image, policy.slot)
-        wounded = self.v.team_wounded(image, policy.slot)
+        # 重伤和角标必须来自同一帧：read_team_marker 在过渡帧会自己重截，用它的那一帧。
+        wounded_frame = getattr(self, "marker_frame", None)
+        wounded = self.v.team_wounded(wounded_frame if wounded_frame is not None else image, policy.slot)
         obs = Observation(policy.key, state=LEGACY_STATE.get(marker["state"], "unknown") if marker else "unknown",
                           location=coord, wounded=wounded, note="铺路快照")
         if marker:
@@ -1016,6 +1037,7 @@ class Game:
 
     def read_team_marker(self, image, slot):
         """单帧读一个槽位的角标状态；画面还在过渡就重截，读不到返回 None。"""
+        self.marker_frame = None
         reader = self.marker_reader()
         if not reader:
             return None
@@ -1024,6 +1046,9 @@ class Game:
         try:
             for attempt in range(2):
                 if _vcall(self.v, "frame_clear", True, image) and reader.avatars_visible(image):
+                    # 记录真正用于读角标的这一帧：重伤必须和角标同帧判断，
+                    # 否则会拿一张过渡帧的“没读到重伤”去盖掉另一帧的结论。
+                    self.marker_frame = image
                     marker = reader.read_slot(image, slot)
                     if marker and marker["state"] in ("idle", "unknown") and _vcall(self.v, "team_wounded", False, image, slot):
                         marker = {**marker, "state": "wounded", "label": state_label("wounded"), "reason": "头像重伤文字"}
@@ -1085,8 +1110,11 @@ class Game:
                 state = value
                 break
         y = (245,383,520,660,785)[policy.slot-1]
+        # 这里只用标准布局的颜色扫描（负责人真正的状态由角标读取给出）：
+        # 建筑内队伍整行左移时，用 -25 去扫地图区域会把地图上的金色/蓝色当成征兵/驻守。
         marker = cv2.cvtColor(image[y+3:y+45,1840:1900],cv2.COLOR_BGR2HSV)
-        horse_blue = cv2.inRange(marker,(90,70,110),(125,255,255))
+        blue = cv2.countNonZero(cv2.inRange(marker,(90,70,110),(125,255,255)))
+        gold = cv2.countNonZero(cv2.inRange(marker,(18,90,130),(40,255,255)))
         if "中止" in state_text and self.v.active_task_visible(image):
             # 自动铺路每格耗时可随时段变化，任务仍在运行就一直等待。
             return "active"
@@ -1095,19 +1123,16 @@ class Game:
             # 铺路只认“停留/行军/占领”，不再读营帐标题猜状态（角标已经给出答案）。
             base = bool(coord and any((b.x,b.y) == coord for b in self.p.backups))
             if phase == "backup" and base:
-                timer_gold = cv2.inRange(marker,(18,90,130),(40,255,255))
-                return "recruiting" if cv2.countNonZero(timer_gold) > 70 else "outside"
+                return "recruiting" if gold > 70 else "outside"
             return "outside"
-        if cv2.countNonZero(horse_blue) > 90:
+        if blue > 90:
             return "returning" if phase == "returning" or state == "returning" else "marching"
         if "中止" in state_text and state == "unknown":
-            guard_gold = cv2.inRange(marker,(18,90,130),(40,255,255))
-            state = "guarding" if cv2.countNonZero(guard_gold) > 70 else "unknown"
+            state = "guarding" if gold > 70 else "unknown"
             if state == "unknown" and self.v.active_task_visible(image):
                 state = "active"
         if state == "unknown":
-            gold = cv2.inRange(marker,(18,90,130),(40,255,255))
-            if cv2.countNonZero(gold) > 90 and self.v.team_task_stop_visible(image, policy.slot):
+            if gold > 90 and self.v.team_task_stop_visible(image, policy.slot):
                 state = "active"
         return state
 
@@ -1381,12 +1406,40 @@ class Game:
             index = slot - 1
         return round(self.CARD_AREA_CENTER + (index - (len(slots) - 1) / 2) * self.CARD_SPACING)
 
+    # 出征页卡片上这些状态明确不能派兵：观测到“可以拉”到真正提交之间，
+    # 队伍可能已经被打了（2026-11-13 实机：观测停留 → 走到目标 → 卡片已是“撤退/重伤”，
+    # 旧代码仍连点 3 次出征）。只在读到明确状态时拦，unknown 不拦，避免识别抖动卡死派兵。
+    BLOCKED_CARD_STATES = {"wounded": "重伤", "retreat": "撤退", "fighting": "战斗",
+                           "queued_battle": "排队进入战斗", "occupying": "占领",
+                           "marching": "行军", "recruiting": "征兵", "guarding": "驻守"}
+
+    def dispatch_card_block(self, image, policy: TeamPolicy, allow=(), assume_recruiting=False,
+                            require_known=False) -> str:
+        """提交前核对本队卡片状态；返回需要放弃本次派兵的中文原因（空串＝可以提交）。
+
+        allow：允许通过的卡片状态（只给“拉线到线就拉”和“回城后调动营帐”用）。
+        assume_recruiting：指令里没有攻占时，占领不可能是本次拉线的结果，把卡片“读不出”
+        按征兵处理（用户 2026-11-13：从根上解决 unknown 干等）。
+        require_known：卡片读不出时不提交（拉线含攻占、可能是占领时用）。
+        """
+        status = _vcall(self.v, "deployment_status", "unknown", image, policy.slot,
+                        self.card_center(policy.slot))
+        if status in allow:
+            return ""
+        if status == "unknown":
+            if assume_recruiting:
+                return ""
+            if require_known:
+                return "未识别"
+            return ""
+        return self.BLOCKED_CARD_STATES.get(status, "")
+
     def _dispatch(self, policy: TeamPolicy, obs: Observation, point: Point, kind: str, reuse_target=False):
         if self.j.pending(policy.key):
             raise GameError("该队上一笔命令还在核对中，稍后自动重试")
         if not self.account_checked and not self.verify_account():
             raise GameError("本次运行尚未核对账号，禁止派兵")
-        self.emit("status", f"{policy.display} · 正在定位 {point.name} ({point.x},{point.y})")
+        self.emit("status", f"{policy.display} · 正在定位 {point_label(point)}")
         image = self.reopen_target(point) if reuse_target else self.go_to(point)
         chosen_action, action_key, tap_point = self.pick_action(image, point, kind)
         self.d.tap(tap_point[0], tap_point[1], .45)
@@ -1423,8 +1476,16 @@ class Game:
                 self.save_image(image, "transfer-checkbox-unreadable", True)
                 raise RecognitionUnavailable("调动页自动征兵状态暂未读清，稍后自动重读")
             if checked is False:
+                # 用户 2026-11-13：有任务的队伍，脚本负责把“自动征兵”勾上。
+                # 只改这一处、只对有任务的队伍；关掉的情况再复读确认一次。
                 self.save_image(image, "transfer-checkbox-disabled", True)
-                raise GameError("调动页自动征兵显示关闭，保留游戏设置，本队暂不调动")
+                self.d.tap(*checkbox, .35)
+                image = self.capture()
+                checked_after = self.v.checked(image, *checkbox) if checkbox else None
+                if checked_after:
+                    self.log(f"{policy.display} 调动页“自动征兵”原为关闭，已勾选", "INFO")
+                else:
+                    self.log(f"{policy.display} 调动页“自动征兵”未能确认已勾选，继续调动", "WARN")
         if kind == "line" and policy.refill_enabled and obs.maximum:
             # 兵力低于出击下限才补（不无条件补满，省辐重）；按钮不存在＝当前补不动。
             current = self.v.deployment_strength(image, policy.slot)
@@ -1437,20 +1498,46 @@ class Game:
                 if self.v.refill_quota(image) == 0:
                     self.save_image(image, "line-refill-insufficient", True)
                     raise LineRefillUnavailable("一键补兵后区块归零，仍低于出击下限，判定补不动")
+                strength_after = self.v.deployment_strength(image, policy.slot)
+                if strength_after is not None and strength_after < floor:
+                    # 用户 2026-11-13：点了补兵还不到出击线，就回城（下一轮转补兵点/营帐），
+                    # 不带残兵出去；回城/撤退/调动需要几分钟，等现场。
+                    self.save_image(image, "line-refill-below-floor", True)
+                    self.log(f"{policy.display} 拉线：一键补兵后 {strength_after}/{obs.maximum} "
+                             f"仍低于出击线 {floor}，回城补兵", "INFO")
+                    raise LineRefillUnavailable("一键补兵后仍低于出击线，回城补兵")
         route = self.v.joined(image, (750, 108, 1250, 174))
         if "阻挡" in route or "无法" in route:
             raise ActionUnavailable(f"{point.name} 的当前路线不可用：{route}", action_key)
+        # AGENTS 约定“派兵前核对账号、槽位、实际兵力与重伤”：
+        # 观测之后队伍可能已经重伤/撤退/进入战斗，卡片状态是提交前最后一次现场证据。
+        # 拉线/调动营帐允许“征兵”卡片：这两种流程就是要把正在征兵的队伍拉出去/调走。
+        allow_recruiting = ("recruiting",) if kind in ("line", "transfer") else ()
+        assume_recruiting = kind == "line" and "occupy" not in point.actions
+        require_known = kind == "line" and not assume_recruiting
+        blocked = self.dispatch_card_block(image, policy, allow=allow_recruiting,
+                                           assume_recruiting=assume_recruiting,
+                                           require_known=require_known)
+        if blocked:
+            self.save_image(image, "dispatch-team-not-ready", True)
+            self.emit("diagnostic", {"stage": "dispatch_blocked", "team": policy.key,
+                                     "target": point.name, "status": blocked})
+            self.log(f"{policy.display} / {point.name}：出征页卡片显示{blocked}，本轮不派出", "WARN")
+            raise DispatchUnconfirmed(f"出征页卡片显示{blocked}，本轮不派出", action=action_key,
+                                      busy=True, page="deployment", status=blocked)
         submit_x, submit_y = self.SUBMIT_POINT
-        ident = self.j.prepare(policy.key, kind, f"{chosen_action} {point.name} ({point.x},{point.y})")
+        ident = self.j.prepare(policy.key, kind, f"{chosen_action} {point_label(point)}")
         attempts = 0
         late = None
+        # 用户 2026-11-13：拉线每轮只点一次「出征」，没确认就交给下一轮重读，不在同一页连点。
+        attempt_limit = 1 if kind == "line" else DISPATCH_ATTEMPTS
         try:
             self.emit("team_action", {"team":policy.key,"state":"confirming","reason":f"正在下发{chosen_action}并核对状态变化"})
             # 闭环：发出指令后必须看到角标状态变化（停留/空闲 -> 行军/驻守/调动/战斗…）。
-            # 状态没变说明没生效，同一轮最多重发 3 次；仍没变就交给下一轮现场重读再发，不提示人工核对。
+            # 状态没变说明没生效；拉线一轮只提交一次，武勋等仍可按原策略重试。
             while True:
                 attempts += 1
-                if attempts == DISPATCH_ATTEMPTS:
+                if attempts == attempt_limit and attempts > 1:
                     # 中间一次只重按出征；仍未受理时重新点选队伍，避免上次点击只是取消了选中。
                     self.d.tap(card_x, self.CARD_Y, .35)
                 self.d.tap(submit_x, submit_y, 1.6)
@@ -1466,11 +1553,12 @@ class Game:
                     result_state = LEGACY_STATE.get(marker_after["state"], "confirmed")
                     reason = f"角标状态 {obs.marker_state}→{marker_after['state']}"
                 else:
-                    accepted, result_state, reason = self.dispatch_verdict(after, policy)
+                    marker_dx = (marker_after or {}).get("hud_dx", 0) if (marker_after or {}).get("state") not in (None, "unknown") else 0
+                    accepted, result_state, reason = self.dispatch_verdict(after, policy, marker_dx)
                 page = self.v.page(after)
                 if page == "deployment" and obs.state == "outside" and result_state == "outside" and not changed:
                     accepted = False  # 提交前就在城外；停留卡片没有变化不证明已出发。
-                if accepted or attempts >= DISPATCH_ATTEMPTS:
+                if accepted or attempts >= attempt_limit:
                     break
                 if page != "deployment":
                     break
@@ -1517,7 +1605,7 @@ class Game:
             phase = ("backup" if kind == "transfer" else "line" if kind == "line"
                      else "guarding" if chosen_action == "驻守" else "merit")
             self.j.set_phase(policy.key, phase)
-            self.log(f"{policy.display} 已提交并确认：{chosen_action} {point.name} ({point.x},{point.y})")
+            self.log(f"{policy.display} 已提交并确认：{chosen_action} {point_label(point)}")
             self.emit("dispatch", {"team":policy.key,"kind":kind,"target":point.name,"state":result_state,"action":chosen_action})
         except DispatchUnconfirmed:
             raise
@@ -1527,9 +1615,11 @@ class Game:
                 self.emit("team_action", {"team":policy.key,"state":"retrying","reason":"提交中断，下一轮读取现场后自动重试"})
             raise
 
-    def dispatch_verdict(self, image, policy: TeamPolicy):
+    def dispatch_verdict(self, image, policy: TeamPolicy, hud_dx=0):
         """提交后一帧的受理判据。只认提交后新出现的行动证据，不看点击本身。
 
+        hud_dx：已读角标给出的本队 HUD 布局（建筑内队伍会左移），只用于颜色扫描；
+        没有可信角标时按标准布局读，避免把地图颜色当成受理证据。
         返回 (是否受理, 队伍状态, 说明)。
         """
         page = self.v.page(image)
@@ -1540,13 +1630,15 @@ class Game:
             return False, "confirmed", f"结果页 deployment / {status}"
         if page == "sandbox":
             y = (245, 383, 520, 660, 785)[policy.slot-1]
-            activity = self.v.joined(image, (1690, y-60, 1915, y+78))
-            clock_roi = image[y+3:y+42, 1840:1900]
-            hsv = cv2.cvtColor(clock_roi, cv2.COLOR_BGR2HSV)
-            yellow = cv2.inRange(hsv, (18, 100, 150), (40, 255, 255))
-            blue = cv2.inRange(hsv, (90, 70, 110), (125, 255, 255))
-            accepted = cv2.countNonZero(yellow) > 90 or cv2.countNonZero(blue) > 90 or any(s in activity for s in ("行军", "调动", "驻守"))
-            if cv2.countNonZero(blue) > 90 or any(s in activity for s in ("行军", "调动")):
+            activity = self.v.joined(image, (1690 + min(HUD_OFFSETS), y-60, 1915, y+78))
+            # 颜色扫描用标准布局：已确认角标时按它的布局读，读不到再退回标准布局，
+            # 不拿 -25 去扫地图（会把地图金色/蓝色误当成受理证据）。
+            dx = hud_dx if hud_dx in HUD_OFFSETS else 0
+            hsv = cv2.cvtColor(image[y+3:y+42, 1840+dx:1900+dx], cv2.COLOR_BGR2HSV)
+            yellow = cv2.countNonZero(cv2.inRange(hsv, (18, 100, 150), (40, 255, 255)))
+            blue = cv2.countNonZero(cv2.inRange(hsv, (90, 70, 110), (125, 255, 255)))
+            accepted = yellow > 90 or blue > 90 or any(s in activity for s in ("行军", "调动", "驻守"))
+            if blue > 90 or any(s in activity for s in ("行军", "调动")):
                 state = "marching"
             elif "驻守" in activity:
                 state = "guarding"
@@ -1653,8 +1745,8 @@ class Game:
         after = self.capture("line-refill-after", True)
         strength = self.v.deployment_strength(after, policy.slot)
         quota_after = self.v.refill_quota(after)
-        self.publish("refill", {"team": policy.key, "before": before, "after": strength,
-                                "quota": quota, "quota_after": quota_after})
+        self.emit("refill", {"team": policy.key, "before": before, "after": strength,
+                             "quota": quota, "quota_after": quota_after})
         self.log(f"{policy.display} 快速征兵：补前 {before} → 补后 {strength}"
                  f"（区块 {quota} → {quota_after}）")
         return after, quota

@@ -16,7 +16,7 @@ from .game import (DispatchUnconfirmed, Game, GameError, LineRefillUnavailable, 
 from .evidence import EvidenceStore
 from .journal import Journal
 from .models import (Decision, Observation, Point, Profile, decide, line_decision, line_target,
-                     observation_expired)
+                     observation_expired, point_label)
 from .team_states import LEGACY_STATE, can_dispatch
 from .transport import Control, Device, Stopped, TransportUnavailable, discover_cli, instances
 from .vision import Vision
@@ -66,6 +66,8 @@ class Worker(QThread):
     # 2026-11-04：久未产出就按 20 分钟看一次兵力；武勋每 30 分钟读一次只作展示。
     RECHECK_SECONDS = 1200
     MERIT_INTERVAL = 1800
+    # 拉线兵力缓存的刷新间隔：忙/可派且要按出击线判断时，超过这个秒数就完整读一次。
+    LINE_STRENGTH_TTL = 180
 
     def __init__(self, profile: Profile, folder: Path, command="scan", dry_run=True, max_orders=0, duration=0):
         super().__init__()
@@ -98,6 +100,10 @@ class Worker(QThread):
         self.merit_base = None       # 本次任务开始时的武勋
         # 铺路快照沿用最近一次完整读数（兵力/伤情）；到点后不再为读数值多开一次总览。
         self.pave_strength = {}
+        # 拉线队的兵力缓存（完整读数，含读取时间；之后快照复用，必要时刷新）。
+        self.line_snapshot = {}
+        # 拉线补不动回城后，等待下一轮调动到补兵点（营帐）。
+        self.line_backup = set()
         self.merit_prev = None       # 上一次读数，用于单次增量
         self.next_merit_at = 0.0
         self.merit_failures = 0
@@ -458,11 +464,16 @@ class Worker(QThread):
                 self.control.checkpoint()
                 if (not hide_checked and self.command == "run" and not self.dry_run
                         and self.profile.hide_before_run):
-                    hide_checked = True
                     try:
-                        game.ensure_hide_on()
+                        state = game.ensure_hide_on()
                     except GameError as exc:
                         game.log(f"打开游戏隐藏显示未完成：{exc}；本轮继续", "WARN")
+                    else:
+                        if state is None:
+                            # 启动瞬间画面还没稳定：不记“已检查”，下一轮再试。
+                            game.log("游戏隐藏状态暂未读清，下一轮再试", "INFO")
+                        else:
+                            hide_checked = True
                 # F2：游戏进出主城会自己关掉隐藏；回到沙盘后立刻重核一次（用户确认“够用”）。
                 if (hide_checked and game.city_visited and self.command == "run" and not self.dry_run
                         and self.profile.hide_before_run):
@@ -564,6 +575,15 @@ class Worker(QThread):
                         game.ensure_sandbox(recover_navigation=True)
                         game.log(f"{exc}；已关闭已识别弹层并继续监控", "INFO")
                     except (RecognitionUnavailable, NavigationRecovered) as recover_exc:
+                        # 用户 2026-11-13：战斗/攻城特效把建筑详情留在屏幕上时，页面会判未知；
+                        # 左右滑动取消选中后就能回到沙盘，不必干等到特效结束。
+                        try:
+                            recovered = game.deselect_unknown_page()
+                        except GameError:
+                            raise
+                        if recovered:
+                            game.log(f"{exc}；左右滑动取消选中后回到沙盘，继续监控", "INFO")
+                            continue
                         game.log(f"{exc}；弹层暂未读清（{recover_exc}），等待重读", "WARN")
                     except GameError:
                         raise
@@ -1251,22 +1271,68 @@ class Worker(QThread):
         return {t.key for t in self.profile.teams
                 if t.role == "line" and t.group == "main" and self.team_present(t.key)}
 
-    def process_line(self, game, food_recovery=False):
-        """拉线模块：单坐标反复拉；打赢就地再拉，打输撤回后继续，仅在手动停时结束。
+    def observe_line_team(self, game, policy):
+        """拉线读队：轻量快照（坐标/角标/重伤），不走刷武勋那套主城核对重扫描。
 
-        独立于刷武勋与铺路；每队失败隔离，单队失败不中断其他队。
+        用户 2026-11-13：一队在城外时旧的重读取会反复失败。第一轮顺手读一次完整数据
+        缓存兵力；之后只用快照，读不到完整数据也不拦派兵（能拉就拉）。
+        """
+        if policy.key not in self.line_snapshot:
+            full = self.observe_team(game, policy)
+            if full is not None and full.strength is not None and full.maximum is not None:
+                self.line_snapshot[policy.key] = (full.strength, full.maximum, time.time())
+            if full is not None and full.marker_state is not None:
+                return full
+        scanner = getattr(game, "scan_pave_team", None)
+        if not callable(scanner):
+            return self.observe_team(game, policy)
+        obs = scanner(policy)
+        cached = self.line_snapshot.get(policy.key)
+        if obs is not None and cached and obs.strength is None:
+            obs.strength, obs.maximum = cached[0], cached[1]
+        return obs
+
+    def line_backup_point(self, policy):
+        """拉线的备用征兵地点（补兵点/营帐）：按本队指定顺序，否则全部启用点。"""
+        order = {name: i for i, name in enumerate(policy.backup_points)}
+        candidates = [p for p in self.profile.backups if p.enabled
+                      and (not order or p.name in order)]
+        candidates.sort(key=lambda p: (order.get(p.name, 10 ** 6), p.priority))
+        return candidates[0] if candidates else None
+
+    def process_line(self, game, food_recovery=False):
+        """拉线模块（用户 2026-11-13 MVP 口径）。
+
+        - 目标动作按拉线目标自己的指令顺序（和武勋目标一样，由使用者排列）；
+        - 每轮每队最多点一次「出征」，没确认就交给下一轮重读；
+        - 忙碌（占领/自然征兵）但兵力已到出击线：去出征页核对，是征兵就拉、是占领就放弃；
+        - 补不动：回城 → 按补兵点调动到营帐 → 到营帐后够线就拉，不够就自然征兵到线再拉；
+        - 一轮只截一帧读所有槽位状态；只在要派兵/回城/调动时才导航。
         """
         if self.command != "run" or self.dry_run:
             return
-        lines = [t for t in self.profile.teams if t.role == "line"]
-        for policy in lines:
+        policies = [t for t in self.profile.teams if t.role == "line"]
+        if not policies:
+            return
+        # 一轮只截一帧读右侧所有槽位：角标 + 重伤。读不到才退回逐队导航。
+        self.control.checkpoint()
+        hud = {}
+        reader = getattr(game, "read_all_marker_states", None)
+        if callable(reader):
+            try:
+                hud = reader() or {}
+            except GameError as exc:
+                game.log(f"拉线整帧角标读取失败：{exc}；退回逐队读取", "WARN")
+        for policy in policies:
             self.control.checkpoint()
             if policy.group != "main" or not self.team_present(policy.key):
                 continue
-            target = line_target(policy)
+            target = line_target(self.profile, policy)
             if target is None:
                 self.log_once(f"line-target:{policy.key}",
-                              f"{policy.display} 拉线目标坐标无效，跳过本队", every=1800)
+                              f"{policy.display} 未配置启用的拉线目标（目标组 {policy.target_group}）；"
+                              f"请在「目标与铺路 → 拉线目标」添加坐标并勾选启用，本队跳过",
+                              every=1800)
                 continue
             if self.journal.pending(policy.key) or time.time() < self.retry_at.get(f"line:{policy.key}", 0):
                 continue
@@ -1281,79 +1347,129 @@ class Worker(QThread):
                 except GameError as exc:
                     game.log(f"拉线前账号核对失败：{exc}", "WARN")
                     continue
-            obs = self.observe_team(game, policy)
+            obs = None
+            has_backup = self.line_backup_point(policy) is not None
+            marker = hud.get(policy.slot)
+            cached = self.line_snapshot.get(policy.key)
+            # 缓存太久、而这一刻的决策要看兵力（忙/可派）时完整读一次；其他状态不值当导航。
+            stale = bool(cached) and time.time() - cached[2] > self.LINE_STRENGTH_TTL
+            need_strength = bool(marker) and marker.get("state") in (
+                "busy", "idle", "training", "stationary", "transfer_stay")
+            # 有补兵点时，忙也要完整读一次：确认是“在主城（先转补兵点）”还是建筑里。
+            force_home_check = has_backup and bool(marker) and marker.get("state") == "busy"
+            if (marker and marker.get("state") != "unknown" and cached
+                    and not (stale and need_strength) and not force_home_check):
+                obs = Observation(
+                    policy.key,
+                    state=LEGACY_STATE.get(marker["state"], "unknown"),
+                    strength=cached[0], maximum=cached[1],
+                    wounded=True if marker["state"] == "wounded" else None,
+                    note="拉线整帧快照", marker_state=marker["state"],
+                    marker_label=marker["label"], marker_confidence=marker["confidence"],
+                    marker_at=time.time())
+                self.publish("observation", obs.__dict__)
+            if obs is None:
+                try:
+                    obs = self.observe_line_team(game, policy)
+                except TeamAbsent as exc:
+                    self.log_once(f"line-absent:{policy.key}", f"{policy.display} 拉线：{exc}", every=1800)
+                    continue
             if obs is None:
                 continue
-            decision = line_decision(policy, obs, refill_button=True, stopped=self.control.stop.is_set())
+            if obs.strength is not None and obs.maximum is not None:
+                self.line_snapshot[policy.key] = (obs.strength, obs.maximum, time.time())
+            # 用户 2026-11-13：有补兵点的拉线队，只要在主城（含自然征兵）就先调动到补兵点，
+            # 不够线在补兵点继续征、够了从补兵点拉；没有补兵点才从主城直接拉。
+            if has_backup and obs.state == "home" and not obs.wounded:
+                self._line_transfer_backup(game, policy, obs)
+                continue
+            decision = line_decision(policy, obs, target=target,
+                                     refill_button=bool(policy.refill_enabled),
+                                     stopped=self.control.stop.is_set())
             self.publish("decision", {"team": policy.key, "action": decision.action, "reason": decision.reason})
             if decision.action == "recall":
                 self._line_fallback(game, policy, obs)
                 continue
             if decision.action not in ("line", "refill"):
                 continue
-            point = Point(name=f"拉线({target[0]},{target[1]})", x=target[0], y=target[1],
-                          group=policy.target_group or "默认", actions=["occupy", "march"],
-                          enabled=True, expected_name="")
-            ident = None
-            try:
-                image = game.go_to(point)
-                # 用户 2026-11-12 选项 a：目标已被我方占领→只剩行军仍继续，但必须记 WARN。
-                if game.v.find(image, ["攻占"], (1050, 120, 1750, 950), exact=True) is None:
-                    game.log(f"{policy.display} 拉线：目标 ({target[0]},{target[1]}) 已是自有地块，"
-                             "仅行军、无战果（按用户选择继续行军）", "WARN")
-                    self.publish("line_owned", {"team": policy.key, "target": [target[0], target[1]]})
-                ident = self.journal.prepare(policy.key, "line", f"拉线 ({target[0]},{target[1]})")
-            except GameError as exc:
-                game.log(f"{policy.display} 拉线：{exc}", "WARN")
-                self.retry_at[f"line:{policy.key}"] = time.time() + self.profile.retry_seconds
-                try:
-                    game.ensure_sandbox()
-                except GameError:
-                    pass
-                continue
+            # 动作顺序完全按目标自己的配置（和刷武勋目标一样），不再写死攻占/行军。
+            point = replace(target, expected_name="")
             try:
                 game.dispatch(policy, obs, point, "line", reuse_target=True)
             except LineRefillUnavailable as exc:
-                self.journal.finish(ident, "rejected", f"未提交：{exc}")
                 game.log(f"{policy.display} 拉线：{exc}；按兜底处理", "WARN")
                 self.retry_at[f"line:{policy.key}"] = time.time() + self.profile.retry_seconds
-                try:
-                    game.ensure_sandbox()
-                except GameError:
-                    pass
+                game.ensure_sandbox()
                 self._line_fallback(game, policy, obs)
             except DispatchUnconfirmed as exc:
-                self.journal.finish(ident, "uncertain", str(exc))
                 self.retry_at[f"line:{policy.key}"] = time.time() + self.unconfirmed_delay(policy.key)
                 game.log(f"{policy.display} / 拉线：{exc}", "INFO")
                 game.ensure_sandbox()
             except NetworkRecovered:
-                self.journal.finish(ident, "uncertain", "网络重连，提交结果未知")
                 raise
             except GameError as exc:
-                self.journal.finish(ident, "rejected", f"未提交：{exc}")
                 game.log(f"{policy.display} / 拉线：{exc}", "WARN")
                 self.retry_at[f"line:{policy.key}"] = time.time() + self.profile.retry_seconds
                 game.ensure_sandbox()
             else:
                 self.retry_at.pop(f"line:{policy.key}", None)
+                # 状态即将变化：清一次缓存，下一轮重新读完整数据。
+                self.line_snapshot.pop(policy.key, None)
                 self.publish("decision", {"team": policy.key, "action": "line",
-                                          "reason": f"拉线已提交 ({target[0]},{target[1]})"})
+                                          "reason": f"拉线已提交 {point_label(target)}"})
+
+    def _line_transfer_backup(self, game, policy, obs):
+        """回城后按补兵点调动到营帐；到达营帐后再按状态继续拉。"""
+        point = self.line_backup_point(policy)
+        if point is None:
+            self.line_backup.discard(policy.key)
+            self.log_once(f"line-backup:{policy.key}",
+                          f"{policy.display} 已回主城，但没有启用的补兵点；留在主城继续", every=1800)
+            return
+        try:
+            game.dispatch(policy, obs, point, "transfer")
+        except DispatchUnconfirmed as exc:
+            self.retry_at[f"line:{policy.key}"] = time.time() + self.unconfirmed_delay(policy.key)
+            game.log(f"{policy.display} / 拉线：回城后调动到 {point.name} 未确认：{exc}", "INFO")
+            game.ensure_sandbox()
+        except NetworkRecovered:
+            raise
+        except GameError as exc:
+            self.retry_at[f"line:{policy.key}"] = time.time() + self.profile.retry_seconds
+            game.log(f"{policy.display} 拉线：回城后调动到 {point.name} 未完成：{exc}", "WARN")
+            game.ensure_sandbox()
+        else:
+            self.line_backup.discard(policy.key)
+            self.retry_at.pop(f"line:{policy.key}", None)
+            game.log(f"{policy.display} 已回主城，按补兵点调动到 {point.name}；到达后继续拉线", "INFO")
+            self.publish("decision", {"team": policy.key, "action": "transfer",
+                                      "reason": f"拉线：回城后调动到 {point.name}"})
 
     def _line_fallback(self, game, policy, obs):
-        """补不动时的兜底：回城（免费、慢）或停手（记录、下一轮重读）。"""
+        """补不动时的兜底：回城（下一轮再调动到补兵点/营帐）或停手。"""
         if policy.refill_fallback == "stop":
             self.publish("decision", {"team": policy.key, "action": "wait",
                                       "reason": "拉线：补不动且设为停手，记录并等下一轮重读"})
             return
         if obs.location is None or obs.wounded is not False:
-            self.log_once(f"line-recall:{policy.key}",
-                          f"{policy.display} 拉线：补不动需回城，但坐标未读到，等现场重读", every=600)
-            return
+            # 整帧快照没有坐标/伤情：只在这一步完整读一次，再决定回城。
+            try:
+                full = self.observe_team(game, policy)
+            except TeamAbsent:
+                full = None
+            if full is not None and full.location is not None and full.wounded is False:
+                obs = full
+            else:
+                self.log_once(f"line-recall:{policy.key}",
+                              f"{policy.display} 拉线：补不动需回城，但坐标/伤情未读到，等现场重读", every=600)
+                return
         try:
             game.recall(policy, obs, minimum=policy.threshold(obs.maximum) if obs.maximum else None)
         except GameError as exc:
             game.log(f"{policy.display} 拉线回城未完成：{exc}", "WARN")
+        else:
+            self.line_backup.add(policy.key)
+            game.log(f"{policy.display} 拉线：补不动，已回主城；下一轮按补兵点调动到营帐", "INFO")
 
     def unconfirmed_delay(self, key):
         """出征未确认后的冷却：只做短退避，绝不锁队。

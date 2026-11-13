@@ -84,8 +84,6 @@ class TeamPolicy:
     # role == "pave" 时使用的路线名称。
     route: str = ""
     identity: str = ""
-    # role == "line" 时使用的单点目标坐标，格式 "x,y"。
-    line_target: str = ""
     # 拉线补兵：出征页出现「一键补兵」且兵力低于出击下限时点它（主城/营帐都可能出现）。
     refill_enabled: bool = True
     # 补不动（按钮不存在）时的兜底：recall=回城免费补兵；stop=停手留待下一轮。
@@ -139,6 +137,41 @@ def pave_summary(points) -> str:
     return " → ".join(pave_label(point) for point in points)
 
 
+def point_label(point) -> str:
+    """统一的“地点 + 坐标”显示：名称里已经带同一坐标时不再追加一遍。
+
+    “名称备注”允许用户写成 `拉线目标 (617,759)`，旧配置迁移也会生成这种名称；
+    日志模板若再拼一次坐标，就会出现 `(617,759)(617,759)`（交接文档 72 的 3.2）。
+    """
+    name = (point.name or "").strip()
+    coords = f"({point.x},{point.y})"
+    if not name:
+        return coords
+    if re.search(rf"[（(]\s*{point.x}\s*[,，]\s*{point.y}\s*[）)]\s*$", name):
+        return name
+    return f"{name}{coords}"
+
+
+# 设置页给“本次没有的队伍”追加的状态后缀；只用于显示，写回配置时必须去掉。
+TEAM_LABEL_SUFFIXES = ("（未拥有）", "(未拥有)")
+
+
+def team_label(text: str) -> str:
+    """队伍名称：去掉界面追加的“（未拥有）”后缀。
+
+    交接文档 72 的 3.4：设置页把“未拥有”写进会被 collect() 回读的单元格，
+    于是每次保存都在名称后面多一段，最后显示成“主城 5 队（未拥有）×4”。
+    """
+    value = (text or "").strip()
+    while True:
+        for suffix in TEAM_LABEL_SUFFIXES:
+            if value.endswith(suffix):
+                value = value[:-len(suffix)].strip()
+                break
+        else:
+            return value
+
+
 @dataclass
 class Profile:
     schema: int = 1
@@ -148,6 +181,8 @@ class Profile:
     teams: list[TeamPolicy] = field(default_factory=lambda: [TeamPolicy(slot=i) for i in range(1, 6)] + [TeamPolicy(slot=i, group="guard") for i in range(1, 4)])
     targets: list[Point] = field(default_factory=list)
     backups: list[Point] = field(default_factory=list)
+    # 拉线目标：与武勋目标同一套坐标/目标组/顺序，拉线队按自己的目标组取第一个启用的点。
+    line_targets: list[Point] = field(default_factory=list)
     pave_routes: list[PaveRoute] = field(default_factory=list)
     cli_path: str = ""
     instance: str = "0"
@@ -217,8 +252,8 @@ class Profile:
             if t.role == "line":
                 if t.group != "main":
                     errors.append(f"{t.display} 的拉线只能由主城队伍执行")
-                if line_target(t) is None:
-                    errors.append(f"{t.display} 已设为拉线，但目标坐标无效（请填 x,y）")
+                if active and not any(p.enabled and p.group == t.target_group for p in self.line_targets):
+                    errors.append(f"{t.display} 未配置启用的拉线目标")
             if t.role == "pave":
                 if t.group != "main":
                     errors.append(f"{t.display} 的铺路只能由主城队伍执行")
@@ -239,7 +274,7 @@ class Profile:
             errors.append("存在重复队伍槽位")
         if len(pave_used) != len(set(pave_used)):
             errors.append("同一条铺路路线只能分配给一支队伍")
-        for points in (self.targets, self.backups, [self.main_city] if self.main_city else []):
+        for points in (self.targets, self.backups, self.line_targets, [self.main_city] if self.main_city else []):
             names = []
             for p in points:
                 names.append(p.name)
@@ -288,6 +323,8 @@ class Profile:
         """
         owners = {}
         for team in self.teams:
+            # 名称只保存用户可编辑的部分；界面状态后缀（（未拥有））不进配置。
+            team.label = team_label(team.label)
             if team.role == "pave" and team.route:
                 owners[team.route] = team.key
         for route in self.pave_routes:
@@ -337,6 +374,14 @@ class Profile:
                     team.pop("merit", None)
                     team.pop("bandits", None)
                 team.pop("priority", None)
+                # 0.9.6 曾把拉线目标放在队伍上（只认 x,y、位置也错）；迁移成独立的 line_targets 点。
+                legacy_line = team.pop("line_target", None)
+                if isinstance(legacy_line, str) and legacy_line.strip():
+                    migrated = _legacy_line_point(legacy_line)
+                    if migrated:
+                        existing = data.setdefault("line_targets", [])
+                        if not any(isinstance(p, dict) and p.get("x") == migrated["x"] and p.get("y") == migrated["y"] for p in existing):
+                            existing.append(migrated)
                 if "backup" in team:
                     backup = team.pop("backup")
                     team.setdefault("backup_points", [backup] if backup else [])
@@ -352,8 +397,6 @@ class Profile:
                     raise ValueError("拉线快速征兵必须是开关")
                 if "refill_fallback" in team and team["refill_fallback"] not in ("recall", "stop"):
                     raise ValueError("补兵兜底只能是回城或停手")
-                if "line_target" in team and not isinstance(team["line_target"], str):
-                    raise ValueError("拉线目标必须是文字")
                 for name in ("auto_refill", "auto_refill_pending"):
                     if name in team and team[name] is not None and type(team[name]) is not bool:
                         raise ValueError("回城自动补兵必须是开关或未知")
@@ -361,7 +404,7 @@ class Profile:
                     raise ValueError("队伍任务必须是文字")
                 if "backup_points" in team and not isinstance(team["backup_points"], list):
                     raise ValueError("队伍补兵点必须是列表")
-            for point in data.get("targets", []) + data.get("backups", []) + ([data["main_city"]] if data.get("main_city") else []):
+            for point in data.get("targets", []) + data.get("backups", []) + data.get("line_targets", []) + ([data["main_city"]] if data.get("main_city") else []):
                 for name in ("x", "y", "priority", "capacity"):
                     if name in point and type(point[name]) is not int:
                         raise ValueError(f"地点 {name} 必须是整数")
@@ -377,6 +420,7 @@ class Profile:
             data["teams"] = [TeamPolicy(**t) for t in data.get("teams", [])]
             data["targets"] = [Point(**t) for t in data.get("targets", [])]
             data["backups"] = [Point(**t) for t in data.get("backups", [])]
+            data["line_targets"] = [Point(**t) for t in data.get("line_targets", [])]
             data["pave_routes"] = [PaveRoute(**r) for r in data.get("pave_routes", [])]
             data["main_city"] = Point(**data["main_city"]) if data.get("main_city") else None
             obj = cls(**data)
@@ -505,23 +549,40 @@ def bandit_decision(profile: Profile, policy: TeamPolicy, obs: Observation, grai
     return Decision("bandits","讨贼：队伍在主城，等可加入集结")
 
 
-def parse_target(text: str) -> Optional[tuple[int, int]]:
-    """把 "x,y"（允许中文逗号/全角括号/尾随备注）解析成坐标；无效返回 None。"""
-    cleaned = (text or "").strip().replace("，", ",").replace("（", "(").replace("）", ")").replace(" ", "")
-    match = re.match(r"^(\d{1,4})[,:：](\d{1,4})", cleaned)
-    return (int(match[1]), int(match[2])) if match else None
+def _legacy_line_point(text: str) -> Optional[dict]:
+    """把 0.9.6 放在队伍上的 line_target 迁移成一个拉线目标点。
+
+    兼容两种写法：裸坐标 "617,759" 与游戏分享地址 "水面(617,759)"。
+    """
+    cleaned = (text or "").strip()
+    match = re.search(r"(\d{1,4})\s*[,，]\s*(\d{1,4})", cleaned)
+    if not match:
+        return None
+    x, y = int(match[1]), int(match[2])
+    if not (0 <= x <= 3000 and 0 <= y <= 3000):
+        return None
+    name = cleaned[:match.start()].strip("()（） \t") or f"拉线目标 ({x},{y})"
+    return {"name": name[:40], "x": x, "y": y, "group": "默认", "actions": ["occupy", "march"],
+            "priority": 1, "enabled": True, "expected_name": "", "capacity": 0}
 
 
-def line_target(policy: TeamPolicy) -> Optional[tuple[int, int]]:
-    """拉线目标的单一坐标；用户口径：拉线只做一个点，不做多目标轮换。"""
-    return parse_target(policy.line_target)
+def line_target(profile: "Profile", policy: TeamPolicy) -> Optional[Point]:
+    """拉线目标：本队目标组里按顺序第一个启用的点（与武勋目标同一套口径）。
+
+    用户 2026-11-13：拉线目标就是坐标点，和武勋目标一样放在「目标与铺路」里，
+    名称只作备注，定位只认坐标；不再单独造一套只认 "x,y" 的格式。
+    """
+    candidates = sorted([p for p in profile.line_targets if p.enabled and p.group == policy.target_group],
+                        key=lambda p: p.priority)
+    return candidates[0] if candidates else None
 
 
 LINE_FALLBACKS = ("recall", "stop")
 
 
-def line_decision(policy: TeamPolicy, obs: Observation, *, refill_button: bool = False,
-                  target_owned: bool = False, stopped: bool = False) -> Decision:
+def line_decision(policy: TeamPolicy, obs: Observation, *, target: Optional[Point] = None,
+                  refill_button: bool = False, target_owned: bool = False,
+                  stopped: bool = False) -> Decision:
     """拉线模块的单队决策（纯函数，便于用真帧或构造观测做单测）。
 
     用户 2026-11-12 口径：
@@ -532,18 +593,27 @@ def line_decision(policy: TeamPolicy, obs: Observation, *, refill_button: bool =
     """
     if stopped:
         return Decision(reason="拉线：用户已手动停止，本轮不派兵")
-    target = line_target(policy)
     if target is None:
-        return Decision(reason="拉线：目标坐标无效，等待重新设置")
+        return Decision(reason="拉线：本队目标组还没有启用的拉线目标")
     if obs.wounded:
         return Decision(reason="拉线：等待重伤结束")
     marker = getattr(obs, "marker_state", None)
+    if marker is None:
+        # 读失败不能当成“可以拉”：没读到状态就等下一次，不拿空观测派兵。
+        return Decision(reason="拉线：本队状态未读到，等下一次读取")
     if marker == "unknown":
         return Decision(reason="拉线：角标状态未识别，等下一次读取")
-    if marker is not None and not can_dispatch(marker):
-        return Decision(reason=f"拉线：角标显示{marker_label(marker)}，等待现场")
     low = (obs.strength is not None and obs.maximum is not None
            and obs.strength < policy.threshold(obs.maximum))
+    if not can_dispatch(marker):
+        # 用户 2026-11-13：拉线要“动起来”。忙（占领/自然征兵）也去出征页核对：
+        # 卡片是“征兵”就点一键补兵/直接拉，是“占领”就放弃——由提交前的卡片核对兜底。
+        # 指令里没有“攻占”时，占领不可能是这条拉线指令的结果，忙基本就是征兵。
+        if marker == "busy":
+            if target is not None and "occupy" not in target.actions:
+                return Decision("line", "拉线：忙碌，当前指令不含攻占（按征兵处理），去出征页补兵/拉")
+            return Decision("line", "拉线：忙碌（占领/征兵），去出征页核对：征兵就补兵/拉，占领就放弃")
+        return Decision(reason=f"拉线：角标显示{marker_label(marker)}，等待现场")
     if low:
         if not policy.refill_enabled:
             return Decision(reason="拉线：兵力低于出击下限，快速征兵未启用，等待自然征兵")
@@ -556,5 +626,5 @@ def line_decision(policy: TeamPolicy, obs: Observation, *, refill_button: bool =
         return Decision("recall", "拉线：一键补兵按钮不存在，回城免费补兵")
     if target_owned:
         return Decision("line", "拉线：目标已是自有地块，仅行军无战果")
-    return Decision("line", f"拉线：向 ({target[0]},{target[1]}) 派出")
+    return Decision("line", f"拉线：向 {point_label(target)} 派出")
 

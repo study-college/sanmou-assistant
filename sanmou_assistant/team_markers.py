@@ -26,8 +26,16 @@ SLOT_Y = (245, 383, 520, 660, 785)
 BADGE_SIZE = 58
 BADGE_X = 1840
 BADGE_DY = -8
-SEARCH_DX = 10
-SEARCH_DY = 18
+
+# 右侧队伍头像不是固定 x。2026-11-13 用户截图 + 本机真帧实测：
+# 选中建筑物（如寒沙寨）后，**驻扎在该建筑里的队伍**整行左移 25px（头像/血条/角标一起），
+# 同一帧里不在该建筑的队伍仍在原位；旧代码只按固定 x=1840 ±10 找角标，
+# 建筑内队伍因此被读成“未识别”。这里改成“每个槽位在已知布局里各试一次，
+# 取匹配最强的那套”，不要求整列一起移动。新增布局必须先有真帧实测再写进来。
+# 候选之间用 SEARCH_DX 的残差连成连续区间：0±6、-12±6、-25±6 → 覆盖 -31..+6。
+HUD_OFFSETS = (0, -12, -25)
+SEARCH_DX = 6
+SEARCH_DY = 10
 
 # 阈值来自 2026-11-02 多个不同地图、不同头像（含换将）的实测：
 # 已标注角标相关度 0.89~1.00；空闲槽位 ≤0.60；未学角标（白色左箭头）0.44。
@@ -108,64 +116,97 @@ class TeamMarkerReader:
 
         2026-11-08 用户明确：队伍数量以游戏部队列表为准，不看头像。
         这里只要求右侧至少有一支队伍的血条，少队/空槽位不影响。
+        按所有已知布局的并集找血条，建筑内队伍左移时同样成立。
         """
         if image is None or image.shape[:2] != (1080, 1920):
             return False
         hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
         s, v = hsv[:, :, 1], hsv[:, :, 2]
+        left = 1720 + min(HUD_OFFSETS)
+        right = 1920 + max(HUD_OFFSETS)
         for y in SLOT_Y:
-            bar = (s[y + 51:y + 57, 1780:1900] > 90) & (v[y + 51:y + 57, 1780:1900] > 120)
-            if bar.mean() >= .2:
+            bar = (s[y + 51:y + 57, left:right] > 90) & (v[y + 51:y + 57, left:right] > 120)
+            if bar.mean() >= .15:
                 return True
         return False
 
     @staticmethod
-    def _window(image, slot):
+    def _window(image, slot, dx=0):
         y = SLOT_Y[slot - 1] + BADGE_DY
-        return image[y:y + BADGE_SIZE, BADGE_X:BADGE_X + BADGE_SIZE]
+        x = BADGE_X + dx
+        return image[y:y + BADGE_SIZE, x:x + BADGE_SIZE]
 
     @staticmethod
-    def _search_roi(image, slot):
+    def _search_roi(image, slot, dx=0):
         y = SLOT_Y[slot - 1]
-        return image[y - 40:y + 70, 1820:1920], 20, 32
+        x0 = 1820 + dx
+        return image[y - 40:y + 70, x0:x0 + 100], 20, 32
 
     # ---------- 判定 ----------
 
-    def glyph_candidates(self, image, slot) -> list[dict]:
+    @staticmethod
+    def _glyph_like(value, labels, stats, index, centre=None):
+        """一个亮块是否像角标字形：紧凑、够大、紧邻一圈偏暗。
+
+        centre 给了就还要求它落在窗口中心附近（旧“固定位置”判据）；
+        不给则只按形状判断，用于“这一行任意 x 有没有角标”。
+        """
+        x, y, w, h, area = stats[index]
+        if area < GLYPH_AREA or w > GLYPH_BOX or h > GLYPH_BOX:
+            return False
+        if max(w, h) < GLYPH_MIN_SIDE:
+            # 地图上的白字（如“伤”）会碎成很小的亮块，不能当角标字形。
+            return False
+        if centre is not None:
+            cx, cy = centre
+            if abs(cx - BADGE_SIZE / 2) > GLYPH_CENTRE or abs(cy - BADGE_SIZE / 2) > GLYPH_CENTRE:
+                return False
+        ring = (cv2.dilate((labels == index).astype(np.uint8), np.ones((5, 5), np.uint8)) > 0) & (labels != index)
+        if ring.sum() < 20:
+            return False
+        return float(np.median(value[ring])) <= GLYPH_RING_DARK
+
+    def glyph_candidates(self, image, slot, dx=0) -> list[dict]:
         """窗内"像角标字形"的亮块：紧凑、居中、紧邻一圈偏暗。"""
-        window = self._window(image, slot)
+        window = self._window(image, slot, dx)
         value = cv2.cvtColor(window, cv2.COLOR_BGR2HSV)[:, :, 2]
         bright = (value >= GLYPH_BRIGHT).astype(np.uint8)
         count, labels, stats, centres = cv2.connectedComponentsWithStats(bright, 8)
         found = []
         for index in range(1, count):
+            if not self._glyph_like(value, labels, stats, index, centre=centres[index]):
+                continue
             x, y, w, h, area = stats[index]
-            if area < GLYPH_AREA or w > GLYPH_BOX or h > GLYPH_BOX:
-                continue
-            if max(w, h) < GLYPH_MIN_SIDE:
-                # 地图上的白字（如“伤”）会碎成很小的亮块，不能当角标字形。
-                continue
-            cx, cy = centres[index]
-            if abs(cx - BADGE_SIZE / 2) > GLYPH_CENTRE or abs(cy - BADGE_SIZE / 2) > GLYPH_CENTRE:
-                continue
             ring = (cv2.dilate((labels == index).astype(np.uint8), np.ones((5, 5), np.uint8)) > 0) & (labels != index)
-            if ring.sum() < 20:
-                continue
-            ring_dark = float(np.median(value[ring]))
-            if ring_dark > GLYPH_RING_DARK:
-                continue
-            found.append({"area": int(area), "box": [int(w), int(h)], "ring": round(ring_dark, 1)})
+            found.append({"area": int(area), "box": [int(w), int(h)],
+                          "ring": round(float(np.median(value[ring])), 1)})
         return found
 
-    def plaque_score(self, image, slot):
+    def badge_like_anywhere(self, image, slot) -> bool:
+        """本行头像区域任意 x 上有没有“像角标”的形状。
+
+        用途只有一个：第一套布局没匹配上时，判断还要不要再试左移布局。
+        没有这种形状就当空闲；有但认不出，后面会保守报“未识别”，不降级成空闲。
+        """
+        y = SLOT_Y[slot - 1]
+        row = image[y - 22:y + 32, 1740 + min(HUD_OFFSETS):1920 + max(HUD_OFFSETS)]
+        if row.size == 0:
+            return False
+        value = cv2.cvtColor(row, cv2.COLOR_BGR2HSV)[:, :, 2]
+        bright = (value >= GLYPH_BRIGHT).astype(np.uint8)
+        count, labels, stats, centres = cv2.connectedComponentsWithStats(bright, 8)
+        return any(self._glyph_like(value, labels, stats, index)
+                   for index in range(1, count))
+
+    def plaque_score(self, image, slot, dx=0):
         """诊断用：菱形区域内近黑像素占比。不能单独当"有没有角标"的判据。"""
-        window = self._window(image, slot)
+        window = self._window(image, slot, dx)
         value = cv2.cvtColor(window, cv2.COLOR_BGR2HSV)[:, :, 2]
         return float((value[_match_mask()] < 40).mean())
 
-    def _scores(self, image, slot):
+    def _scores(self, image, slot, dx=0):
         mask = _match_mask()
-        roi, ox0, oy0 = self._search_roi(image, slot)
+        roi, ox0, oy0 = self._search_roi(image, slot, dx)
         windows = np.lib.stride_tricks.sliding_window_view(roi, (BADGE_SIZE, BADGE_SIZE), axis=(0, 1))
         windows = windows.transpose(0, 1, 3, 4, 2)  # (y, x, 58, 58, 3)
         # 只取允许的偏移范围，避免在空地/头像上"找"出假角标。
@@ -192,38 +233,67 @@ class TeamMarkerReader:
             results[state] = best
         return results
 
-    def read_slot(self, image: np.ndarray, slot: int) -> dict:
+    def read_slot(self, image: np.ndarray, slot: int, offset: int | None = None) -> dict:
         if not 1 <= slot <= 5:
             raise ValueError("主队槽位必须为1～5")
-        scores = self._scores(image, slot)
-        ranked = sorted(scores.items(), key=lambda kv: kv[1][0], reverse=True)
-        best_state, (best_score, dx, dy) = ranked[0]
-        second_state, (second_score, *_rest) = ranked[1] if len(ranked) > 1 else ("unknown", (-2.0, 0, 0))
-        plaque = self.plaque_score(image, slot)
-        glyphs = self.glyph_candidates(image, slot)
+        # 已知布局逐个试，取匹配最强的一套：建筑内队伍左移、其他队不动，不能假定整列一致。
+        # 为控制耗时：第一套布局匹配到可信状态就结束；第一套连“角标形状”都没有就当空闲，
+        # 只有“有角标但没认出”时才继续试左移布局（通常只有建筑内那 1～2 支队）。
+        candidates = (int(offset),) if offset is not None else HUD_OFFSETS
+        head = None
+        all_glyphs = []
+        for index, dx in enumerate(candidates):
+            scores = self._scores(image, slot, dx)
+            ranked = sorted(scores.items(), key=lambda kv: kv[1][0], reverse=True)
+            best_state, (best_score, local_dx, local_dy) = ranked[0]
+            second_state, (second_score, *_rest) = ranked[1] if len(ranked) > 1 else ("unknown", (-2.0, 0, 0))
+            glyphs = self.glyph_candidates(image, slot, dx)
+            all_glyphs.extend(glyphs)
+            entry = {
+                "rank": (best_score, bool(glyphs)),
+                "dx": dx,
+                "state": best_state,
+                "score": best_score,
+                "local": (local_dx, local_dy),
+                "second": (second_state, second_score),
+                "glyphs": glyphs,
+                "plaque": self.plaque_score(image, slot, dx),
+            }
+            if head is None or entry["rank"] > head["rank"]:
+                head = entry
+            if head["score"] >= MATCH_MIN:
+                break
+            if index == 0 and not self.badge_like_anywhere(image, slot):
+                # 第一套布局没有任何角标形状：空闲，不必再为其他布局重复整窗匹配。
+                break
+        best_score = head["score"]
         if best_score >= MATCH_MIN:
-            state, reason = best_state, "模板匹配"
-        elif glyphs:
+            state, reason = head["state"], "模板匹配"
+        elif all_glyphs:
             state, reason = "unknown", "角标未识别"
         elif best_score < BEST_IDLE_MAX:
             state, reason = "idle", "无角标"
         else:
             state, reason = "unknown", "角标未识别"
         idle = state == "idle"
+        glyph = head["glyphs"][0] if head["glyphs"] else (all_glyphs[0] if all_glyphs else None)
+        local_dx, local_dy = head["local"]
+        second_state, second_score = head["second"]
         return {
             "slot": slot,
             "state": state,
             "label": label(state),
             "reason": reason,
             "confidence": round(1 - min(best_score, .99), 3) if idle else round(best_score, 3),
-            "plaque": round(plaque, 3),
-            "glyph": glyphs[0] if glyphs else None,
-            "matched": None if idle else best_state,
-            "matched_label": None if idle else label(best_state),
+            "plaque": round(head["plaque"], 3),
+            "glyph": glyph,
+            "matched": None if idle else head["state"],
+            "matched_label": None if idle else label(head["state"]),
             "matched_score": None if idle else round(best_score, 3),
             "second": None if idle else second_state,
             "second_score": None if idle else round(second_score, 3),
-            "shift": None if idle else [dx, dy],
+            "hud_dx": head["dx"],
+            "shift": None if idle else [local_dx, local_dy],
         }
 
     def read(self, image: np.ndarray) -> list[dict]:

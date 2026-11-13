@@ -10,6 +10,7 @@ import cv2
 import numpy as np
 
 from .models import Observation
+from .team_markers import HUD_OFFSETS
 
 
 @dataclass
@@ -1006,12 +1007,17 @@ class Vision:
 
         只有没有角标的队伍才需要查（重伤队在主城，角标区为空）；一次小区域 OCR，
         文字必须正好是“重伤”，地图上的单个“伤”字或白色撤退箭头不会被当成重伤。
+        2026-11-13：选中建筑物时，驻扎在该建筑里的队伍整行左移 ~25px，固定 x 会漏读；
+        按所有已知布局各读一次，读到即算重伤。
         """
         if not 1 <= slot <= 5:
             return False
         y = (245, 383, 520, 660, 785)[slot - 1]
-        text = self.joined(image, (1808, y - 19, 1880, y + 19)).replace(" ", "")
-        return "重伤" in text
+        for dx in HUD_OFFSETS:
+            text = self.joined(image, (1808 + dx, y - 19, 1880 + dx, y + 19)).replace(" ", "")
+            if "重伤" in text:
+                return True
+        return False
 
     def deploy_button_enabled(self, image):
         """出征按钮是否可点：按钮底色为黄色才算可用（灰色＝条件不满足）。"""
@@ -1107,11 +1113,14 @@ class Vision:
         if not 1 <= slot <= 5:
             return False
         y = (245,383,520,660,785)[slot-1]
-        roi = image[y:y+56,1840:1905]
-        if roi.shape[:2] != (56,65):
-            return False
-        white = cv2.inRange(cv2.cvtColor(roi,cv2.COLOR_BGR2HSV),(0,0,150),(179,65,255))
-        return float(cv2.matchTemplate(white,self.returning_marker,cv2.TM_CCOEFF_NORMED).max()) >= .92
+        best = 0.0
+        for dx in HUD_OFFSETS:
+            roi = image[y:y+56, 1840+dx:1905+dx]
+            if roi.shape[:2] != (56,65):
+                continue
+            white = cv2.inRange(cv2.cvtColor(roi,cv2.COLOR_BGR2HSV),(0,0,150),(179,65,255))
+            best = max(best, float(cv2.matchTemplate(white,self.returning_marker,cv2.TM_CCOEFF_NORMED).max()))
+        return best >= .92
 
     def refill_checkbox(self, image):
         label = self.find(image, ["回城自动补兵"], (1640, 875, 1840, 965), exact=True)
@@ -1314,18 +1323,35 @@ class Vision:
                 slots[key] = (int(match[1]), int(match[2]))
         return slots
 
-    def deployment_status(self, image, slot: int, center_x=None) -> str:
-        # 少队时卡片整组居中；调用方给 center_x 就按卡片左边缘读，没给才退回旧五列。
-        x = (round(center_x) - 125) if center_x is not None else 25 + (slot-1)*249
-        value = self.joined(image, (x, 750, x+235, 821))
+    @staticmethod
+    def _card_state(value: str) -> str:
+        """卡片状态文字 → 状态；读不到返回空串。"""
         if "重伤" in value:
             return "wounded"
         # 铺路/攻占过程中卡片会显示占领倒计时；队伍参战时会显示“战斗”。
-        for label, state in (("集结", "outside"), ("战斗", "fighting"),
+        for label, state in (("撤退", "retreat"), ("集结", "outside"), ("战斗", "fighting"),
                              ("占领", "occupying"), ("返回", "returning"),
                              ("征兵", "recruiting"), ("驻守", "guarding"), ("行军", "marching"),
                              ("调动", "outside"), ("停留", "outside"), ("空闲", "home")):
             if label in value:
+                return state
+        return ""
+
+    def deployment_status(self, image, slot: int, center_x=None) -> str:
+        # 少队时卡片整组居中；调用方给 center_x 就按卡片左边缘读，没给才退回旧五列。
+        x = (round(center_x) - 125) if center_x is not None else 25 + (slot-1)*249
+        value = self.joined(image, (x, 750, x+235, 821))
+        state = self._card_state(value)
+        if state:
+            return state
+        # 2026-11-13 实机：战斗/暗色卡片上“征兵/占领”可能整行读不到。
+        # 用同一区域做对比度增强后再读一次，从根上减少 unknown，而不是让调用方干等。
+        roi = image[745:850, x:x+235]
+        if roi.size:
+            gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+            enhanced = cv2.cvtColor(cv2.equalizeHist(gray), cv2.COLOR_GRAY2BGR)
+            state = self._card_state(self.joined(enhanced, (0, 0, roi.shape[1], roi.shape[0])).replace(" ", ""))
+            if state:
                 return state
         return "unknown"
 
