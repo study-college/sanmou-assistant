@@ -488,6 +488,12 @@ class Vision:
             return prompt
         if self.bandit_assist_prompt(image) is not None:
             return "bandit_assist_confirm"
+        # 出征提交后的模态弹窗（强敌预警 / 二次确认）：全屏拦截，必须先于底层页型判断，
+        # 否则会被当成 unknown，脚本按“未知页暂停”一直等不到受理证据。
+        if self.enemy_warning(image) is not None:
+            return "enemy_warning"
+        if self.confirm_dialog(image) is not None:
+            return "dispatch_confirm"
         # 聊天面板的“前往好友”不是地图前往；先核对两个专有控件。
         if self.chat_close_point(image) is not None:
             return "chat"
@@ -742,6 +748,77 @@ class Vision:
         cancel = self.find(image, ["取消"], (570, 610, 895, 707), exact=True)
         confirm = self.find(image, ["确定"], (1020, 610, 1355, 707), exact=True)
         return (cancel, confirm) if cancel and confirm else None
+
+    def confirm_dialog(self, image):
+        """出征前的二次确认弹窗：未加点武将 / 未携带满战法。
+
+        2026-11-12 实测：点出征页右下 `出征` 后弹出；标题「提示」+ 正文两句之一
+        + 「继续出征」和「前往加点/前往调整」两个按钮同时成立才认定。
+        判据来自 session-03 scene-008/013/032 真帧；读不齐返回 None，调用方不得据此点击。
+        """
+        if self.find(image, ["提示"], (820, 345, 1110, 445), exact=True) is None:
+            return None
+        body = self.joined(image, (560, 480, 1370, 600)).replace(" ", "")
+        kinds = {"部队有未加点的武将": "unleveled", "部队未携带满战法": "unfull_skill"}
+        kind = next((value for key, value in kinds.items() if key in body), None)
+        if kind is None or "是否继续出征" not in body:
+            return None
+        confirm = self.find(image, ["继续出征"], (560, 605, 1010, 715), exact=True)
+        leave = self.find(image, ["前往加点", "前往调整"], (1010, 605, 1420, 715), exact=True)
+        if confirm is None or leave is None:
+            return None
+        return {"kind": kind, "body": body,
+                "continue_point": (round(confirm.x), round(confirm.y)),
+                "leave_point": (round(leave.x), round(leave.y))}
+
+    def enemy_warning(self, image):
+        """强敌预警弹窗「敌军强盛，请主公三思！」。
+
+        2026-11-12 实测（pages/enemy-too-strong-2026-11-12.png）：大标题 + 四行指标
+        + 左下「该等级今日不再提示」+ 底部「暂且避让」/「继续进攻(N秒)」。
+        `继续进攻` 初始是灰色倒计时按钮，倒计时未走完点了是点空，调用方必须等待。
+        返回 {continue_point, avoid_point, checkbox, countdown}；读不齐返回 None。
+        """
+        title = self.joined(image, (300, 130, 1650, 250)).replace(" ", "")
+        if "强盛" not in title or "三思" not in title:
+            return None
+        avoid = self.find(image, ["暂且避让"], (750, 875, 1000, 965), exact=True)
+        spans = self.read(image, (1170, 875, 1520, 965), minimum=.75)
+        advance = None
+        countdown = 0
+        for span in spans:
+            if "继续进攻" not in span.text.replace(" ", ""):
+                continue
+            advance = span
+            found = re.search(r"(\d+)\s*秒", span.text.replace(" ", ""))
+            if found is None:
+                # OCR 常把 `继续进攻(N秒)` 拆成相邻两段，只拼同一行紧邻的秒字段。
+                for other in spans:
+                    if other is span or abs(other.y - span.y) > 12:
+                        continue
+                    tail = re.fullmatch(r"(\d{1,2})(?:秒)?", other.text.replace(" ", ""))
+                    if tail and span.box[2] - 20 <= other.box[0] <= span.box[2] + 150:
+                        found = tail
+                        break
+            if found is not None:
+                countdown = int(found[1])
+            break
+        if avoid is None or advance is None:
+            return None
+        checkbox = None
+        label = self.find(image, ["该等级今日不再提示"], (350, 880, 730, 965), exact=True)
+        if label is not None:
+            rect = (round(label.box[0]) - 12, round(label.y) - 34,
+                    round(label.box[0]) + 90, round(label.y) + 34)
+            # OCR 常把方框与文字并成一行、压缩画面还会把轮廓糊成一个整块；
+            # 轮廓定位优先，退回“文字左缘 + 固定偏移”（与 refill_checkbox 同一套锚定思路）。
+            checkbox = (self.checkbox_before(image, label)
+                        or self.checkbox_square(image, rect)
+                        or (round(label.box[0]) + 20, round(label.y)))
+        return {"continue_point": (round(advance.x), round(advance.y)),
+                "avoid_point": (round(avoid.x), round(avoid.y)),
+                "checkbox": checkbox,
+                "countdown": countdown}
 
     def chat_close_point(self, image):
         if not self.find(image, ["前往好友"], (0, 885, 250, 972), exact=True):
@@ -1039,6 +1116,53 @@ class Vision:
     def refill_checkbox(self, image):
         label = self.find(image, ["回城自动补兵"], (1640, 875, 1840, 965), exact=True)
         return (1857, round(label.y)) if label else None
+
+    @staticmethod
+    def checkbox_square(image, rect, min_side=22, max_side=46):
+        """在给定区域里找唯一的复选框方框中心（比 checkbox_before 更宽的尺寸范围）。
+
+        强敌预警的复选框比补给提醒那类小一号（实测约 28×27），且 OCR 会把方框与
+        文字合并成一行，checkbox_before 按文字左缘定位会落在框外；这里直接找方框轮廓。
+        """
+        x0, y0, x1, y1 = (int(value) for value in rect)
+        x0, y0 = max(0, x0), max(0, y0)
+        hsv = cv2.cvtColor(image[y0:y1, x0:x1], cv2.COLOR_BGR2HSV)
+        border = cv2.inRange(hsv, (0, 0, 65), (179, 65, 255))
+        border = cv2.morphologyEx(border, cv2.MORPH_CLOSE, np.ones((9, 1), np.uint8))
+        contours, _ = cv2.findContours(border, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+        centres = []
+        for contour in contours:
+            x, y, w, h = cv2.boundingRect(contour)
+            if min_side <= w <= max_side and min_side <= h <= max_side and .7 < w / h < 1.4:
+                centre = (round(x0 + x + w / 2), round(y0 + y + h / 2))
+                if not any(abs(centre[0] - cx) < 6 and abs(centre[1] - cy) < 6 for cx, cy in centres):
+                    centres.append(centre)
+        return centres[0] if len(centres) == 1 else None
+
+    def refill_button(self, image):
+        """出征页右下的「一键补兵」按钮位置；区块不存在返回 None。
+
+        2026-11-12：主城与营帐/城池的出征页都可能出现该按钮。按钮不存在＝当前补不动
+        （没辎重 / 范围无辎重 / 兵池不足），调用方必须走兜底，不能当“点了没反应”重试。
+        """
+        button = self.find(image, ["一键补兵"], (1250, 955, 1620, 1065), exact=False)
+        return (round(button.x), round(button.y)) if button else None
+
+    def refill_quota(self, image):
+        """「一键补兵」区块上方随当前队伍变化的数值；读不到返回 None。
+
+        2026-11-12 实测（session-04）：表头「消耗辎重」，值 3828 → 点击后 0；
+        必须与选中队伍同帧读取，禁止跨队缓存。
+        """
+        header = self.find(image, ["消耗辎重", "消耗辐重"], (1260, 890, 1580, 940), exact=False)
+        if header is None:
+            return None
+        for span in self.read(image, (1320, 925, 1530, 995), minimum=.75):
+            text = span.text.replace(" ", "").replace(",", "")
+            if re.fullmatch(r"\d{1,6}", text):
+                return int(text)
+        # 表头在但数值读不到 = 区块已归零（点击后额度用尽，用户 2026-11-12 实测）。
+        return 0
 
     def full_team(self, image: np.ndarray, key: str) -> Observation:
         obs = Observation(key)

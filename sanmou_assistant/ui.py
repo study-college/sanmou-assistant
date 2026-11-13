@@ -394,6 +394,14 @@ class TeamDetailDialog(QDialog):
         self.group.addItems(groups)
         self.group.setCurrentText(team.target_group or "默认")
         form.addRow("武勋目标组", self.group)
+        self.line_target = QLineEdit(team.line_target)
+        self.line_target.setPlaceholderText("拉线目标，例如 602,707（只认坐标，不做多目标）")
+        form.addRow("拉线目标坐标", self.line_target)
+        self.fallback = QComboBox()
+        self.fallback.addItem("回城免费补兵（慢）", "recall")
+        self.fallback.addItem("停手等下一轮", "stop")
+        self.fallback.setCurrentIndex(1 if team.refill_fallback == "stop" else 0)
+        form.addRow("补不动时", self.fallback)
         layout.addLayout(form)
 
         layout.addWidget(QLabel("本队补兵点（从上到下）"))
@@ -445,7 +453,10 @@ class TeamDetailDialog(QDialog):
         self.points.setCurrentRow(target)
 
     def values(self):
-        return self.group.currentText().strip() or "默认", [self.points.item(i).text() for i in range(self.points.count())]
+        return (self.group.currentText().strip() or "默认",
+                [self.points.item(i).text() for i in range(self.points.count())],
+                self.line_target.text().strip(),
+                self.fallback.currentData())
 
 
 def dialog_buttons():
@@ -897,13 +908,13 @@ class Window(QMainWindow):
 
     def make_teams(self):
         layout = self.page("部队任务", "每支队伍只做一件事：刷武勋、讨贼或铺路。第一次先点“读取全部队伍”确认本次实际有几队；没有的槽位会自动锁住，保留配置但不读取、不派兵。", scroll=False)
-        self.team_table = table(["显示", "队伍", "任务", "兵力方式", "出击下限", "体力", "补给", "目标组 / 补兵点"])
+        self.team_table = table(["显示", "队伍", "任务", "兵力方式", "出击下限", "体力", "补给", "目标组 / 补兵点", "快速征兵", "回城自动补兵"])
         header = self.team_table.horizontalHeader()
         header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
         header.setStretchLastSection(True)
         header.setMinimumSectionSize(44)
         self.team_table.verticalHeader().setDefaultSectionSize(46)
-        for i, w in enumerate((52, 100, 235, 105, 100, 62, 62)):
+        for i, w in enumerate((52, 100, 235, 105, 100, 62, 62, 88, 78, 108)):
             self.team_table.setColumnWidth(i, w)
         f, inner = card("队伍安排", "点“详情”配置目标组和补兵点顺序；不用的队伍可在运行总览里隐藏")
         inner.addWidget(self.team_table, 1)
@@ -936,7 +947,7 @@ class Window(QMainWindow):
             row.addWidget(label)
             row.addStretch()
             return holder
-        for role, text in (("merit", "刷武勋"), ("bandits", "讨贼"), ("pave", "铺路")):
+        for role, text in (("merit", "刷武勋"), ("bandits", "讨贼"), ("pave", "铺路"), ("line", "拉线")):
             button = QRadioButton(text)
             button.setProperty("role", role)
             button.clicked.connect(lambda checked=False, row=r, role=role: self.team_role_clicked(row, role))
@@ -979,6 +990,26 @@ class Window(QMainWindow):
             widget = self.team_table.cellWidget(r, c)
             if widget:
                 widget.setEnabled(editable)
+        refill = self.team_table.cellWidget(r, 8)
+        if isinstance(refill, QCheckBox):
+            refill.blockSignals(True)
+            refill.setChecked(bool(t.refill_enabled))
+            refill.setEnabled(editable and t.role == "line")
+            refill.blockSignals(False)
+        auto = self.team_table.cellWidget(r, 9)
+        if isinstance(auto, QComboBox):
+            auto.blockSignals(True)
+            if t.auto_refill_pending is not None:
+                auto.setCurrentIndex(1 if t.auto_refill_pending else 2)
+                auto.setToolTip("待写入：下次访问该队详情页时写回游戏")
+            elif t.auto_refill is None:
+                auto.setCurrentIndex(0)
+                auto.setToolTip("未知：还没读过该队详情页的“回城自动补兵”")
+            else:
+                auto.setCurrentIndex(1 if t.auto_refill else 2)
+                auto.setToolTip(f"游戏内当前{'已开' if t.auto_refill else '未开'}（读到真值，外部改动以游戏为准）")
+            auto.setEnabled(editable)
+            auto.blockSignals(False)
         name = t.display if available else f"{t.display}（未拥有）"
         cell = self.team_table.item(r, 1)
         if cell:
@@ -1074,6 +1105,16 @@ class Window(QMainWindow):
         self.refresh_live()
         self.update_hidden_hint()
 
+    def team_refill_toggled(self, r, checked):
+        self.profile.teams[r].refill_enabled = bool(checked)
+        self.saved_label.setText("快速征兵已修改 · 待保存")
+
+    def team_auto_refill_changed(self, r):
+        widget = self.team_table.cellWidget(r, 9)
+        value = widget.currentData() if isinstance(widget, QComboBox) else None
+        self.profile.teams[r].auto_refill_pending = value
+        self.saved_label.setText("回城自动补兵已标记待写入 · 下次访问该队详情页时写回游戏")
+
     def edit_team_detail(self, r):
         t = self.profile.teams[r]
         if not self.team_available(t):
@@ -1081,7 +1122,7 @@ class Window(QMainWindow):
         dialog = TeamDetailDialog(t, self.profile, self)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
-        t.target_group, t.backup_points = dialog.values()
+        t.target_group, t.backup_points, t.line_target, t.refill_fallback = dialog.values()
         self.sync_team_row(r)
         self.saved_label.setText("队伍细节已修改 · 待保存")
 
@@ -1529,6 +1570,18 @@ class Window(QMainWindow):
             detail.setToolTip("配置该队的目标组和补兵点顺序")
             detail.clicked.connect(lambda _, row=r: self.edit_team_detail(row))
             self.team_table.setCellWidget(r,7,detail)
+            refill = QCheckBox("补兵")
+            refill.setToolTip("拉线：出征页出现“一键补兵”且兵力低于出击下限时点它（主城/营帐都可能出现）")
+            refill.setChecked(bool(t.refill_enabled))
+            refill.toggled.connect(lambda checked, row=r: self.team_refill_toggled(row, checked))
+            self.team_table.setCellWidget(r,8,refill)
+            auto = QComboBox()
+            auto.addItem("未知", None)
+            auto.addItem("开", True)
+            auto.addItem("关", False)
+            auto.setToolTip("游戏内“回城自动补兵”：显示游戏真值；改动标为待写入，下次访问该队详情页才写回。")
+            auto.currentIndexChanged.connect(lambda _, row=r: self.team_auto_refill_changed(row))
+            self.team_table.setCellWidget(r,9,auto)
             self.sync_team_row(r)
             for c,val in enumerate((t.display,"待识别","—","—","—","尚未读取")):
                 item(self.live,r,c+1,val,False)
@@ -1802,6 +1855,12 @@ class Window(QMainWindow):
             t.role, t.saved_role = current.role, current.saved_role
             t.route = current.route if t.role == "pave" else ""
             t.target_group, t.backup_points = current.target_group, list(current.backup_points)
+            t.line_target, t.refill_fallback = current.line_target, current.refill_fallback
+            t.auto_refill = current.auto_refill
+            refill_widget = self.team_table.cellWidget(r, 8)
+            t.refill_enabled = bool(refill_widget.isChecked()) if isinstance(refill_widget, QCheckBox) else current.refill_enabled
+            auto_widget = self.team_table.cellWidget(r, 9)
+            t.auto_refill_pending = auto_widget.currentData() if isinstance(auto_widget, QComboBox) else None
         p.targets, p.backups = [], []
         for table_, points in ((self.target_table,p.targets),(self.backup_table,p.backups)):
             for r in range(table_.rowCount()):

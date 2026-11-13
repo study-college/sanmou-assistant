@@ -73,6 +73,14 @@ class PavePointUnavailable(GameError):
     """
 
 
+class LineRefillUnavailable(GameError):
+    """拉线：兵力低于出击下限且当前补不动（没有一键补兵按钮 / 点完区块归零）。
+
+    用户 2026-11-12：按钮不存在比读数字更稳，是“当前无法快速征兵”的硬判据，
+    必须走回城/停手兜底，绝不能当成“点了没反应”去重试。
+    """
+
+
 class DispatchUnconfirmed(GameError):
     """提交后没读到受理证据。
 
@@ -118,6 +126,8 @@ class Game:
     active_slots = None
     # 本次是否有实际刷武勋队；False 时粮食低也不拦讨贼/铺路。
     food_gate = True
+    # 本次运行是否进过城内/征兵所：游戏会在进出主城后自动关掉隐藏，回沙盘要重核。
+    city_visited = False
     # 只读库存刷新间隔。每次刷新要截图 + 页面识别 + 读数，和派兵抢同一个 OCR 线程；
     # 5 秒一次时等待期间几乎一直在识别，反而拖慢真正的游戏操作。
     RESOURCE_INTERVAL = 10
@@ -154,6 +164,8 @@ class Game:
         self.active_slots = None
         # 是否有实际刷武勋队；Worker 每轮写入，讨贼决定据此忽略粮食门槛。
         self.food_gate = True
+        # 本次运行是否进过城内/征兵所：游戏会在进出主城后自动关掉隐藏，回沙盘要重核。
+        self.city_visited = False
 
     def log(self, message, level="INFO"):
         self.emit("log", {"time": datetime.now().strftime("%H:%M:%S"), "level": level, "message": message})
@@ -308,6 +320,56 @@ class Game:
             raise RecognitionUnavailable("弹层关闭提示暂未识别，等待重读")
         self.d.tap(*point, .6)
 
+    def resolve_enemy_warning(self, image):
+        """强敌预警弹窗：勾选「该等级今日不再提示」→ 等倒计时走完 → 点「继续进攻」。
+
+        用户 2026-11-12 口径（R13/R14）：程序设定好的安排也继续进攻，并勾选今日不再提示。
+        倒计时未走完时按钮是灰的点不动，必须先等待，不能当成“点了没反应”重试。
+        """
+        info = self.v.enemy_warning(image)
+        if info is None:
+            raise RecognitionUnavailable("强敌预警弹窗暂未读清，等待重读")
+        box = info.get("checkbox")
+        if box:
+            state = self.v.checked(image, *box)
+            if state is False:
+                self.d.tap(*box, .3)
+                image = self.capture()
+                state = self.v.checked(image, *box)
+            if state:
+                self.log("强敌预警：已勾选“该等级今日不再提示”")
+            else:
+                self.log("强敌预警：未能确认“该等级今日不再提示”已勾选，仍继续进攻", "WARN")
+        else:
+            self.log("强敌预警：未定位“该等级今日不再提示”复选框，仍继续进攻", "WARN")
+        wait = info.get("countdown") or 0
+        if wait:
+            self.emit("status", f"强敌预警 · 等待继续进攻倒计时 {wait} 秒")
+            self.d.control.sleep(min(wait + .6, 8))
+        self.save_image(image, "enemy-warning-continue", True)
+        self.d.tap(*info["continue_point"], 1.0)
+
+    def clear_dispatch_prompt(self, image):
+        """出征提交后的模态弹窗：二次确认→继续出征；强敌预警→勾选并等倒计时继续进攻。
+
+        返回处理过的页型名；没有弹窗时返回 None。弹窗是全屏模态，不处理就会被当成
+        未知页暂停，表现为“一直等不到受理证据”。
+        """
+        page = self.v.page(image)
+        if page == "dispatch_confirm":
+            info = self.v.confirm_dialog(image)
+            if info is None:
+                return None
+            self.emit("status", "出征二次确认 · 选择继续出征")
+            self.log(f"出征二次确认（{info['kind']}）· 按无人值守口径选择继续出征")
+            self.save_image(image, "dispatch-confirm-continue", True)
+            self.d.tap(*info["continue_point"], .9)
+            return page
+        if page == "enemy_warning":
+            self.resolve_enemy_warning(image)
+            return page
+        return None
+
     def clear_map_selection(self, image=None, expected_page="sandbox"):
         image = self.ensure_sandbox(refresh_grain=False) if image is None else image
         if self.v.page(image) != expected_page or expected_page not in ("sandbox", "city"):
@@ -377,6 +439,9 @@ class Game:
         for attempt in range(5):
             image = self.capture()
             page = self.v.page(image)
+            if page in ("city", "reserve", "camp_recruit", "camp_recruit_list"):
+                # 进入城内/征兵所会让游戏自动取消隐藏；回到沙盘后由 Worker 重核小眼睛。
+                self.city_visited = True
             if page == "sandbox":
                 if refresh_grain and (self.grain is None or self.resources_due()):
                     self.update_grain(image)
@@ -418,6 +483,14 @@ class Game:
                     raise RecognitionUnavailable("协助讨贼确认框暂未读清，等待重读")
                 self.emit("status", "取消奖励次数耗尽后的协助确认 · 不自动协助")
                 self.d.tap(buttons[0].x, buttons[0].y, .7)
+            elif page == "dispatch_confirm":
+                info = self.v.confirm_dialog(image)
+                if info is None:
+                    raise RecognitionUnavailable("出征确认弹窗暂未读清，等待重读")
+                self.emit("status", "出征二次确认 · 选择继续出征")
+                self.d.tap(*info["continue_point"], .9)
+            elif page == "enemy_warning":
+                self.resolve_enemy_warning(image)
             elif page == "monthly_claimed":
                 # 关闭已核对的月卡结果面板，不再领取，也不进入购买入口。
                 self.close_panel(image)
@@ -752,6 +825,7 @@ class Game:
                     obs = self.v.full_team(image, policy.key)
                     self._team_detail_cache[policy.key] = (obs, time.time())
                     self.save_image(image, f"{policy.key}-detail", True)
+                    self.sync_auto_refill(image, policy)
                 except GameError as exc:
                     if policy.key == current.key:
                         raise
@@ -842,6 +916,7 @@ class Game:
                     obs = self.v.full_team(full, policy.key)
                     detail_observed_at = time.time()
                     self.save_image(full, f"{policy.key}-home", True)
+                    self.sync_auto_refill(full, policy)
                     self.close_panel(full)
             obs.state = "wounded" if obs.wounded else "home"
             obs.location = coord
@@ -1350,6 +1425,18 @@ class Game:
             if checked is False:
                 self.save_image(image, "transfer-checkbox-disabled", True)
                 raise GameError("调动页自动征兵显示关闭，保留游戏设置，本队暂不调动")
+        if kind == "line" and policy.refill_enabled and obs.maximum:
+            # 兵力低于出击下限才补（不无条件补满，省辐重）；按钮不存在＝当前补不动。
+            current = self.v.deployment_strength(image, policy.slot)
+            floor = policy.threshold(obs.maximum)
+            if current is not None and current < floor:
+                if self.v.refill_button(image) is None:
+                    self.save_image(image, "line-refill-missing", True)
+                    raise LineRefillUnavailable("出征页没有一键补兵按钮，当前补不动")
+                image, _ = self.line_refill(image, policy)
+                if self.v.refill_quota(image) == 0:
+                    self.save_image(image, "line-refill-insufficient", True)
+                    raise LineRefillUnavailable("一键补兵后区块归零，仍低于出击下限，判定补不动")
         route = self.v.joined(image, (750, 108, 1250, 174))
         if "阻挡" in route or "无法" in route:
             raise ActionUnavailable(f"{point.name} 的当前路线不可用：{route}", action_key)
@@ -1368,6 +1455,9 @@ class Game:
                     self.d.tap(card_x, self.CARD_Y, .35)
                 self.d.tap(submit_x, submit_y, 1.6)
                 after = self.capture_clear("dispatch-result" if attempts == 1 else f"dispatch-result-{attempts}", True)
+                prompt = self.clear_dispatch_prompt(after)
+                if prompt:
+                    after = self.capture_clear(f"dispatch-{prompt}-answer", True)
                 marker_after = self.read_team_marker(after, policy.slot)
                 changed = bool(marker_after and obs.marker_state and marker_after["state"] != "unknown"
                                and marker_after["state"] != obs.marker_state)
@@ -1424,7 +1514,9 @@ class Game:
                                           busy=not still_free, marker=marker_state,
                                           confidence=(marker_now or {}).get("confidence"),
                                           page=last_page, status=last_status)
-            self.j.set_phase(policy.key, "backup" if kind == "transfer" else "guarding" if chosen_action == "驻守" else "merit")
+            phase = ("backup" if kind == "transfer" else "line" if kind == "line"
+                     else "guarding" if chosen_action == "驻守" else "merit")
+            self.j.set_phase(policy.key, phase)
             self.log(f"{policy.display} 已提交并确认：{chosen_action} {point.name} ({point.x},{point.y})")
             self.emit("dispatch", {"team":policy.key,"kind":kind,"target":point.name,"state":result_state,"action":chosen_action})
         except DispatchUnconfirmed:
@@ -1502,6 +1594,70 @@ class Game:
         self.d.tap(confirm.x, confirm.y, 1.2)
         self.log(f"{policy.display} 铺路：已确认补给提醒，继续核对出发", "INFO")
         return True
+
+    def read_auto_refill(self, image, policy):
+        """读部队详情页「回城自动补兵」的真实状态：True / False / None（未读到）。
+
+        用 _vcall 容忍测试/旧工具构造的 vision 没有该方法：读不到就是未知，不写不猜。
+        """
+        box = _vcall(self.v, "refill_checkbox", None, image)
+        return _vcall(self.v, "checked", None, image, *box) if box else None
+
+    def sync_auto_refill(self, image, policy):
+        """按队同步游戏内「回城自动补兵」（用户 2026-11-12 定的同步模型）。
+
+        游戏→界面：读到状态就写回 policy.auto_refill。
+        界面→游戏：界面改动只标“待写入”；下一次访问该队详情页时读当前值，与待写入比，
+        不同才点，复读确认后清标记；相同不点，直接清标记。外部改动以游戏为准。
+        """
+        state = self.read_auto_refill(image, policy)
+        if state is None:
+            return None
+        policy.auto_refill = state
+        want = policy.auto_refill_pending
+        if want is None:
+            return state
+        if want == state:
+            policy.auto_refill_pending = None
+            self.log(f"{policy.display} 回城自动补兵与界面待写入一致，不点击")
+            return state
+        box = _vcall(self.v, "refill_checkbox", None, image)
+        if box is None:
+            return state
+        self.emit("status", f"{policy.display} · 写入回城自动补兵：{'开' if want else '关'}")
+        self.save_image(image, "auto-refill-before", True)
+        self.d.tap(*box, .4)
+        after = self.capture("auto-refill-after", True)
+        confirmed = self.read_auto_refill(after, policy)
+        if confirmed == want:
+            policy.auto_refill = confirmed
+            policy.auto_refill_pending = None
+            self.log(f"{policy.display} 回城自动补兵已按界面设置写入并复核：{'开' if want else '关'}")
+        else:
+            if confirmed is not None:
+                policy.auto_refill = confirmed
+            self.log(f"{policy.display} 回城自动补兵写入未确认（读到 {confirmed}），保留待写入下次再试", "WARN")
+        return policy.auto_refill
+
+    def line_refill(self, image, policy):
+        """拉线出征页：点「一键补兵」并读回执，返回 (补兵后帧, 补前区块值)。
+
+        按钮是否存在由调用方先行判断；这里只负责点击与回执（补前/补后兵力与区块值）。
+        """
+        quota = self.v.refill_quota(image)
+        before = self.v.deployment_strength(image, policy.slot)
+        button = self.v.refill_button(image)
+        self.emit("status", f"{policy.display} · 快速征兵（一键补兵）")
+        self.save_image(image, "line-refill-before", True)
+        self.d.tap(button[0], button[1], 1.2)
+        after = self.capture("line-refill-after", True)
+        strength = self.v.deployment_strength(after, policy.slot)
+        quota_after = self.v.refill_quota(after)
+        self.publish("refill", {"team": policy.key, "before": before, "after": strength,
+                                "quota": quota, "quota_after": quota_after})
+        self.log(f"{policy.display} 快速征兵：补前 {before} → 补后 {strength}"
+                 f"（区块 {quota} → {quota_after}）")
+        return after, quota
 
     def pave_dispatch(self, policy: TeamPolicy, obs: Observation, target: tuple[int, int], ident: str):
         """按铺路路线派兵。订单由调用方先原子落库，本方法只负责核对与提交。

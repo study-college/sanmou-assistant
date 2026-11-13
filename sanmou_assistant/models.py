@@ -4,6 +4,7 @@ import copy
 import json
 import math
 import os
+import re
 import sys
 import tempfile
 import time
@@ -59,8 +60,9 @@ class Point:
 
 
 # 每支队伍只有一个任务角色；隐藏=不参与任何任务，也不被读取。
-TEAM_ROLES = ("merit", "bandits", "pave", "idle", "hidden")
-TEAM_ROLE_LABELS = {"merit": "刷武勋", "bandits": "讨贼", "pave": "铺路", "idle": "空闲", "hidden": "隐藏（不参与）"}
+# line=拉线：独立于刷武勋的新模块（用户 2026-11-12）。
+TEAM_ROLES = ("merit", "bandits", "pave", "line", "idle", "hidden")
+TEAM_ROLE_LABELS = {"merit": "刷武勋", "bandits": "讨贼", "pave": "铺路", "line": "拉线", "idle": "空闲", "hidden": "隐藏（不参与）"}
 
 
 @dataclass
@@ -82,6 +84,16 @@ class TeamPolicy:
     # role == "pave" 时使用的路线名称。
     route: str = ""
     identity: str = ""
+    # role == "line" 时使用的单点目标坐标，格式 "x,y"。
+    line_target: str = ""
+    # 拉线补兵：出征页出现「一键补兵」且兵力低于出击下限时点它（主城/营帐都可能出现）。
+    refill_enabled: bool = True
+    # 补不动（按钮不存在）时的兜底：recall=回城免费补兵；stop=停手留待下一轮。
+    refill_fallback: str = "recall"
+    # 游戏内「回城自动补兵」：读到的最新真值；None=未知（还没读过该队详情页）。
+    auto_refill: Optional[bool] = None
+    # 界面改动的「待写入」值：下一次访问该队详情页时才写回游戏；None=无待写入。
+    auto_refill_pending: Optional[bool] = None
 
     @property
     def key(self) -> str:
@@ -94,7 +106,7 @@ class TeamPolicy:
     @property
     def participating(self) -> bool:
         """是否会参与派兵或铺路；隐藏和空闲都不参与。"""
-        return self.role in ("merit", "bandits", "pave")
+        return self.role in ("merit", "bandits", "pave", "line")
 
     def threshold(self, maximum: int) -> int:
         return math.ceil(maximum * self.minimum / 100) if self.min_mode == "percent" else self.minimum
@@ -186,14 +198,27 @@ class Profile:
                 errors.append("队伍分组或槽位无效")
             if t.role not in TEAM_ROLES:
                 errors.append(f"{t.display} 的任务无效")
-            if t.saved_role and t.saved_role not in ("merit", "bandits", "pave", "idle"):
+            if t.saved_role and t.saved_role not in ("merit", "bandits", "pave", "line", "idle"):
                 errors.append(f"{t.display} 的隐藏前任务无效")
+            if type(t.refill_enabled) is not bool:
+                errors.append(f"{t.display} 的快速征兵必须是开关")
+            if t.refill_fallback not in ("recall", "stop"):
+                errors.append(f"{t.display} 的补兵兜底只能是回城或停手")
+            for name, label in (("auto_refill", "回城自动补兵"), ("auto_refill_pending", "回城自动补兵待写入")):
+                value = getattr(t, name)
+                if value is not None and type(value) is not bool:
+                    errors.append(f"{t.display} 的{label}必须是开关或未知")
             if t.min_mode not in ("percent", "absolute") or not 1 <= t.minimum <= (100 if t.min_mode == "percent" else 1000000):
                 errors.append(f"{t.display} 的兵力下限无效")
             if not 0 <= t.stamina <= 200 or not 0 <= t.supply <= 100:
                 errors.append(f"{t.display} 的体力或补给无效")
             if active and t.role in ("merit", "bandits") and t.group == "guard":
                 errors.append(f"{t.display} 的亲卫自动出征尚未实机验收，请先设为空闲")
+            if t.role == "line":
+                if t.group != "main":
+                    errors.append(f"{t.display} 的拉线只能由主城队伍执行")
+                if line_target(t) is None:
+                    errors.append(f"{t.display} 已设为拉线，但目标坐标无效（请填 x,y）")
             if t.role == "pave":
                 if t.group != "main":
                     errors.append(f"{t.display} 的铺路只能由主城队伍执行")
@@ -323,6 +348,15 @@ class Profile:
                 for name in ("slot", "minimum", "stamina", "supply"):
                     if name in team and type(team[name]) is not int:
                         raise ValueError(f"队伍 {name} 必须是整数")
+                if "refill_enabled" in team and type(team["refill_enabled"]) is not bool:
+                    raise ValueError("拉线快速征兵必须是开关")
+                if "refill_fallback" in team and team["refill_fallback"] not in ("recall", "stop"):
+                    raise ValueError("补兵兜底只能是回城或停手")
+                if "line_target" in team and not isinstance(team["line_target"], str):
+                    raise ValueError("拉线目标必须是文字")
+                for name in ("auto_refill", "auto_refill_pending"):
+                    if name in team and team[name] is not None and type(team[name]) is not bool:
+                        raise ValueError("回城自动补兵必须是开关或未知")
                 if "role" in team and not isinstance(team["role"], str):
                     raise ValueError("队伍任务必须是文字")
                 if "backup_points" in team and not isinstance(team["backup_points"], list):
@@ -396,6 +430,8 @@ def decide(profile: Profile, policy: TeamPolicy, obs: Observation, grain: Option
         return bandit_decision(profile,policy,obs,grain,now,food_gate=food_gate)
     if policy.role == "pave":
         return Decision(reason="铺路任务，由铺路路线推进")
+    if policy.role == "line":
+        return Decision(reason="拉线任务，由拉线循环推进")
     if policy.role != "merit":
         return Decision(reason="空闲，未安排任务")
     # 角标是当前状态的第一证据：停留/空闲/调动停留才派出；忙碌、未识别、在路上/驻守/战斗一律等现场。
@@ -467,4 +503,58 @@ def bandit_decision(profile: Profile, policy: TeamPolicy, obs: Observation, grai
     if food_gate and profile.food_enabled and grain is not None and grain < profile.food_low:
         return Decision(reason="讨贼：等待补粮")
     return Decision("bandits","讨贼：队伍在主城，等可加入集结")
+
+
+def parse_target(text: str) -> Optional[tuple[int, int]]:
+    """把 "x,y"（允许中文逗号/全角括号/尾随备注）解析成坐标；无效返回 None。"""
+    cleaned = (text or "").strip().replace("，", ",").replace("（", "(").replace("）", ")").replace(" ", "")
+    match = re.match(r"^(\d{1,4})[,:：](\d{1,4})", cleaned)
+    return (int(match[1]), int(match[2])) if match else None
+
+
+def line_target(policy: TeamPolicy) -> Optional[tuple[int, int]]:
+    """拉线目标的单一坐标；用户口径：拉线只做一个点，不做多目标轮换。"""
+    return parse_target(policy.line_target)
+
+
+LINE_FALLBACKS = ("recall", "stop")
+
+
+def line_decision(policy: TeamPolicy, obs: Observation, *, refill_button: bool = False,
+                  target_owned: bool = False, stopped: bool = False) -> Decision:
+    """拉线模块的单队决策（纯函数，便于用真帧或构造观测做单测）。
+
+    用户 2026-11-12 口径：
+    - 打赢停留→就地再拉；打输撤回出发点→继续拉；
+    - 兵力低于出击下限：出征页有「一键补兵」就点（主城/营帐都可能出现）；
+      按钮不存在＝当前补不动 → 兜底（回城免费补兵 / 停手）；
+    - 营帐自然征兵到出击线→继续拉；只在手动停时结束。
+    """
+    if stopped:
+        return Decision(reason="拉线：用户已手动停止，本轮不派兵")
+    target = line_target(policy)
+    if target is None:
+        return Decision(reason="拉线：目标坐标无效，等待重新设置")
+    if obs.wounded:
+        return Decision(reason="拉线：等待重伤结束")
+    marker = getattr(obs, "marker_state", None)
+    if marker == "unknown":
+        return Decision(reason="拉线：角标状态未识别，等下一次读取")
+    if marker is not None and not can_dispatch(marker):
+        return Decision(reason=f"拉线：角标显示{marker_label(marker)}，等待现场")
+    low = (obs.strength is not None and obs.maximum is not None
+           and obs.strength < policy.threshold(obs.maximum))
+    if low:
+        if not policy.refill_enabled:
+            return Decision(reason="拉线：兵力低于出击下限，快速征兵未启用，等待自然征兵")
+        if refill_button:
+            return Decision("refill", "拉线：兵力低于出击下限，点一键补兵")
+        if policy.refill_fallback == "stop":
+            return Decision(reason="拉线：补不动且设为停手，记录并等下一轮")
+        if obs.state == "home":
+            return Decision(reason="拉线：主城补不动，等待兵池恢复")
+        return Decision("recall", "拉线：一键补兵按钮不存在，回城免费补兵")
+    if target_owned:
+        return Decision("line", "拉线：目标已是自有地块，仅行军无战果")
+    return Decision("line", f"拉线：向 ({target[0]},{target[1]}) 派出")
 

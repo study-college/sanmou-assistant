@@ -10,12 +10,13 @@ from pathlib import Path
 
 from PySide6.QtCore import QThread, Signal
 
-from .game import (DispatchUnconfirmed, Game, GameError, NavigationRecovered, NetworkRecovered,
-                   ObservationExpired, PavePointUnavailable, PaveUnknown, RecognitionUnavailable,
-                   TeamAbsent)
+from .game import (DispatchUnconfirmed, Game, GameError, LineRefillUnavailable, NavigationRecovered,
+                   NetworkRecovered, ObservationExpired, PavePointUnavailable, PaveUnknown,
+                   RecognitionUnavailable, TeamAbsent)
 from .evidence import EvidenceStore
 from .journal import Journal
-from .models import Decision, Observation, Profile, decide, observation_expired
+from .models import (Decision, Observation, Point, Profile, decide, line_decision, line_target,
+                     observation_expired)
 from .team_states import LEGACY_STATE, can_dispatch
 from .transport import Control, Device, Stopped, TransportUnavailable, discover_cli, instances
 from .vision import Vision
@@ -462,6 +463,14 @@ class Worker(QThread):
                         game.ensure_hide_on()
                     except GameError as exc:
                         game.log(f"打开游戏隐藏显示未完成：{exc}；本轮继续", "WARN")
+                # F2：游戏进出主城会自己关掉隐藏；回到沙盘后立刻重核一次（用户确认“够用”）。
+                if (hide_checked and game.city_visited and self.command == "run" and not self.dry_run
+                        and self.profile.hide_before_run):
+                    game.city_visited = False
+                    try:
+                        game.ensure_hide_on()
+                    except GameError as exc:
+                        game.log(f"回沙盘后重核游戏隐藏显示未完成：{exc}；本轮继续", "WARN")
                 if self.duration and time.monotonic()-started >= self.duration:
                     self.publish("status", "本次验收时限已到，停止新动作")
                     return
@@ -513,6 +522,8 @@ class Worker(QThread):
                     if self.command == "run" and not self.dry_run:
                         # 铺路路线独立推进：到达当前段才派下一段，不占武勋批次。
                         self.process_pave(game, food_recovery)
+                        # 拉线独立推进：单坐标反复拉，独立于刷武勋与铺路。
+                        self.process_line(game, food_recovery)
                     if self.command == "run" and self.bandits_due():
                         # 验收达到出征上限以后仍可只读列表，绝不再提交新出征。
                         self.check_bandits(game,allow_execute=not food_recovery and not limited)
@@ -1235,6 +1246,114 @@ class Worker(QThread):
             self.retry_at[policy.key] = time.time() + self.profile.retry_seconds
             self.publish("decision", {"team": policy.key, "action": "pave",
                                       "reason": f"铺路路线 {route.name} 第 {idx+1} 段 → ({target[0]},{target[1]})"})
+
+    def line_team_keys(self):
+        return {t.key for t in self.profile.teams
+                if t.role == "line" and t.group == "main" and self.team_present(t.key)}
+
+    def process_line(self, game, food_recovery=False):
+        """拉线模块：单坐标反复拉；打赢就地再拉，打输撤回后继续，仅在手动停时结束。
+
+        独立于刷武勋与铺路；每队失败隔离，单队失败不中断其他队。
+        """
+        if self.command != "run" or self.dry_run:
+            return
+        lines = [t for t in self.profile.teams if t.role == "line"]
+        for policy in lines:
+            self.control.checkpoint()
+            if policy.group != "main" or not self.team_present(policy.key):
+                continue
+            target = line_target(policy)
+            if target is None:
+                self.log_once(f"line-target:{policy.key}",
+                              f"{policy.display} 拉线目标坐标无效，跳过本队", every=1800)
+                continue
+            if self.journal.pending(policy.key) or time.time() < self.retry_at.get(f"line:{policy.key}", 0):
+                continue
+            if food_recovery:
+                self.publish("decision", {"team": policy.key, "action": "wait",
+                                          "reason": "拉线：粮食恢复中，暂停新出征"})
+                continue
+            if not game.account_checked:
+                try:
+                    if not game.verify_account():
+                        continue
+                except GameError as exc:
+                    game.log(f"拉线前账号核对失败：{exc}", "WARN")
+                    continue
+            obs = self.observe_team(game, policy)
+            if obs is None:
+                continue
+            decision = line_decision(policy, obs, refill_button=True, stopped=self.control.stop.is_set())
+            self.publish("decision", {"team": policy.key, "action": decision.action, "reason": decision.reason})
+            if decision.action == "recall":
+                self._line_fallback(game, policy, obs)
+                continue
+            if decision.action not in ("line", "refill"):
+                continue
+            point = Point(name=f"拉线({target[0]},{target[1]})", x=target[0], y=target[1],
+                          group=policy.target_group or "默认", actions=["occupy", "march"],
+                          enabled=True, expected_name="")
+            ident = None
+            try:
+                image = game.go_to(point)
+                # 用户 2026-11-12 选项 a：目标已被我方占领→只剩行军仍继续，但必须记 WARN。
+                if game.v.find(image, ["攻占"], (1050, 120, 1750, 950), exact=True) is None:
+                    game.log(f"{policy.display} 拉线：目标 ({target[0]},{target[1]}) 已是自有地块，"
+                             "仅行军、无战果（按用户选择继续行军）", "WARN")
+                    self.publish("line_owned", {"team": policy.key, "target": [target[0], target[1]]})
+                ident = self.journal.prepare(policy.key, "line", f"拉线 ({target[0]},{target[1]})")
+            except GameError as exc:
+                game.log(f"{policy.display} 拉线：{exc}", "WARN")
+                self.retry_at[f"line:{policy.key}"] = time.time() + self.profile.retry_seconds
+                try:
+                    game.ensure_sandbox()
+                except GameError:
+                    pass
+                continue
+            try:
+                game.dispatch(policy, obs, point, "line", reuse_target=True)
+            except LineRefillUnavailable as exc:
+                self.journal.finish(ident, "rejected", f"未提交：{exc}")
+                game.log(f"{policy.display} 拉线：{exc}；按兜底处理", "WARN")
+                self.retry_at[f"line:{policy.key}"] = time.time() + self.profile.retry_seconds
+                try:
+                    game.ensure_sandbox()
+                except GameError:
+                    pass
+                self._line_fallback(game, policy, obs)
+            except DispatchUnconfirmed as exc:
+                self.journal.finish(ident, "uncertain", str(exc))
+                self.retry_at[f"line:{policy.key}"] = time.time() + self.unconfirmed_delay(policy.key)
+                game.log(f"{policy.display} / 拉线：{exc}", "INFO")
+                game.ensure_sandbox()
+            except NetworkRecovered:
+                self.journal.finish(ident, "uncertain", "网络重连，提交结果未知")
+                raise
+            except GameError as exc:
+                self.journal.finish(ident, "rejected", f"未提交：{exc}")
+                game.log(f"{policy.display} / 拉线：{exc}", "WARN")
+                self.retry_at[f"line:{policy.key}"] = time.time() + self.profile.retry_seconds
+                game.ensure_sandbox()
+            else:
+                self.retry_at.pop(f"line:{policy.key}", None)
+                self.publish("decision", {"team": policy.key, "action": "line",
+                                          "reason": f"拉线已提交 ({target[0]},{target[1]})"})
+
+    def _line_fallback(self, game, policy, obs):
+        """补不动时的兜底：回城（免费、慢）或停手（记录、下一轮重读）。"""
+        if policy.refill_fallback == "stop":
+            self.publish("decision", {"team": policy.key, "action": "wait",
+                                      "reason": "拉线：补不动且设为停手，记录并等下一轮重读"})
+            return
+        if obs.location is None or obs.wounded is not False:
+            self.log_once(f"line-recall:{policy.key}",
+                          f"{policy.display} 拉线：补不动需回城，但坐标未读到，等现场重读", every=600)
+            return
+        try:
+            game.recall(policy, obs, minimum=policy.threshold(obs.maximum) if obs.maximum else None)
+        except GameError as exc:
+            game.log(f"{policy.display} 拉线回城未完成：{exc}", "WARN")
 
     def unconfirmed_delay(self, key):
         """出征未确认后的冷却：只做短退避，绝不锁队。

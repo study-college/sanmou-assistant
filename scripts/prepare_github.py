@@ -44,7 +44,7 @@ def export(output: Path) -> dict:
         private = path.parent.name == "research-tests" or "artifacts" in path.read_text("utf-8") or "data/sessions" in path.read_text("utf-8")
         copy(path, Path("research-tests" if private else "tests") / path.name)
     from sanmou_assistant import __version__
-    for name in dict.fromkeys(("09-user-guide.md", "AGENT-GUIDE.md", "ROADMAP.md", "RELEASE-0.8.1.md", "RELEASE-0.8.2.md", "RELEASE-0.8.3.md", "RELEASE-0.9.0.md", "RELEASE-0.9.2.md", "RELEASE-0.9.3.md", "RELEASE-0.9.4.md", f"RELEASE-{__version__}.md", "guide.css")):
+    for name in dict.fromkeys(("09-user-guide.md", "AGENT-GUIDE.md", "ROADMAP.md", "RELEASE-0.8.1.md", "RELEASE-0.8.2.md", "RELEASE-0.8.3.md", "RELEASE-0.9.0.md", "RELEASE-0.9.2.md", "RELEASE-0.9.3.md", "RELEASE-0.9.4.md", "RELEASE-0.9.5.md", f"RELEASE-{__version__}.md", "guide.css")):
         copy(ROOT / "docs" / name)
     for path in sorted((ROOT / "docs/guide-assets").glob("*.png")):
         copy(path)
