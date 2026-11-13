@@ -149,6 +149,8 @@ class Game:
         self.d, self.v, self.p, self.j = device, vision, profile, journal
         self.folder, self.emit = folder, emit
         self.folder.mkdir(parents=True, exist_ok=True)
+        # 每个槽位上一次确认的角标状态与时刻：用于“无角标”防抖（见 read_team_marker）。
+        self.marker_last = {}
         self.last_image = None
         self.last_image_at = None
         self._grain = None
@@ -555,8 +557,10 @@ class Game:
             elif page == "camp_recruit":
                 self.close_panel(image)
             elif page == "worldmap":
-                self.d.zoom_out(steps=22, delta=120)
-                self.d.control.sleep(.5)
+                # 用户 2026-11-13：缩放改用左下角放大按钮；双指手势位置不稳、易被遮挡。
+                if not self.zoom_in_to_sandbox():
+                    self.d.zoom_out(steps=22, delta=120)
+                    self.d.control.sleep(.5)
             elif page in ("war", "rally", "reserve", "territory"):
                 self.close_panel(image)
             elif page in ("affairs", "drill", "campaign", "activity", "welfare", "visit", "visit_result", "alliance"):
@@ -584,12 +588,77 @@ class Game:
                     continue
                 # 城内出城等切换可能跨过一次重读；有上限地等待，不在未知页点击。
                 if attempt < 4:
+                    if attempt >= 2:
+                        # 2026-11-13 实机：地图放大到水寨近景时，地图标签压住顶部状态栏，
+                        # 页型会一直 unknown。只点“识别到的”左下角缩小按钮退回沙盘再重读；
+                        # 按钮认不出就不点，避免在弹层上盲点。
+                        zoom = getattr(self.v, "map_zoom_point", None)
+                        point = zoom(image, zoom_in=False) if zoom else None
+                        if point is not None:
+                            self.save_image(image, "unknown-map-labelled", True)
+                            self.d.long_press(point[0], point[1], 1.8)
+                            continue
                     self.emit("status", "等待游戏画面加载 · 暂不点击")
                     self.d.control.sleep(1.1)
                     continue
                 self.save_image(image,"unknown-page", True)
                 raise RecognitionUnavailable("当前页面暂未识别，等待画面恢复后自动重读")
         raise RecognitionUnavailable("本轮未能返回沙盘，稍后重新识别页面")
+
+    def map_zoom(self, zoom_in: bool, seconds: float = 1.8) -> bool:
+        """长按地图左下角常驻的放大/缩小按钮；认不出按钮就不按。
+
+        用户 2026-11-13：双指缩放在实机不稳；连点也可能不生效，长按 1~2 秒就能一路
+        缩到最小（地图沙盘）或放到最大，位置固定，只按识别到的按钮。
+        """
+        zoom = getattr(self.v, "map_zoom_point", None)
+        if zoom is None:
+            return False
+        image = self.capture()
+        point = zoom(image, zoom_in=zoom_in)
+        if point is None:
+            return False
+        self.d.long_press(point[0], point[1], seconds)
+        return True
+
+    def zoom_out_to_map(self, attempts: int = 3):
+        """长按缩小按钮退到“地图沙盘”（坐标输入页），返回该页画面。
+
+        每次长按后都重新读页型，到了就停；不到就再长按一次，最多 3 次。
+        """
+        zoom = getattr(self.v, "map_zoom_point", None)
+        for _ in range(attempts):
+            image = self.capture()
+            if self.v.page(image, verify=False) == "worldmap":
+                return image
+            if zoom is None:
+                break
+            point = zoom(image, zoom_in=False)
+            if point is None:
+                raise RecognitionUnavailable("地图缩小按钮暂未识别，等待重读")
+            self.d.long_press(point[0], point[1], 1.8)
+            self.d.control.sleep(.8)
+        image = self.capture()
+        if self.v.page(image) == "worldmap":
+            return image
+        self.save_image(image, "coordinate-map-not-open", True)
+        raise GameError("未打开坐标地图（长按缩小仍未到地图沙盘），停止定位")
+
+    def zoom_in_to_sandbox(self, attempts: int = 3) -> bool:
+        """从“地图沙盘”长按放大按钮回到沙盘；认不出按钮或没到就返回 False。"""
+        zoom = getattr(self.v, "map_zoom_point", None)
+        if zoom is None:
+            return False
+        for _ in range(attempts):
+            image = self.capture()
+            if self.v.page(image, verify=False) == "sandbox":
+                return True
+            point = zoom(image, zoom_in=True)
+            if point is None:
+                return False
+            self.d.long_press(point[0], point[1], 1.8)
+            self.d.control.sleep(.8)
+        return self.v.page(self.capture(), verify=False) == "sandbox"
 
     def note_team_roster(self, image):
         """从部队页/部队总览左侧行确认本次运行实际拥有的主队。
@@ -1044,6 +1113,8 @@ class Game:
         if self.active_slots is not None and slot not in self.active_slots:
             return None
         try:
+            if not hasattr(self, "marker_last"):
+                self.marker_last = {}
             for attempt in range(2):
                 if _vcall(self.v, "frame_clear", True, image) and reader.avatars_visible(image):
                     # 记录真正用于读角标的这一帧：重伤必须和角标同帧判断，
@@ -1052,6 +1123,22 @@ class Game:
                     marker = reader.read_slot(image, slot)
                     if marker and marker["state"] in ("idle", "unknown") and _vcall(self.v, "team_wounded", False, image, slot):
                         marker = {**marker, "state": "wounded", "label": state_label("wounded"), "reason": "头像重伤文字"}
+                    # 防抖（2026-11-13 实机）：空闲=无角标，但“到点/开战”的一瞬角标也会消失。
+                    # 上一状态还是行军/调动/撤退/战斗/忙碌，这一帧却“无角标”时，再截一帧确认；
+                    # 只有连续两帧都无角标才认空闲，不能拿一帧的瞬时缺失当成回主城。
+                    # 不设时间窗：上次读到的状态就是最近一次现场，确认过一次空闲后
+                    # marker_last 会变成 idle，后续不会再补读。
+                    previous = self.marker_last.get(slot)
+                    if (marker and marker["state"] == "idle" and previous
+                            and previous[0] not in ("idle", "training")):
+                        self.d.control.sleep(.6)
+                        again = self.capture()
+                        if _vcall(self.v, "frame_clear", True, again) and reader.avatars_visible(again):
+                            second = reader.read_slot(again, slot)
+                            if second and second["state"] != "idle":
+                                self.marker_frame = again
+                                marker = second
+                    self.marker_last[slot] = (marker["state"], time.time())
                     return marker
                 if attempt == 0:
                     # 云雾过渡/切页瞬间：等半秒重截一帧，而不是拿洗白的画面下结论。
@@ -1086,6 +1173,9 @@ class Game:
                     marker = {**marker, "state": "wounded", "label": state_label("wounded"), "reason": "头像重伤文字"}
                 states[slot] = marker
             return states
+        except Stopped:
+            # 停止/暂停检查穿过整帧读取时要原样抛出，不能被当成“识别失败”吞掉再继续。
+            raise
         except GameError:
             raise
         except Exception as exc:
@@ -1230,17 +1320,9 @@ class Game:
             # 上一个目标的详情会挡住缩放。地图往返拖动取消选中；左上“空地”会随活动入口变化。
             if image is not None and self.v.page(image) == "sandbox" and self.v.map_coordinates(image) is not None:
                 self.clear_map_selection(image)
-            # 详情关闭后的比例不固定，单次缩放未必到地图层。只在已确认沙盘上
-            # 有限补一次缩放；未知页仅等待，不把“未打开”当作允许盲点。
-            for zoom in range(2):
-                self.d.zoom_out()
-                self.d.control.sleep(.5)
-                image = self.wait_transition(self.capture(), ("worldmap", "sandbox"), ("unknown",))
-                if self.v.page(image) == "worldmap":
-                    break
-            else:
-                self.save_image(image, "coordinate-map-not-open", True)
-                raise GameError("未打开坐标地图（已有限重读和缩放），停止定位")
+            # 详情关闭后的比例不固定；用户 2026-11-13 要求改用左下角缩小按钮一路退到
+            # “地图沙盘”（坐标输入页），不再用双指缩放。到不了就停，不盲点。
+            image = self.zoom_out_to_map()
             self.d.tap(1483, 998)
             self.d.text(f"{point.x}.{point.y}")
             self.d.finish_coordinate_input()
@@ -1864,14 +1946,18 @@ class Game:
                                "state": "marching", "action": "攻占"})
         return reason
 
-    def recall(self, policy: TeamPolicy, obs: Observation, manual=False, minimum=None):
-        # 用户 2026-11-04：自然征兵只要兵力达到本队出击下限就回城，不要求征到满兵；
+    def recall(self, policy: TeamPolicy, obs: Observation, manual=False, minimum=None, line=False):
+        # 用户 2026-11-04：刷武勋/自然征兵只要兵力达到本队出击下限就回城，不要求征到满兵；
         # 未指定 minimum 时仍按满兵（保持手动/旧调用语义）。
+        # 用户 2026-11-13：拉线不套用这条“到线才回城”。拉线只要拉不出去（营帐里补不动、
+        # 额度耗尽）就立刻回主城免费补兵，补完再调动回营帐继续拉；营帐里队伍是
+        # “忙碌（建筑内征兵）”也允许回城。line=True 只放宽这两条，重伤/坐标缺失仍不回城。
         need = obs.maximum if minimum is None else minimum
+        states = ("outside", "recruiting", "guarding", "active") if (manual or line) else ("outside", "recruiting")
         if (obs.strength is None or obs.maximum is None or obs.maximum <= 0
-                or (not manual and need is not None and obs.strength < need)
+                or (not manual and not line and need is not None and obs.strength < need)
                 or obs.wounded is not False
-                or obs.state not in (("outside", "recruiting", "guarding") if manual else ("outside", "recruiting"))):
+                or obs.state not in states):
             raise GameError("备用征兵尚未达到回城兵力或状态不明，不回城")
         if not self.account_checked and not self.verify_account():
             raise GameError("回城前账号未核对，不提交")
@@ -1938,7 +2024,7 @@ class Game:
                 raise GameError("回城结果待核对，保留记录防止重复撤军")
             self.j.set_phase(policy.key,"returning")
             self.emit("team_action",{"team":policy.key,"state":result_state,"reason":"普通回城请求已确认；继续读取返回和到家状态"})
-            self.log(f"{policy.display} {'按界面请求' if manual else '满兵'}返回主城")
+            self.log(f"{policy.display} {'按界面请求' if manual else '补不动' if line else '满兵'}返回主城")
         except BaseException:
             if self.j.pending(policy.key):
                 self.j.finish(ident,"uncertain","回城提交中停止或异常，等待核对")

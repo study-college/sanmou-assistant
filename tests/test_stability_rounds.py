@@ -28,7 +28,7 @@ def _game(tmp_path):
 
 def _obs():
     return Observation("main:1", state="outside", strength=33000, maximum=33000,
-                       stamina=200, supply=100, wounded=False, location=(636, 286),
+                       stamina=200, supply=100, wounded=False, location=(200, 200),
                        marker_state="stationary", marker_label="停留", marker_confidence=0.96)
 
 

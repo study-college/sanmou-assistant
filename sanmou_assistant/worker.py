@@ -104,6 +104,10 @@ class Worker(QThread):
         self.line_snapshot = {}
         # 拉线补不动回城后，等待下一轮调动到补兵点（营帐）。
         self.line_backup = set()
+        # 已回到主城、做过一次完整兵力复核的拉线队（避免整帧缓存把回城补兵误判成没补）。
+        self.line_home_seen = set()
+        # 已完成“最后一次调动”的拉线队；所有拉线队都完成才停程序（用户 2026-11-13）。
+        self.line_finished = set()
         self.merit_prev = None       # 上一次读数，用于单次增量
         self.next_merit_at = 0.0
         self.merit_failures = 0
@@ -1327,6 +1331,8 @@ class Worker(QThread):
             self.control.checkpoint()
             if policy.group != "main" or not self.team_present(policy.key):
                 continue
+            if policy.key in self.line_finished:
+                continue
             target = line_target(self.profile, policy)
             if target is None:
                 self.log_once(f"line-target:{policy.key}",
@@ -1378,9 +1384,39 @@ class Worker(QThread):
                 continue
             if obs.strength is not None and obs.maximum is not None:
                 self.line_snapshot[policy.key] = (obs.strength, obs.maximum, time.time())
-            # 用户 2026-11-13：有补兵点的拉线队，只要在主城（含自然征兵）就先调动到补兵点，
-            # 不够线在补兵点继续征、够了从补兵点拉；没有补兵点才从主城直接拉。
-            if has_backup and obs.state == "home" and not obs.wounded:
+            # 用户 2026-11-13：有补兵点的拉线队，只要在主城（含自然征兵）就先补到出击线，
+            # 再调动到补兵点。
+            # 主城只认角标（空闲/练兵；用户 2026-11-13：不搞坐标判据，角标才作数）。
+            # 用户 2026-11-13 补充：回主城的一瞬间就完成了给队伍补兵，之后征兵只补兵池、
+            # 不会再给这支队补兵（除非在游戏里主动设置）。所以到主城后读到仍低于出击线，
+            # 就是补不上，直接做最后一次调动并结束该队，不能等 8 分钟再说。
+            at_home = obs.state == "home"
+            if not at_home:
+                self.line_home_seen.discard(policy.key)
+            if has_backup and at_home and not obs.wounded:
+                if policy.key not in self.line_home_seen:
+                    # 刚回主城：角标缓存里的兵力可能是路上读数，必须完整读一次再判定，
+                    # 否则会把“回城瞬间补上的兵”当成没补上。读不到就下一轮再复核。
+                    try:
+                        full = self.observe_team(game, policy)
+                    except TeamAbsent:
+                        full = None
+                    if full is None or full.strength is None:
+                        self.log_once(f"line-home-blind:{policy.key}",
+                                      f"{policy.display} 拉线：已回主城但兵力未读到，下一轮再复核",
+                                      every=600)
+                        continue
+                    obs = full
+                    self.line_home_seen.add(policy.key)
+                need = policy.threshold(obs.maximum) if obs.maximum else None
+                if obs.strength is None:
+                    self.log_once(f"line-home-blind:{policy.key}",
+                                  f"{policy.display} 拉线：已回主城但兵力未读到，等下一次完整读取",
+                                  every=600)
+                    continue
+                if need is not None and obs.strength < need:
+                    self._line_finish(game, policy, obs)
+                    continue
                 self._line_transfer_backup(game, policy, obs)
                 continue
             decision = line_decision(policy, obs, target=target,
@@ -1417,6 +1453,40 @@ class Worker(QThread):
                 self.line_snapshot.pop(policy.key, None)
                 self.publish("decision", {"team": policy.key, "action": "line",
                                           "reason": f"拉线已提交 {point_label(target)}"})
+
+    def _line_finish(self, game, policy, obs):
+        """主城也补不上兵：最后一次调动到补兵点；所有拉线队都完成后才停程序。
+
+        用户 2026-11-13：一支队补不上不代表任务结束——只要还有拉线队能补能拉，
+        任务就继续；等所有被选为拉线的队伍都完成“最后一次调动”，任务才算结束。
+        """
+        point = self.line_backup_point(policy)
+        submitted = False
+        if point is None:
+            game.log(f"{policy.display} 拉线任务结束：主城补不上兵，且没有配置补兵点；"
+                     f"留在主城", "WARN")
+        else:
+            try:
+                game.dispatch(policy, obs, point, "transfer")
+                submitted = True
+            except GameError as exc:
+                game.log(f"{policy.display} 拉线任务结束前调动未提交：{exc}", "WARN")
+        self.line_backup.discard(policy.key)
+        self.line_finished.add(policy.key)
+        if submitted:
+            game.log(f"{policy.display} 已进入调动（{point.name}）；该队拉线任务结束，"
+                     f"等待兵力恢复后再启动", "WARN")
+            self.publish("decision", {"team": policy.key, "action": "transfer",
+                                      "reason": f"拉线任务结束：最后一次调动到 {point.name}"})
+        remaining = [p.display for p in self.profile.teams
+                     if p.role == "line" and p.group == "main" and p.key not in self.line_finished]
+        if remaining:
+            self.publish("status", f"{policy.display} 拉线结束；继续 {'、'.join(remaining)}")
+            return
+        self.publish("status", "拉线任务结束 · 所有拉线队已发出调动令（补兵点）")
+        if submitted:
+            game.log("所有拉线队伍都已发出调动令（补兵点）；拉线任务结束，程序停止", "WARN")
+        self.control.stop.set()
 
     def _line_transfer_backup(self, game, policy, obs):
         """回城后按补兵点调动到营帐；到达营帐后再按状态继续拉。"""
@@ -1464,7 +1534,8 @@ class Worker(QThread):
                               f"{policy.display} 拉线：补不动需回城，但坐标/伤情未读到，等现场重读", every=600)
                 return
         try:
-            game.recall(policy, obs, minimum=policy.threshold(obs.maximum) if obs.maximum else None)
+            # 用户 2026-11-13：拉线不套用刷武勋的“到出击线才回城”——拉不出去就回城补兵。
+            game.recall(policy, obs, line=True)
         except GameError as exc:
             game.log(f"{policy.display} 拉线回城未完成：{exc}", "WARN")
         else:

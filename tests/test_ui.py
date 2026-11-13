@@ -188,31 +188,31 @@ def test_game_address_paste_for_targets_backups_and_main(tmp_path, monkeypatch):
     # 测试不碰系统剪贴板：只验证界面交给 set_clipboard 的内容。
     monkeypatch.setattr("sanmou_assistant.ui.set_clipboard", copied.append)
     window = Window(tmp_path)
-    pasted = "涪县(595,277)测试玩家甲(619,282)测试主公(607,291)山道(636,286)测试玩家乙(634,286)"
+    pasted = "甲城(100,100)乙城(200,200)丙城(300,300)丁城(400,400)戊城(500,500)"
     window.target_address.setText(pasted)
     assert window.add_shared_points(window.target_table)
     assert window.target_table.rowCount() == 5
     window.target_table.cellWidget(3,0).setChecked(True)
     window.target_table.cellWidget(3,5)._actions = ["guard"]
     window.target_table.cellWidget(3,5).setText("驻守  ✎")
-    assert window.add_shared_points(window.target_table, "山道(636,286)")
+    assert window.add_shared_points(window.target_table, "丁城(400,400)")
     assert window.target_table.rowCount() == 5
     assert window.target_table.cellWidget(3,0).isChecked()
     assert window.target_table.cellWidget(3,5)._actions == ["guard"]
-    window.backup_address.setText("涪县（595，277）")
-    window.main_address.setText("测试主公(607,291)")
+    window.backup_address.setText("甲城（100，100）")
+    window.main_address.setText("丙城(300,300)")
     # 保存也识别尚未点应用的地址；城内农田没有地图地址输入。
     assert window.save()
     profile = Profile.from_dict(json.loads((tmp_path/'active-profile.json').read_text(encoding='utf-8')))
-    assert (profile.account,profile.main_city.x,profile.main_city.y) == ("测试主公",607,291)
-    assert (profile.backups[0].name,profile.backups[0].x,profile.backups[0].y) == ("涪县",595,277)
+    assert (profile.account,profile.main_city.x,profile.main_city.y) == ("丙城",300,300)
+    assert (profile.backups[0].name,profile.backups[0].x,profile.backups[0].y) == ("甲城",100,100)
     assert 'grain_field' not in profile.to_dict()
     assert not hasattr(window,"farm_address")
     assert not hasattr(window,"use_farm_mark")
     assert "无需填写地址" in window.farm_position.text()
     assert not profile.backups[0].enabled
     window.copy_addresses(window.backup_table)
-    assert copied == ["涪县(595,277)"]
+    assert copied == ["甲城(100,100)"]
     window.handle_event('calibrated',{'account':'新主公','main_city':{'name':'我的主城','x':201,'y':202,'expected_name':'新主公'}})
     assert window.collect().main_city.x == 201
     assert window.main_address.text() == "新主公(201,202)"
@@ -472,19 +472,19 @@ def test_pave_route_dialog_parses_addresses_and_reorders():
     from sanmou_assistant.ui import PaveRouteDialog
     app = QApplication.instance() or QApplication([])
     dialog = PaveRouteDialog([])
-    dialog.paste.setText("空地(571,243)空地(566,240)")
+    dialog.paste.setText("空地(400,400)空地(300,300)")
     dialog.add_pasted()
-    assert [p[:2] for p in dialog.points()] == [[571, 243], [566, 240]]
+    assert [p[:2] for p in dialog.points()] == [[400, 400], [300, 300]]
     assert dialog.points()[0][2] == "空地"
-    dialog.paste.setText("571,217; 566,240")
+    dialog.paste.setText("200,200; 300,300")
     dialog.add_pasted()
-    assert [p[:2] for p in dialog.points()] == [[571, 243], [566, 240], [571, 217]]
+    assert [p[:2] for p in dialog.points()] == [[400, 400], [300, 300], [200, 200]]
     dialog.list.setCurrentRow(2)
     dialog.to_first()
-    assert [p[:2] for p in dialog.points()][0] == [571, 217]
+    assert [p[:2] for p in dialog.points()][0] == [200, 200]
     dialog.list.setCurrentRow(0)
     dialog.move(1)
-    assert [p[:2] for p in dialog.points()][1] == [571, 217]
+    assert [p[:2] for p in dialog.points()][1] == [200, 200]
     dialog.close()
     app.processEvents()
 
@@ -495,7 +495,7 @@ def test_pave_page_saves_route_points(tmp_path, monkeypatch):
     window.add_pave_route()
     t = window.pave_table
     t.item(0, 0).setText("测试路线")
-    t.cellWidget(0, 4)._points = [[571, 243, "空地"], [566, 240]]
+    t.cellWidget(0, 4)._points = [[400, 400, "空地"], [300, 300]]
     window.sync_routes_from_table()
     monkeypatch.setattr("sanmou_assistant.ui.QInputDialog.getItem",
                         lambda *args, **kwargs: ("测试路线", True))
@@ -508,10 +508,10 @@ def test_pave_page_saves_route_points(tmp_path, monkeypatch):
     p = Profile.from_dict(json.loads((tmp_path / "active-profile.json").read_text(encoding="utf-8")))
     assert p.pave_routes[0].name == "测试路线"
     assert p.pave_routes[0].team == "main:2"
-    assert p.pave_routes[0].points == [[571, 243, "空地"], [566, 240]]
+    assert p.pave_routes[0].points == [[400, 400, "空地"], [300, 300]]
     reopened = Window(tmp_path)
     assert reopened.pave_table.item(0, 0).text() == "测试路线"
-    assert reopened.pave_table.cellWidget(0, 4)._points == [[571, 243, "空地"], [566, 240]]
+    assert reopened.pave_table.cellWidget(0, 4)._points == [[400, 400, "空地"], [300, 300]]
     window.close()
     reopened.close()
     app.processEvents()
@@ -550,8 +550,8 @@ def test_unassigned_pave_routes_do_not_block_start(tmp_path):
     profile = Profile(account="测试", main_city=Point(name="主城", x=600, y=280))
     profile.teams[0].role = "merit"
     profile.teams[1].role = "bandits"
-    profile.pave_routes = [PaveRoute(name="铺路 1", points=[[571, 243]], enabled=True),
-                           PaveRoute(name="铺路 2", points=[[566, 240]], enabled=True)]
+    profile.pave_routes = [PaveRoute(name="铺路 1", points=[[400, 400]], enabled=True),
+                           PaveRoute(name="铺路 2", points=[[300, 300]], enabled=True)]
     (tmp_path / "active-profile.json").write_text(json.dumps(profile.to_dict()), encoding="utf-8")
     app = QApplication.instance() or QApplication([])
     window = Window(tmp_path)

@@ -4,18 +4,18 @@ from sanmou_assistant.locations import parse_addresses, single_address
 
 
 def test_game_share_concatenated_addresses_and_round_trip():
-    pasted = "涪县(595,277)测试玩家甲(619,282)测试主公(607,291)山道(636,286)测试玩家乙(634,286)"
+    pasted = "甲城(100,100)乙城(200,200)丙城(300,300)丁城(400,400)戊城(500,500)"
     addresses = parse_addresses(pasted)
     assert [(a.name, a.x, a.y) for a in addresses] == [
-        ("涪县",595,277),("测试玩家甲",619,282),("测试主公",607,291),("山道",636,286),("测试玩家乙",634,286)]
+        ("甲城",100,100),("乙城",200,200),("丙城",300,300),("丁城",400,400),("戊城",500,500)]
     assert parse_addresses("\n".join(a.text() for a in addresses)) == addresses
-    assert single_address(" 涪县（ 595 ， 277 ） ").text() == "涪县(595,277)"
+    assert single_address(" 甲城（ 100 ， 100 ） ").text() == "甲城(100,100)"
     assert single_address("(0,3000)").name == ""
-    assert len(parse_addresses("涪县(595,277)；涪县(595,277)")) == 1
+    assert len(parse_addresses("甲城(100,100)；甲城(100,100)")) == 1
     assert single_address("营帐（升级后）(100,200)").text() == "营帐（升级后）(100,200)"
 
 
-@pytest.mark.parametrize("text", ["", "涪县595,277", "涪县(-1,277)", "涪县(3001,277)", "涪县(595,277)尾巴", "涪县(595,277)坏地址(1,)", "涪县(595,277)别的城(595,277)"])
+@pytest.mark.parametrize("text", ["", "甲城100,100", "甲城(-1,277)", "甲城(3001,277)", "甲城(100,100)尾巴", "甲城(100,100)坏地址(1,)", "甲城(100,100)别的城(100,100)"])
 def test_malformed_paste_is_rejected_instead_of_importing_valid_prefix(text):
     with pytest.raises(ValueError):
         parse_addresses(text)

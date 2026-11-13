@@ -24,21 +24,21 @@ from sanmou_assistant.worker import Worker
 # ---------- 3.2 统一地点显示 ----------
 
 def test_point_label_never_repeats_the_same_coordinates():
-    assert point_label(Point(name="拉线目标 (617,759)", x=617, y=759)) == "拉线目标 (617,759)"
-    assert point_label(Point(name="拉线目标（617，759）", x=617, y=759)) == "拉线目标（617，759）"
-    assert point_label(Point(name="水面", x=617, y=759)) == "水面(617,759)"
-    assert point_label(Point(name="", x=617, y=759)) == "(617,759)"
+    assert point_label(Point(name="拉线目标 (800,800)", x=800, y=800)) == "拉线目标 (800,800)"
+    assert point_label(Point(name="拉线目标（800，800）", x=800, y=800)) == "拉线目标（800，800）"
+    assert point_label(Point(name="水面", x=800, y=800)) == "水面(800,800)"
+    assert point_label(Point(name="", x=800, y=800)) == "(800,800)"
     # 名称里是别的坐标：仍然补上真实坐标，不能被误当成“已经有坐标”。
-    assert point_label(Point(name="旧点(1,2)", x=617, y=759)) == "旧点(1,2)(617,759)"
+    assert point_label(Point(name="旧点(1,2)", x=800, y=800)) == "旧点(1,2)(800,800)"
 
 
 def test_line_decision_reason_prints_coordinates_only_once():
-    target = Point(name="拉线目标 (617,759)", x=617, y=759, group="默认")
+    target = Point(name="拉线目标 (800,800)", x=800, y=800, group="默认")
     profile = Profile(teams=[TeamPolicy(slot=1, role="line")], line_targets=[target])
     obs = Observation("main:1", state="outside", marker_state="stationary",
                       strength=33000, maximum=33000, wounded=False)
     reason = line_decision(profile.teams[0], obs, target=line_target(profile, profile.teams[0])).reason
-    assert reason.count("617,759") == 1
+    assert reason.count("800,800") == 1
     assert "拉线 拉线" not in reason
 
 
@@ -47,11 +47,13 @@ def test_line_decision_reason_prints_coordinates_only_once():
 class FakeLineGame:
     """只回答拉线循环需要的那几个方法；不连接设备。"""
 
-    def __init__(self, image, marker_state="stationary", fail_dispatch=True, scan_state="outside"):
+    def __init__(self, image, marker_state="stationary", fail_dispatch=True, scan_state="outside",
+                 strength=33000, maximum=33000):
         self.image = image
         self.marker_state = marker_state
         self.fail_dispatch = fail_dispatch
         self.scan_state = scan_state
+        self.strength, self.maximum = strength, maximum
         self.hud = {}
         self.logs = []
         self.targets = []
@@ -69,7 +71,8 @@ class FakeLineGame:
         # 拉线第一轮完整读数；marker_state 有值，不再走铺路快照兜底。
         self.scanned += 1
         return Observation(policy.key, state=self.scan_state, marker_state=self.marker_state,
-                           strength=33000, maximum=33000, wounded=False)
+                           strength=self.strength, maximum=self.maximum, wounded=False,
+                           location=(100, 200) if self.scan_state == "home" else None)
 
     def log(self, message, level="INFO"):
         self.logs.append((level, message))
@@ -89,8 +92,8 @@ class FakeLineGame:
         if self.fail_dispatch:
             raise GameError("测试停止：不真正派兵")
 
-    def recall(self, policy, obs, minimum=None):
-        self.recalled.append((policy.key, obs.location, minimum))
+    def recall(self, policy, obs, minimum=None, line=False):
+        self.recalled.append((policy.key, obs.location, minimum, line))
 
 
 class FakeJournal:
@@ -111,7 +114,7 @@ class FakeJournal:
 
 
 def make_worker(tmp_path, actions=("occupy", "march"), **policy_kwargs):
-    point = Point(name="拉线目标 (617,759)", x=617, y=759, group="默认",
+    point = Point(name="拉线目标 (800,800)", x=800, y=800, group="默认",
                   actions=list(actions), expected_name="")
     policy = TeamPolicy(slot=1, role="line", **policy_kwargs)
     profile = Profile(teams=[policy], line_targets=[point])
@@ -220,7 +223,7 @@ def test_settings_page_does_not_save_unowned_suffix_into_names(tmp_path):
 def dialog_profile():
     return Profile(
         teams=[TeamPolicy(slot=1, role="line"), TeamPolicy(slot=2, role="merit", backup_points=["营帐A"])],
-        line_targets=[Point(name="水面", x=617, y=759, group="拉线组", priority=1),
+        line_targets=[Point(name="水面", x=800, y=800, group="拉线组", priority=1),
                       Point(name="备用", x=1, y=2, group="默认", priority=2)],
         targets=[Point(name="战场", x=640, y=286, group="战场组", priority=1)],
         backups=[Point(name="营帐A", x=300, y=200)])
@@ -265,9 +268,9 @@ def test_line_team_summary_shows_its_real_target(tmp_path):
     window = Window(tmp_path)
     team = window.profile.teams[0]
     team.role, team.target_group = "line", "默认"
-    window.profile.line_targets = [Point(name="水面", x=617, y=759, group="默认", priority=1)]
+    window.profile.line_targets = [Point(name="水面", x=800, y=800, group="默认", priority=1)]
     summary = window.team_detail_summary(team)
-    assert "水面(617,759)" in summary
+    assert "水面(800,800)" in summary
     assert "补兵点" in summary          # 拉线的营帐（补兵点）也显示在行内摘要
     window.close()
     app.processEvents()
@@ -374,7 +377,7 @@ def test_line_and_transfer_may_pass_a_recruiting_card():
 # ---------- 用户 2026-11-13 MVP：忙到线就拉、回城转营帐 ----------
 
 def line_busy_profile(minimum=95):
-    point = Point(name="水面", x=617, y=759, group="默认", priority=1, actions=["march"])
+    point = Point(name="水面", x=800, y=800, group="默认", priority=1, actions=["march"])
     policy = TeamPolicy(slot=1, role="line", minimum=minimum)
     return Profile(teams=[policy], line_targets=[point]), policy
 
@@ -399,7 +402,52 @@ def test_line_fallback_recalls_and_waits_for_backup(tmp_path):
     game = FakeLineGame(np.zeros((1080, 1920, 3), np.uint8))
     worker._line_fallback(game, policy, obs)
     assert game.recalled and game.recalled[0][0] == "main:1"
+    # 用户 2026-11-13：拉线“拉不出去就回城”，不套用刷武勋的“到出击线才回城”。
+    assert game.recalled[0][3] is True
+    assert game.recalled[0][2] is None
     assert policy.key in worker.line_backup
+    worker.deleteLater()
+
+
+def test_line_home_below_line_finishes_task_immediately(tmp_path):
+    """2026-11-13 用户：回主城瞬间就补完兵，之后不会再给队伍补兵；
+    到主城仍低于出击线 = 补不上，立刻做最后一次调动并结束，不等 8 分钟。"""
+    worker, profile, point = make_worker(tmp_path, minimum=95)
+    policy = profile.teams[0]
+    profile.backups = [Point(name="补给营帐", x=700, y=700, enabled=True)]
+    policy.backup_points = ["补给营帐"]
+    profile.main_city = Point(name="主城", x=331, y=562, group="默认")
+    game = FakeLineGame(np.zeros((1080, 1920, 3), np.uint8), marker_state="idle",
+                        scan_state="home", fail_dispatch=False,
+                        strength=18000, maximum=28200)
+    worker.process_line(game)
+    assert game.dispatched and game.dispatched[0][0] == "transfer"
+    assert game.dispatched[0][1].name == "补给营帐"
+    assert worker.control.stop.is_set()
+    worker.control.stop.clear()
+    worker.deleteLater()
+
+
+def test_two_line_teams_finish_independently_then_stop(tmp_path):
+    """2026-11-13 用户：只要还有拉线队能补，任务就不算结束；所有队完成最后调动才停。"""
+    point = Point(name="拉线目标 (800,800)", x=800, y=800, group="默认",
+                  actions=["occupy", "march"], expected_name="")
+    first = TeamPolicy(slot=1, role="line", backup_points=["补给营帐"])
+    second = TeamPolicy(slot=2, role="line", backup_points=["补给营帐"])
+    profile = Profile(teams=[first, second], line_targets=[point],
+                      backups=[Point(name="补给营帐", x=700, y=700, enabled=True)],
+                      main_city=Point(name="主城", x=331, y=562, group="默认"))
+    worker = Worker(profile, tmp_path, command="run", dry_run=False)
+    worker.journal = FakeJournal()
+    game = FakeLineGame(np.zeros((1080, 1920, 3), np.uint8), fail_dispatch=False)
+    obs = Observation("main:1", state="home", location=(100, 200), wounded=False,
+                      strength=18000, maximum=28200)
+    worker._line_finish(game, first, obs)
+    assert not worker.control.stop.is_set()
+    assert first.key in worker.line_finished
+    worker._line_finish(game, second, obs)
+    assert worker.control.stop.is_set()
+    worker.control.stop.clear()
     worker.deleteLater()
 
 
@@ -409,7 +457,7 @@ def test_line_backup_transfers_to_the_configured_point(tmp_path):
     profile.backups = [Point(name="伏波营", x=592, y=655, enabled=True)]
     worker.line_backup.add(policy.key)
     game = FakeLineGame(np.zeros((1080, 1920, 3), np.uint8), fail_dispatch=False)
-    obs = Observation("main:1", state="home", location=(331, 562), wounded=False,
+    obs = Observation("main:1", state="home", location=(100, 200), wounded=False,
                       strength=18000, maximum=28200)
     worker._line_transfer_backup(game, policy, obs)
     assert game.dispatched and game.dispatched[0][0] == "transfer"
@@ -423,6 +471,7 @@ def test_process_line_at_home_with_backup_transfers_first(tmp_path):
     worker, profile, _point = make_worker(tmp_path)
     policy = profile.teams[0]
     profile.backups = [Point(name="营帐B", x=660, y=753, enabled=True)]
+    profile.main_city = Point(name="主城", x=331, y=562, group="默认")
     game = FakeLineGame(np.zeros((1080, 1920, 3), np.uint8),
                         marker_state="idle", scan_state="home", fail_dispatch=False)
     worker.process_line(game)
@@ -435,6 +484,7 @@ def test_process_line_after_recall_transfers_home_to_backup(tmp_path):
     worker, profile, _point = make_worker(tmp_path)
     policy = profile.teams[0]
     profile.backups = [Point(name="伏波营", x=592, y=655, enabled=True)]
+    profile.main_city = Point(name="主城", x=331, y=562, group="默认")
     worker.line_backup.add(policy.key)
     game = FakeLineGame(np.zeros((1080, 1920, 3), np.uint8),
                         marker_state="idle", scan_state="home", fail_dispatch=False)
@@ -450,7 +500,7 @@ def test_dispatch_does_not_submit_when_card_already_retreat_or_wounded(tmp_path)
         game = stub_game(tmp_path, status)
         policy = TeamPolicy(slot=1, role="line")
         obs = Observation("main:1", marker_state="stationary", state="outside", wounded=False)
-        point = Point(name="拉线目标 (617,759)", x=617, y=759, actions=["occupy", "march"])
+        point = Point(name="拉线目标 (800,800)", x=800, y=800, actions=["occupy", "march"])
         with pytest.raises(DispatchUnconfirmed) as raised:
             game._dispatch(policy, obs, point, "line", reuse_target=True)
         assert raised.value.busy is True

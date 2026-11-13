@@ -140,8 +140,8 @@ def pave_summary(points) -> str:
 def point_label(point) -> str:
     """统一的“地点 + 坐标”显示：名称里已经带同一坐标时不再追加一遍。
 
-    “名称备注”允许用户写成 `拉线目标 (617,759)`，旧配置迁移也会生成这种名称；
-    日志模板若再拼一次坐标，就会出现 `(617,759)(617,759)`（交接文档 72 的 3.2）。
+    “名称备注”允许用户写成 `拉线目标 (100,100)`，旧配置迁移也会生成这种名称；
+    日志模板若再拼一次坐标，就会出现 `(100,100)(100,100)`（交接文档 72 的 3.2）。
     """
     name = (point.name or "").strip()
     coords = f"({point.x},{point.y})"
@@ -552,7 +552,7 @@ def bandit_decision(profile: Profile, policy: TeamPolicy, obs: Observation, grai
 def _legacy_line_point(text: str) -> Optional[dict]:
     """把 0.9.6 放在队伍上的 line_target 迁移成一个拉线目标点。
 
-    兼容两种写法：裸坐标 "617,759" 与游戏分享地址 "水面(617,759)"。
+    兼容两种写法：裸坐标 "100,100" 与游戏分享地址 "水面(100,100)"。
     """
     cleaned = (text or "").strip()
     match = re.search(r"(\d{1,4})\s*[,，]\s*(\d{1,4})", cleaned)

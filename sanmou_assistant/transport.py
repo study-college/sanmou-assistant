@@ -335,6 +335,15 @@ class Device:
         self.shell("input", "swipe", round(x1*self.width/1920), round(y1*self.height/1080), round(x2*self.width/1920), round(y2*self.height/1080), duration)
         self.control.sleep(.5)
 
+    def long_press(self, x, y, seconds=1.8):
+        """原地按住同一坐标：地图缩放按钮长按 1~2 秒即可连续缩放。
+
+        用户 2026-11-13：连点可能不生效，长按更稳；只按下已识别到的按钮。
+        """
+        self.shell("input", "swipe", round(x*self.width/1920), round(y*self.height/1080),
+                   round(x*self.width/1920), round(y*self.height/1080), int(seconds*1000))
+        self.control.sleep(.5)
+
     def launch_game(self, package: str):
         if not re.fullmatch(r"[A-Za-z0-9_.]+",package):
             raise ValueError("游戏包名格式不正确")

@@ -41,10 +41,14 @@ def export(output: Path) -> dict:
     for name in SCRIPTS:
         copy(ROOT / "scripts" / name)
     for path in sorted(list((ROOT / "tests").glob("*.py")) + list((ROOT / "research-tests").glob("*.py"))):
-        private = path.parent.name == "research-tests" or "artifacts" in path.read_text("utf-8") or "data/sessions" in path.read_text("utf-8")
-        copy(path, Path("research-tests" if private else "tests") / path.name)
+        text = path.read_text("utf-8")
+        # 依赖本机 artifacts/data 的测试无法在公开仓库运行，且可能含本机截图里的账号与坐标；
+        # 一律不导出，公开仓库只保留可独立运行的测试。
+        if path.parent.name == "research-tests" or "artifacts" in text or "data/sessions" in text:
+            continue
+        copy(path, Path("tests") / path.name)
     from sanmou_assistant import __version__
-    for name in dict.fromkeys(("09-user-guide.md", "AGENT-GUIDE.md", "ROADMAP.md", "RELEASE-0.8.1.md", "RELEASE-0.8.2.md", "RELEASE-0.8.3.md", "RELEASE-0.9.0.md", "RELEASE-0.9.2.md", "RELEASE-0.9.3.md", "RELEASE-0.9.4.md", "RELEASE-0.9.5.md", "RELEASE-0.9.6.md", f"RELEASE-{__version__}.md", "guide.css")):
+    for name in dict.fromkeys(("09-user-guide.md", "AGENT-GUIDE.md", "ROADMAP.md", "RELEASE-0.8.1.md", "RELEASE-0.8.2.md", "RELEASE-0.8.3.md", "RELEASE-0.9.0.md", "RELEASE-0.9.2.md", "RELEASE-0.9.3.md", "RELEASE-0.9.4.md", "RELEASE-0.9.5.md", "RELEASE-0.9.6.md", "RELEASE-0.9.9.md", f"RELEASE-{__version__}.md", "guide.css")):
         copy(ROOT / "docs" / name)
     for path in sorted((ROOT / "docs/guide-assets").glob("*.png")):
         copy(path)

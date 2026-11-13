@@ -61,6 +61,17 @@ def clock_seconds(text: str) -> int | None:
     return int(a)*3600 + int(b)*60 + int(c) if c is not None else int(a)*60+int(b)
 
 
+def sandbox_hud(bottom: str, xunfang: bool) -> bool:
+    """沙盘 HUD 判据（纯函数）：底栏导航 + 右下角“寻访”徽记。
+
+    用户 2026-11-13：顶部资源栏背后是半透明地图，地图标签会压上来，不能拿顶部当判据。
+    沙盘界面上底栏“武将/同盟/职业/征战”和右下角“寻访”必定存在；寻访用模板匹配，
+    比 OCR 稳（隐藏模式的“隐藏”小字会盖住“寻访”两个字的底部）。
+    """
+    return bool(xunfang and "武将" in bottom and "同盟" in bottom
+                and ("职业" in bottom or "征战" in bottom or "证战" in bottom))
+
+
 class Vision:
     # 页型第一次识别为 unknown 时，第二次复核用的检测边长（模型默认 736，越慢但越细）。
     FALLBACK_DETECT_LIMIT = 480
@@ -107,6 +118,9 @@ class Vision:
             if image is not None:
                 self.hide_eye[key] = image
         self.reward_templates = []
+        # 右下角“寻访”徽记：沙盘界面必定存在，用来替代不可靠的顶部资源栏判据。
+        self.xunfang = cv2.imdecode(np.fromfile(Path(__file__).with_name("assets") / "xunfang-mask.png",
+                                                dtype=np.uint8), cv2.IMREAD_GRAYSCALE)
         # 活动/礼包整屏弹层右上角的叉号（实机 2026-11-03 首登 BLG 活动页校准）。
         self.close_x = None
         close_path = Path(__file__).with_name("assets") / "close-x.png"
@@ -571,13 +585,8 @@ class Vision:
         # 出城与聊天文字相邻；独立核对按钮，避免拥挤文字漏检或聊天中同词误判。
         if self.find(image, ["出城"], (15, 1000, 180, 1075), exact=True):
             return "city"
-        if "武将" in bottom and ("同盟" in bottom or "职业" in bottom):
-            # 沙盘页型只由底栏 + 顶部资源栏确认，不读队伍页码。
-            # 2026-11-09：页码属于右侧头像列表的分页状态，与“这是不是沙盘”无关；
-            # 把它当页型条件会让地图底色影响页面判断。
-            top = self.joined(image, (0, 30, 900, 115)).replace(" ", "")
-            if "繁荣" in top and "道路" in top:
-                return "sandbox"
+        if sandbox_hud(bottom, self.sandbox_badge(image)):
+            return "sandbox"
         center = self.joined(image, (450, 250, 1470, 800))
         if any(s in center for s in ("其他地方登录", "其他设备登录", "重新登录", "连接已断开")):
             return "blocked"
@@ -673,6 +682,52 @@ class Vision:
         if self.page(image) != "sandbox":
             return None
         return self.gold_control(image, "sandbox-menu-mask.png", (1580, 930, 1750, 1065))
+
+    def sandbox_badge(self, image, minimum=.75) -> bool:
+        """右下角“寻访”徽记是否存在；沙盘页型的硬证据（不受顶部半透明资源栏影响）。"""
+        if (self.xunfang is None or image is None or not isinstance(image, np.ndarray)
+                or image.shape[:2] != (1080, 1920)):
+            return False
+        roi = cv2.cvtColor(image[900:1040, 1680:1920], cv2.COLOR_BGR2GRAY)
+        if self.xunfang.shape[0] > roi.shape[0] or self.xunfang.shape[1] > roi.shape[1]:
+            return False
+        return float(cv2.matchTemplate(roi, self.xunfang, cv2.TM_CCOEFF_NORMED).max()) >= minimum
+
+    # 地图左下角常驻的缩小（上箭头）/放大（下箭头）按钮：实机 2026-11-13 标定，
+    # 位置固定、不会随弹层移动；只在这个小框里找，避免点到地图上的其他控件。
+    MAP_ZOOM_BOXES = {"out": (0, 640, 135, 785), "in": (0, 780, 135, 925)}
+    MAP_ZOOM_MIN = .55
+
+    def map_zoom_point(self, image, zoom_in=False):
+        """返回地图缩放按钮中心 (x, y)；识别不到就返回 None，不拿固定坐标盲点。
+
+        用户 2026-11-13：双指缩放不稳定，地图左下角的放大/缩小按钮一直都在；
+        向上（缩小）连点能退到“地图沙盘”（坐标输入页），向下（放大）连点能放到最大。
+        """
+        if image is None or not isinstance(image, np.ndarray) or image.shape[:2] != (1080, 1920):
+            return None
+        name = "map-zoom-in-mask.png" if zoom_in else "map-zoom-out-mask.png"
+        path = Path(__file__).with_name("assets") / name
+        if not path.is_file():
+            return None
+        template = cv2.imdecode(np.fromfile(path, dtype=np.uint8), cv2.IMREAD_GRAYSCALE)
+        if template is None:
+            return None
+        x0, y0, x1, y1 = self.MAP_ZOOM_BOXES["in" if zoom_in else "out"]
+        roi = cv2.cvtColor(image[y0:y1, x0:x1], cv2.COLOR_BGR2GRAY)
+        best = None
+        for scale in (1.0, .96, 1.04):
+            sample = cv2.resize(template, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+            height, width = sample.shape
+            if height > roi.shape[0] or width > roi.shape[1]:
+                continue
+            result = cv2.matchTemplate(roi, sample, cv2.TM_CCOEFF_NORMED)
+            _, score, _, location = cv2.minMaxLoc(result)
+            if best is None or score > best[0]:
+                best = (float(score), x0+location[0]+width/2, y0+location[1]+height/2)
+        if best is None or best[0] < self.MAP_ZOOM_MIN:
+            return None
+        return (round(best[1]), round(best[2]))
 
     def city_building_point(self, image):
         if self.page(image) != "city":

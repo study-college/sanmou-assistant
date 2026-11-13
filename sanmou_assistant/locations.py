@@ -18,7 +18,7 @@ class SharedAddress:
 def parse_addresses(text: str) -> list[SharedAddress]:
     """Parse the whole paste or reject it; never silently import a valid prefix."""
     if not isinstance(text, str) or not text.strip():
-        raise ValueError("请粘贴游戏地址，例如：涪县(595,277)")
+        raise ValueError("请粘贴游戏地址，例如：涪县(300,300)")
     if len(text) > 10000:
         raise ValueError("一次粘贴的地址过多，请分批添加")
     source = text.translate(str.maketrans({"（": "(", "）": ")", "，": ","}))

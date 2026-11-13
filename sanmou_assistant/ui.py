@@ -268,7 +268,7 @@ class PaveRouteDialog(QDialog):
         self.resize(620, 540)
         layout = QVBoxLayout(self)
         tip = QLabel("列表从上到下就是铺路顺序，脚本到达一个点并停留后才派下一段。\n"
-                     "可直接粘贴游戏地址：空地(571,243)空地(566,240)；或写坐标：571,243; 566,240。")
+                     "可直接粘贴游戏地址：空地(200,200)空地(300,300)；或写坐标：200,200; 300,300。")
         tip.setWordWrap(True)
         layout.addWidget(tip)
         options = options or {}
@@ -278,7 +278,7 @@ class PaveRouteDialog(QDialog):
         layout.addWidget(self.list, 1)
         row = QHBoxLayout()
         self.paste = PasteLineEdit()
-        self.paste.setPlaceholderText("粘贴游戏地址或坐标，例如 空地(571,243)空地(566,240)")
+        self.paste.setPlaceholderText("粘贴游戏地址或坐标，例如 空地(200,200)空地(300,300)")
         # 铺路路线不再限制段数，粘贴框也别先卡住（10000 字符只够五百多段）。
         self.paste.setMaxLength(200000)
         row.addWidget(self.paste, 1)
@@ -1211,7 +1211,7 @@ class Window(QMainWindow):
         row.addStretch()
         layout.addLayout(row)
         self.collapsible(layout, "拉线目标怎么用",
-                         "直接粘贴游戏地址，例如 水面(617,759)，点“识别并添加”后勾选启用；"
+                         "直接粘贴游戏地址，例如 水面(100,100)，点“识别并添加”后勾选启用；"
                          "同一目标组内从上到下取第一个启用目标。拉线只认坐标，名称仅作备注；"
                          "“指令顺序”和刷武勋目标一样由你排列（攻城/攻占/驻守/行军），脚本按这个顺序尝试。"
                          "哪支队拉线在“部队任务”里选。")

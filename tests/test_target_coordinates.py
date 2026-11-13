@@ -83,11 +83,12 @@ def test_page_change_after_typing_stops_before_forward():
     assert (1750, 998) not in calls
 
 
-def test_two_unsuccessful_zooms_stop_before_input():
+def test_unrecognized_zoom_button_stops_before_input():
+    """2026-11-13：缩放改用左下角按钮；认不出按钮就停，不再用双指盲缩。"""
     g, calls = navigation(['sandbox|', 'sandbox|'])
     with pytest.raises(GameError, match='未打开坐标地图'):
         g.go_to(Point(x=648, y=277))
-    assert calls == ['zoom', 'zoom']
+    assert calls == []
 
 
 def test_blocked_after_forward_is_not_retried_as_input_failure():

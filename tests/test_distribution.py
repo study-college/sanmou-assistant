@@ -110,7 +110,7 @@ def test_clouded_home_menu_is_reread_before_team_state_is_decided():
     waits = []
     game = Game.__new__(Game)
     game.p = Profile(account="测试",main_city=Point(name="主城",x=607,y=291))
-    game.v = SimpleNamespace(navigation_close_point=lambda *a:(138,38), map_coordinates=lambda im:(607,291),
+    game.v = SimpleNamespace(navigation_close_point=lambda *a:(138,38), map_coordinates=lambda im:(100,100),
         find=lambda im,*a,**kw:SimpleNamespace() if im is clear else None,
         page=lambda im:"team" if im is full else "sandbox",
         full_team=lambda im,key:Observation(key,wounded=False,strength=33000,maximum=33000))
@@ -125,5 +125,5 @@ def test_clouded_home_menu_is_reread_before_team_state_is_decided():
     game.v.home_team_visible=lambda *a:False
     game.emit=lambda *a:None
     result=game.scan_team(TeamPolicy(slot=5))
-    assert result.state=="home" and result.location==(607,291)
+    assert result.state=="home" and result.location==(100,100)
     assert waits==[.8]

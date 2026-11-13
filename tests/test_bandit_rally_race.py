@@ -170,7 +170,7 @@ def test_post_submit_target_still_open_is_rejected(joiner):
 
 def test_post_submit_target_gone_from_list_stays_uncertain(joiner):
     build, policy, obs, rally, journal, events = joiner
-    other = {"text": "20级贼寇 蟒一白雀 集结中..00:27:18", "join": (1290, 590)}
+    other = {"text": "20级贼寇 测试玩家 集结中..00:27:18", "join": (1290, 590)}
     game = build(join_sequence(), {"detail": ("reward", 1), "list": ("reward", 1)})
     game.open_bandit_list = lambda: Frame("war", rallies=[other])
     with pytest.raises(GameError, match="待核对"):

@@ -15,7 +15,7 @@ def test_manual_return_uses_current_verified_arrow_and_never_guesses(tmp_path, h
     image = np.zeros((1080,1920,3), np.uint8)
     taps = []
     vision = SimpleNamespace(joined=lambda *a:'', page=lambda *a:'sandbox',
-        map_coordinates=lambda im:(636,286),
+        map_coordinates=lambda im:(200,200),
         stationary_return_point=lambda *a:(1744,257) if has_arrow else None)
     journal = Journal(tmp_path/'runtime.sqlite', 'test')
     game = Game(SimpleNamespace(tap=lambda *a:taps.append(a)), vision, profile, journal, tmp_path, lambda *a:None)
