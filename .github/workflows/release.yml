@@ -6,7 +6,7 @@ on:
       tag:
         description: Existing release tag
         required: true
-        default: v0.9.0
+        default: v0.10.0
         type: string
 
 permissions:
@@ -60,7 +60,8 @@ jobs:
       - name: Assemble, verify and upload the full package
         shell: pwsh
         run: |
-          python scripts/package_release.py
+          # 干净公开源码检出没有本机脱敏映射；源码已脱敏，显式允许继续。
+          python scripts/package_release.py --allow-no-anonymization
           if ($LASTEXITCODE -ne 0) { throw 'Package assembly failed' }
           $version = python -c 'from sanmou_assistant import __version__; print(__version__)'
           $folder = "dist/SanmouAssistant-$version-Windows-x64-full"

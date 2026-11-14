@@ -46,7 +46,7 @@ def test_explicit_install_is_never_silently_replaced(tmp_path):
     assert Path(discover_adb(str(cli))) == adb
 
 
-def test_feedback_is_readable_bounded_and_does_not_follow_external_images(tmp_path):
+def _feedback_data(tmp_path):
     data = tmp_path / "user data 中文"
     folder = data / "sessions" / "20261027-010000"
     folder.mkdir(parents=True)
@@ -55,20 +55,78 @@ def test_feedback_is_readable_bounded_and_does_not_follow_external_images(tmp_pa
     image.write_bytes(b"png-test")
     outside = tmp_path / "unrelated.png"
     outside.write_bytes(b"secret")
-    records = [{"event": "error", "value": "测试 <报错>"},
-               {"event": "evidence", "value": str(image)},
-               {"event": "evidence", "value": str(outside)}]
+    records = [{"event": "error", "at": "2026-10-27T01:00:01", "value": "测试 <报错>"},
+               {"event": "log", "at": "2026-10-27T01:00:02", "value": {"level": "WARN", "message": "秘密警告"}},
+               {"event": "evidence", "at": "2026-10-27T01:00:03", "value": str(image)},
+               {"event": "evidence", "at": "2026-10-27T01:00:04", "value": str(outside)}]
     (folder / "events.jsonl").write_text("\n".join(json.dumps(r) for r in records), encoding="utf-8")
+    return data, folder, image
+
+
+def test_safe_feedback_has_metadata_but_no_raw_values_or_images(tmp_path):
+    data, folder, image = _feedback_data(tmp_path)
     write_session_report(folder, "测试")
     output = tmp_path / "feedback.zip"
     report = export_diagnostics(data, output)
     with zipfile.ZipFile(output) as archive:
         assert archive.testzip() is None
-        assert "images/error.png" in archive.namelist()
-        assert all("unrelated" not in name for name in archive.namelist())
-        assert "&lt;报错&gt;" in archive.read("请先打开诊断报告.html").decode("utf-8")
-        assert "测试" in archive.read("report.json").decode("utf-8")
+        names = archive.namelist()
+        assert "images/error.png" not in names
+        assert all("unrelated" not in name for name in names)
+        assert all(not name.endswith(("events.jsonl", "result.json", "session.json", "diagnosis.json", "诊断摘要.html")) for name in names)
+        payload = b"".join(archive.read(name) for name in names)
+        for secret in ("测试", "秘密警告", str(image), "sessions/_evidence"):
+            assert secret.encode("utf-8") not in payload
+        summary = json.loads(archive.read("report.json").decode("utf-8"))
+        assert summary["mode"] == "safe"
+        assert summary["event_counts"] == {"error": 1, "log": 1, "evidence": 2}
+        assert summary["sessions"] == ["20261027-010000"]
+        assert summary["files"]["sessions/20261027-010000/events.jsonl"] > 0
+        assert summary["files"]["sessions/20261027-010000/diagnosis.json"] > 0
+        assert [item["event"] for item in summary["attention"]] == ["error", "log"]
+        assert all(set(item) == {"at", "event", "level"} for item in summary["attention"])
+        assert summary["attention"][1]["level"] == "WARN"
+        html_text = archive.read("请先打开诊断报告.html").decode("utf-8")
+        assert "安全诊断包" in html_text and "不含账号配置、原始日志、订单、截图" in html_text
     assert report["environment"]["version"]
+
+
+def test_full_feedback_requires_include_private(tmp_path):
+    data, folder, image = _feedback_data(tmp_path)
+    write_session_report(folder, "测试")
+    output = tmp_path / "feedback-full.zip"
+    report = export_diagnostics(data, output, include_private=True)
+    with zipfile.ZipFile(output) as archive:
+        names = archive.namelist()
+        assert "images/error.png" in names
+        assert all("unrelated" not in name for name in names)
+        assert "sessions/20261027-010000/events.jsonl" in names
+        html_text = archive.read("请先打开诊断报告.html").decode("utf-8")
+        assert "完整诊断包" in html_text and "请核对后再发送" in html_text
+        assert "&lt;报错&gt;" in html_text
+        assert "测试" in archive.read("report.json").decode("utf-8")
+        assert report["mode"] == "full" and report["images"] == ["images/error.png"]
+    assert report["environment"]["version"]
+
+
+def test_cli_diagnostics_defaults_to_safe_and_include_private_opt_in(tmp_path):
+    data, folder, image = _feedback_data(tmp_path)
+    safe = tmp_path / "cli-safe.zip"
+    result = subprocess.run([sys.executable, "-m", "sanmou_assistant", "--data-dir", str(data),
+                             "--command", "diagnostics", "--output", str(safe)], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    with zipfile.ZipFile(safe) as archive:
+        payload = b"".join(archive.read(name) for name in archive.namelist())
+        assert "测试".encode("utf-8") not in payload
+        assert json.loads(archive.read("report.json").decode("utf-8"))["mode"] == "safe"
+    full = tmp_path / "cli-full.zip"
+    result = subprocess.run([sys.executable, "-m", "sanmou_assistant", "--data-dir", str(data),
+                             "--command", "diagnostics", "--include-private", "--output", str(full)],
+                            capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    with zipfile.ZipFile(full) as archive:
+        assert "sessions/20261027-010000/events.jsonl" in archive.namelist()
+        assert "images/error.png" in archive.namelist()
 
 
 def test_only_paving_also_requires_account_and_rejects_guard():

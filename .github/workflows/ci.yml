@@ -3,9 +3,9 @@ name: CI
 on:
   push:
     branches: [main]
-    paths: ['sanmou_assistant/**', 'scripts/**', 'tests/**', 'requirements*.txt', 'pyproject.toml', '.github/workflows/ci.yml']
+    paths: ['sanmou_assistant/**', 'scripts/**', 'tests/**', 'docs/**', 'README.md', 'AGENTS.md', 'requirements*.txt', 'pyproject.toml', '.github/workflows/ci.yml']
   pull_request:
-    paths: ['sanmou_assistant/**', 'scripts/**', 'tests/**', 'requirements*.txt', 'pyproject.toml', '.github/workflows/ci.yml']
+    paths: ['sanmou_assistant/**', 'scripts/**', 'tests/**', 'docs/**', 'README.md', 'AGENTS.md', 'requirements*.txt', 'pyproject.toml', '.github/workflows/ci.yml']
   workflow_dispatch:
 
 permissions:

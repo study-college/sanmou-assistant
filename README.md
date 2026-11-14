@@ -13,7 +13,7 @@
 
 《三国：谋定天下》的 Windows 桌面助手，通过截图识别和 Android 模拟输入读取现场、监控队伍并按配置安排任务。支持单窗口多账号，配置和运行记录保存在使用者本机。
 
-当前源码版本 **0.10.0**。本项目为独立社区项目，与游戏及模拟器厂商没有官方隶属关系；识别与模拟输入可能出错，不保证游戏账号安全。
+当前源码版本 **0.11.0**（本机源码，未打包、未发布；最新公开发行仍为 [0.10.0](https://github.com/study-college/sanmou-assistant/releases/tag/v0.10.0)）。本项目为独立社区项目，与游戏及模拟器厂商没有官方隶属关系；识别与模拟输入可能出错，不保证游戏账号安全。
 
 ## 能做什么
 
@@ -84,14 +84,13 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\start-source.ps1
 .\.venv\Scripts\python.exe scripts/audit_publication.py --repository . --history
 ```
 
-`tests/` 是可独立运行的脱敏测试；`research-tests/` 保留历史图片回归代码，其私有样本没有发布，不属于默认测试集。测试成功不等于所有游戏页面和长期执行已验证。
+`tests/` 是可独立运行的脱敏测试；需要私有样本的历史实机研究测试不进入公开仓库或发行包。测试成功不等于所有游戏页面和长期执行已验证。
 
 ## 结构与构建
 
 ```text
 sanmou_assistant/       界面、识别、调度与识别资源
 tests/                 独立测试
-research-tests/        需要私有样本的历史测试代码
 docs/                  使用说明、版本记录和路线图
 scripts/               源码环境、构建、打包和发布审计
 .github/               CI、手动发行、问题与 PR 模板
@@ -101,7 +100,8 @@ scripts/               源码环境、构建、打包和发布审计
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\build.ps1 -Python .\.venv\Scripts\python.exe
-.\.venv\Scripts\python.exe .\scripts\package_release.py
+# 已脱敏公开源码显式跳过本机匿名映射；维护者本机有映射时省略该参数。
+.\.venv\Scripts\python.exe .\scripts\package_release.py --allow-no-anonymization
 ```
 
 维护者也可手动运行 **Build Windows release**，按已有标签构建并上传 Release；再运行 **Verify Windows release**，完整下载、核对清单并检查打包 exe 的 OCR。两套发行流程不按时间自动运行。提交和 PR 的常规检查使用只读权限，不接管模拟器或游戏。
@@ -110,6 +110,6 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\build.ps1 -Python 
 
 欢迎提供可复现的脱敏反馈、代码与文档改进。先读 [贡献说明](CONTRIBUTING.md) 和 [社区行为准则](CODE_OF_CONDUCT.md)。安全漏洞通过 [私密报告](SECURITY.md) 处理。
 
-仓库和发行包不携带维护者的账号配置、完整游戏截图、数据库、日志或登录凭据；这些运行数据应留在使用者自己的 `data/`。诊断包可能含昵称、坐标、画面和机器路径，分享前请检查。
+仓库和发行包不携带维护者的账号配置、完整游戏截图、数据库、日志或登录凭据；这些运行数据应留在使用者自己的 `data/`。默认安全诊断不含配置、数据库、截图或原始日志；仅显式选择的完整诊断可能含昵称、坐标、画面和机器路径，分享前必须检查。
 
 原创代码与文档使用 [MIT License](LICENSE)。第三方依赖、模型、游戏图形与商标保留各自权利；识别用裁切图不属于 MIT 授权，详见 [第三方说明](THIRD_PARTY_NOTICES.md)。项目不包含游戏或模拟器安装程序。

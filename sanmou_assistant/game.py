@@ -448,6 +448,9 @@ class Game:
             else:
                 self.log(f"打开隐藏后状态为 {state_after}，本轮继续执行", "WARN")
             return state_after
+        except (Stopped, TransportUnavailable):
+            # 停止/断连不是“没认出小眼睛”：原样传播，不能吞掉后当本轮继续。
+            raise
         except GameError:
             raise
         except Exception as exc:
@@ -1145,6 +1148,9 @@ class Game:
                     self.d.control.sleep(.5)
                     image = self.capture()
             return None
+        except (Stopped, TransportUnavailable):
+            # 停止/断连必须原样传播：吞成“读不到”会让 Worker 拿着停止后的画面继续派兵。
+            raise
         except Exception as exc:
             self.log(f"角标读取失败：{exc}", "WARN")
             return None
@@ -1167,14 +1173,25 @@ class Game:
             if not _vcall(self.v, "frame_clear", True, image) or not reader.avatars_visible(image):
                 return {}
             states = {}
+            # 优先批量读：team_markers 提供 read_slots(image, slots) 时一次读出全部槽位；
+            # 旧 reader 只有 read_slot 时回退逐槽读取，保持同一帧上的重伤覆盖。
+            read_slots = getattr(reader, "read_slots", None)
+            markers = read_slots(image, slots) if callable(read_slots) else None
+            if markers is None:
+                markers = {slot: reader.read_slot(image, slot) for slot in slots}
+            elif isinstance(markers, list):
+                markers = {marker["slot"]: marker for marker in markers}
             for slot in slots:
-                marker = reader.read_slot(image, slot)
+                marker = markers.get(slot)
+                if not marker:
+                    continue
                 if marker["state"] in ("idle", "unknown") and _vcall(self.v, "team_wounded", False, image, slot):
                     marker = {**marker, "state": "wounded", "label": state_label("wounded"), "reason": "头像重伤文字"}
                 states[slot] = marker
             return states
-        except Stopped:
-            # 停止/暂停检查穿过整帧读取时要原样抛出，不能被当成“识别失败”吞掉再继续。
+        except (Stopped, TransportUnavailable):
+            # 停止/暂停检查与设备断连穿过整帧读取时必须原样抛出：
+            # 吞成“识别失败”会让 Worker 拿着停止后的画面继续派兵。
             raise
         except GameError:
             raise
@@ -1288,10 +1305,9 @@ class Game:
         page = self.v.page(image)
         if page != "profile":
             self.save_image(image, "profile-unconfirmed", True)
-            try:
-                self.ensure_sandbox()
-            except GameError:
-                pass
+            # 恢复途中 ensure_sandbox 可能抛出异地登录/维护/重连作废等真实错误，
+            # 必须原样传播；吞掉后降级成“本轮不读武勋”会把停止延后一拍。
+            self.ensure_sandbox()
             raise RecognitionUnavailable(f"个人信息页未确认（{page}），本轮不读武勋")
         value, text = _vcall(self.v, "profile_merit", (None, ""), image)
         self.save_image(image, "profile-merit", False)
@@ -1570,7 +1586,9 @@ class Game:
                     self.log(f"{policy.display} 调动页“自动征兵”未能确认已勾选，继续调动", "WARN")
         if kind == "line" and policy.refill_enabled and obs.maximum:
             # 兵力低于出击下限才补（不无条件补满，省辐重）；按钮不存在＝当前补不动。
-            current = self.v.deployment_strength(image, policy.slot)
+            # 少队时卡槽整组居中，必须按真实卡中心读数，不能按固定五列的旧位置。
+            current = self.v.deployment_strength(image, policy.slot,
+                                                 center_x=self.card_center(policy.slot))
             floor = policy.threshold(obs.maximum)
             if current is not None and current < floor:
                 if self.v.refill_button(image) is None:
@@ -1580,7 +1598,8 @@ class Game:
                 if self.v.refill_quota(image) == 0:
                     self.save_image(image, "line-refill-insufficient", True)
                     raise LineRefillUnavailable("一键补兵后区块归零，仍低于出击下限，判定补不动")
-                strength_after = self.v.deployment_strength(image, policy.slot)
+                strength_after = self.v.deployment_strength(image, policy.slot,
+                                                            center_x=self.card_center(policy.slot))
                 if strength_after is not None and strength_after < floor:
                     # 用户 2026-11-13：点了补兵还不到出击线，就回城（下一轮转补兵点/营帐），
                     # 不带残兵出去；回城/撤退/调动需要几分钟，等现场。
@@ -1819,13 +1838,15 @@ class Game:
         按钮是否存在由调用方先行判断；这里只负责点击与回执（补前/补后兵力与区块值）。
         """
         quota = self.v.refill_quota(image)
-        before = self.v.deployment_strength(image, policy.slot)
+        before = self.v.deployment_strength(image, policy.slot,
+                                            center_x=self.card_center(policy.slot))
         button = self.v.refill_button(image)
         self.emit("status", f"{policy.display} · 快速征兵（一键补兵）")
         self.save_image(image, "line-refill-before", True)
         self.d.tap(button[0], button[1], 1.2)
         after = self.capture("line-refill-after", True)
-        strength = self.v.deployment_strength(after, policy.slot)
+        strength = self.v.deployment_strength(after, policy.slot,
+                                              center_x=self.card_center(policy.slot))
         quota_after = self.v.refill_quota(after)
         self.emit("refill", {"team": policy.key, "before": before, "after": strength,
                              "quota": quota, "quota_after": quota_after})
@@ -1892,6 +1913,15 @@ class Game:
             image = self.capture()
             if self.v.page(image) != "deployment" or self.v.checked(image, *checkbox) is not False:
                 raise GameError("自动回城无法确认取消，不提交铺路命令")
+        # 提交前最后一次现场核对（与 _dispatch 同一口径）：观测之后队伍可能已被打，
+        # 卡片明确显示撤退/重伤/战斗/行军等状态时本轮停手，绝不能点出征；unknown 不拦。
+        blocked = self.dispatch_card_block(image, policy)
+        if blocked:
+            self.save_image(image, "pave-team-not-ready", True)
+            self.emit("diagnostic", {"stage": "pave_dispatch_blocked", "team": policy.key,
+                                     "target": name, "status": blocked})
+            self.log(f"{policy.display} / {name}：出征页卡片显示{blocked}，本轮不铺路", "WARN")
+            raise GameError(f"出征页卡片显示{blocked}，本轮不铺路")
         before = self.read_team_marker(image, policy.slot)
         before_state = before["state"] if before else obs.marker_state
         submit_x, submit_y = self.SUBMIT_POINT
@@ -2341,8 +2371,8 @@ class Game:
         if self.j.daily("monthly")[0] == "done":
             self.close_panel(image)
             return False
-        if self.j.pending_daily("monthly"):
-            raise GameError("月卡上次领取结果未确认，请人工核对")
+        if self.j.daily("monthly")[0] == "pending":
+            raise GameError("月卡本周期领取结果未确认，请人工核对")
         cycle = self.j.prepare_daily("monthly", {"panel": body})
         self.d.tap(claim.x, claim.y, .8)
         after = self.capture("monthly-claimed", True)
@@ -2577,8 +2607,8 @@ class Game:
         image = self.capture("event-signin", True)
         button = self.v.find(image, ["免费领取", "签到领取", "立即签到"], (345, 180, 1865, 1030), exact=True)
         if button and commit:
-            if self.j.pending_daily("events"):
-                raise GameError("上次活动领取结果未确认")
+            if self.j.daily("events")[0] == "pending":
+                raise GameError("本周期活动领取结果未确认")
             cycle = self.j.prepare_daily("events", {"button":button.text,"activity":label.text})
             self.d.tap(button.x, button.y, .6)
             after = self.capture("event-result", True)

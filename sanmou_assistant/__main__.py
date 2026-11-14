@@ -21,6 +21,8 @@ def apply_window_identity(app):
     if sys.platform == "win32":
         try:
             import ctypes
+            # 有意保持固定的 0.9 系列标识，不跟随版本号动态变化：Windows 按
+            # AppUserModelID 关联任务栏固定、跳转列表与通知，换标识会被当成新应用。
             ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("SanmouAssistant.Desktop.0.9")
         except (AttributeError, OSError):
             pass
@@ -47,6 +49,7 @@ def main():
     parser.add_argument("--scan", action="store_true", help="只读扫描后退出，结果保存到指定数据目录")
     parser.add_argument("--command", choices=["scan","calibrate","preview","rates","farming","dailies","run","launch","discover","packages","review","return","runtime","pave-reset","diagnostics"])
     parser.add_argument("--output", type=Path, help="diagnostics 诊断压缩包输出路径")
+    parser.add_argument("--include-private", action="store_true", help="diagnostics 导出完整诊断包（含配置、原始日志和截图）；默认导出不含隐私内容的安全诊断包")
     parser.add_argument("--profile", type=Path)
     parser.add_argument("--account-id", help="指定 accounts.json 中的账号；默认使用界面当前账号")
     parser.add_argument("--execute", action="store_true", help="执行已启用的任务；否则只监控")
@@ -64,7 +67,7 @@ def main():
     if args.command == "diagnostics":
         from datetime import datetime
         output = args.output or data / "feedback" / ("三谋诊断-" + datetime.now().strftime("%Y%m%d-%H%M%S") + ".zip")
-        export_diagnostics(data, output)
+        export_diagnostics(data, output, include_private=args.include_private)
         if sys.stdout is not None:
             print(str(output.resolve()))
         return 0
@@ -78,7 +81,7 @@ def main():
         from datetime import datetime
         try:
             path, session_root = profile_location(data, args.profile, args.account_id or "")
-        except (ValueError, StopIteration) as exc:
+        except ValueError as exc:
             parser.error(str(exc) or "指定账号不存在")
         profile = Profile.from_dict(json.loads(path.read_text(encoding="utf-8"))) if path.exists() else Profile()
         command = args.command or "scan"

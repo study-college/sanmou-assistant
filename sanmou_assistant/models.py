@@ -507,6 +507,8 @@ def decide(profile: Profile, policy: TeamPolicy, obs: Observation, grain: Option
         if profile.backup_enabled and backups and grain is not None and grain >= profile.food_low:
             return Decision("transfer", "兵力不足，调动到备用地点征满", backups[0])
         return Decision(reason=f"兵力 {obs.strength} / 出击下限 {policy.threshold(obs.maximum)}，等待补兵")
+    # 有意策略（docs/16、docs/18）：在主城的队伍要求游戏内「回城自动补兵」处于开启状态。
+    # 这条对满兵队伍同样生效——脚本只提示、不替使用者改游戏设置；要打开请去游戏里操作。
     if obs.state == "home" and obs.auto_refill is False:
         return Decision(reason="主城回城自动补兵显示关闭，保留游戏设置")
     if obs.stamina is not None and obs.stamina < policy.stamina:
@@ -577,18 +579,15 @@ def line_target(profile: "Profile", policy: TeamPolicy) -> Optional[Point]:
     return candidates[0] if candidates else None
 
 
-LINE_FALLBACKS = ("recall", "stop")
-
-
 def line_decision(policy: TeamPolicy, obs: Observation, *, target: Optional[Point] = None,
-                  refill_button: bool = False, target_owned: bool = False,
-                  stopped: bool = False) -> Decision:
+                  target_owned: bool = False, stopped: bool = False) -> Decision:
     """拉线模块的单队决策（纯函数，便于用真帧或构造观测做单测）。
 
     用户 2026-11-12 口径：
     - 打赢停留→就地再拉；打输撤回出发点→继续拉；
-    - 兵力低于出击下限：出征页有「一键补兵」就点（主城/营帐都可能出现）；
-      按钮不存在＝当前补不动 → 兜底（回城免费补兵 / 停手）；
+    - 兵力低于出击下限且启用快速征兵→去出征页核对并尝试一键补兵；
+      按钮有无、补不动后的回退（回城免费补兵 / 停手）由 Game._dispatch 抛
+      LineRefillUnavailable、Worker 兜底处理，这里不凭未知按钮提前 recall/stop；
     - 营帐自然征兵到出击线→继续拉；只在手动停时结束。
     """
     if stopped:
@@ -617,13 +616,7 @@ def line_decision(policy: TeamPolicy, obs: Observation, *, target: Optional[Poin
     if low:
         if not policy.refill_enabled:
             return Decision(reason="拉线：兵力低于出击下限，快速征兵未启用，等待自然征兵")
-        if refill_button:
-            return Decision("refill", "拉线：兵力低于出击下限，点一键补兵")
-        if policy.refill_fallback == "stop":
-            return Decision(reason="拉线：补不动且设为停手，记录并等下一轮")
-        if obs.state == "home":
-            return Decision(reason="拉线：主城补不动，等待兵池恢复")
-        return Decision("recall", "拉线：一键补兵按钮不存在，回城免费补兵")
+        return Decision("refill", "拉线：兵力低于出击下限，去出征页核对并尝试一键补兵")
     if target_owned:
         return Decision("line", "拉线：目标已是自有地块，仅行军无战果")
     return Decision("line", f"拉线：向 {point_label(target)} 派出")

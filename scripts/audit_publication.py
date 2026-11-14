@@ -16,6 +16,8 @@ RULES = {
     "private-key": re.compile(rb"-----BEGIN (?:RSA |EC |OPENSSH |ENCRYPTED )?PRIVATE KEY-----[\r\n]+[A-Za-z0-9+/=\r\n]{64,}-----END (?:RSA |EC |OPENSSH |ENCRYPTED )?PRIVATE KEY-----"),
     "api-key": re.compile(rb"(?:sk-proj-[A-Za-z0-9_-]{30,}|AKIA[A-Z0-9]{16})"),
     "personal-windows-home": re.compile(rb"[A-Za-z]:[\\/]+Users[\\/]+(?!Public\b|Default\b|<|example\b|test\b)[A-Za-z0-9_.-]+", re.I),
+    # 本机项目根目录约定；lookbehind 排除 URL 路径段和普通相对目录，MuMu 等公开安装示例不误伤。
+    "local-projects-dir": re.compile(rb"(?<![A-Za-z0-9_/.-])(?:[A-Za-z]:[\\/]+|~[\\/]+|/)Projects[\\/]+[A-Za-z0-9_.-]+", re.I),
 }
 
 

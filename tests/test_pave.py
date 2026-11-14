@@ -528,6 +528,50 @@ def test_pave_dispatch_accepts_when_badge_state_changes(tmp_path):
     assert (1717, 984) in game.d.taps
 
 
+class BlockedCardVision(MarkerVision):
+    """提交前卡片状态明确不可派（撤退/重伤等）：选卡与自动回城核对照常通过。"""
+
+    def __init__(self, status):
+        super().__init__(page_after="deployment", status_after=status)
+        self._card_status = status
+
+    def deployment_status(self, image, slot, center_x=None):
+        self.status_calls += 1
+        return self._card_status
+
+
+def pave_blocked_case(tmp_path, status):
+    image = np.zeros((1080, 1920, 3), np.uint8)
+    image[947:1020, 1580:1860] = (0, 200, 255)
+    game = stub_game(tmp_path, BlockedCardVision(status), image)
+    saved = []
+    game.save_image = lambda img, name, *args: saved.append(name)
+    policy = next(t for t in game.p.teams if t.key == "main:2")
+    obs = observation(policy.key, "outside", (400, 400))
+    ident = game.j.begin_pave(policy.key, "路线A", 0, "攻占 (400,400)", "100,100", "fp")
+    return game, policy, obs, ident, saved
+
+
+def test_pave_dispatch_blocked_by_retreat_card_never_submits(tmp_path):
+    # 2026-11-13 实机教训：观测停留 → 走到目标 → 卡片已是“撤退”，旧代码仍连点出征。
+    game, policy, obs, ident, saved = pave_blocked_case(tmp_path, "retreat")
+    with pytest.raises(GameError, match="撤退"):
+        game.pave_dispatch(policy, obs, (400, 400), ident)
+    assert (1717, 984) not in game.d.taps      # 绝不能点出征
+    assert (385, 880) in game.d.taps           # 选卡点击本身已经发生
+    assert "pave-team-not-ready" in saved      # 拦截留证
+    game.j.close()
+
+
+def test_pave_dispatch_blocked_by_wounded_card_never_submits(tmp_path):
+    game, policy, obs, ident, saved = pave_blocked_case(tmp_path, "wounded")
+    with pytest.raises(GameError, match="重伤"):
+        game.pave_dispatch(policy, obs, (400, 400), ident)
+    assert (1717, 984) not in game.d.taps
+    assert "pave-team-not-ready" in saved
+    game.j.close()
+
+
 def test_low_food_still_settles_completed_pave_without_new_segment(tmp_path):
     worker = make_worker(tmp_path, make_profile([[400,400],[300,300]]))
     seeded(worker, idx=0, status='running')

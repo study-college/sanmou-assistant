@@ -1880,7 +1880,8 @@ class Window(QMainWindow):
         for r in rows:
             t.removeRow(r)
         for r in range(t.rowCount()):
-            item(t,r,6 if t is self.target_table else 4,r+1,False)
+            # 武勋/拉线表顺序在第 6 列，补兵表在第 4 列。
+            item(t,r,6 if self.is_target_like(t) else 4,r+1,False)
 
     def collect(self):
         for target, editor in ((self.target_table,self.target_address),(self.backup_table,self.backup_address),(self.line_table,self.line_address)):
@@ -2088,18 +2089,31 @@ class Window(QMainWindow):
             self.resource_visible = value["visible"]
             self.refresh_resource_age()
         elif kind == "calibrated":
-            self.profile.account = value["account"]
-            self.profile.main_city = Point(**value["main_city"])
+            # 只写回已核实的账号与主城：从当前已保存配置深拷贝，不夹带界面上
+            # 尚未保存的阈值等表单；校验通过并落盘成功后才同步 self.profile/UI。
+            saved = copy.deepcopy(self.profile)
+            saved.account = value["account"]
+            saved.main_city = Point(**value["main_city"])
+            errors = saved.validate()
+            if not errors:
+                try:
+                    if self.account and self.manager:
+                        self.manager.store.save_profile(self.account_id, saved)
+                    else:
+                        atomic_json(self.config_path,saved.to_dict())
+                except OSError as exc:
+                    errors = [f"写入失败：{exc}"]
+            if errors:
+                message = "账号校准结果未保存：" + "；".join(errors)
+                self.status.setText(message)
+                self.append_log({"time":datetime.now().strftime("%H:%M:%S"),"level":"ERROR","message":message})
+                return
+            self.profile = saved
             self.main_address.setText(self.point_address(self.profile.main_city))
             self.account_label.setText(f"{value['account']} · 主城 ({value['main_city']['x']},{value['main_city']['y']})")
             self.metrics["账号与主城"].setText(self.account_label.text())
-            # 不读取尚未保存的其它表单，校验只更新账号字段。
-            saved = self.collect()
-            if self.account and self.manager:
-                self.manager.store.save_profile(self.account_id, saved)
+            if self.manager:
                 self.manager.update_account(self)
-            else:
-                atomic_json(self.config_path,saved.to_dict())
         elif kind == "observation":
             self.observations[value["key"]] = value
             self.team_activity.pop(value["key"], None)
@@ -2174,7 +2188,15 @@ class Window(QMainWindow):
                                        f"状态 {value.get('status','')}"})
             self.refresh_live()
         elif kind == "error":
-            self.nav.setCurrentRow(7)
+            # 故障跳到日志页。Worker 停止时已经发布过同一条 ERROR 日志，
+            # 用最近记录去重：已有对应 ERROR 时只切页、不重复追加；
+            # 只有 error 事件而没有对应日志时，才在这里补记一条。
+            message = str(value)
+            recent = self.log_records[-5:]
+            if not any(record.get("level") == "ERROR" and record.get("message") == message
+                       for record in recent):
+                self.append_log({"time":datetime.now().strftime("%H:%M:%S"),"level":"ERROR","message":message})
+            self.nav.setCurrentRow(self.log_page_index)
 
     def refresh_live(self):
         self.refresh_resource_age()
@@ -2312,6 +2334,10 @@ class Window(QMainWindow):
         if path:
             try:
                 p = Profile.from_dict(json.loads(Path(path).read_text(encoding="utf-8")))
+                # 校验通过才写盘：无效配置不能覆盖当前账号的原配置。
+                errors = p.validate()
+                if errors:
+                    raise ValueError("\n".join(errors))
                 if self.account and self.manager:
                     self.manager.store.save_profile(self.account_id, p)
                 else:
@@ -2362,14 +2388,46 @@ class Window(QMainWindow):
         if self.latest_evidence:
             QDesktopServices.openUrl(QUrl.fromLocalFile(str(Path(self.latest_evidence).resolve())))
 
+    def choose_diagnostics_scope(self):
+        """导出前让用户选诊断范围：返回 "safe" / "full" / None（取消）。测试可整体替换本方法。"""
+        box = QMessageBox(self)
+        box.setWindowTitle("导出问题诊断包")
+        box.setText("安全诊断（默认，不含配置、数据库、截图、原始日志）\n完整诊断（含昵称、坐标、本机路径等敏感信息）")
+        safe = box.addButton("安全诊断", QMessageBox.ButtonRole.AcceptRole)
+        full = box.addButton("完整诊断", QMessageBox.ButtonRole.ActionRole)
+        box.addButton("取消", QMessageBox.ButtonRole.RejectRole)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is safe:
+            return "safe"
+        if clicked is full:
+            return "full"
+        return None
+
+    def confirm_full_diagnostics(self):
+        answer = QMessageBox.question(self,"确认完整诊断",
+            "完整诊断包包含昵称、坐标、本机路径等敏感信息，确认导出？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.No)
+        return answer == QMessageBox.StandardButton.Yes
+
     def export_diagnostics(self):
         from .diagnostics import export_diagnostics
+        scope = self.choose_diagnostics_scope()
+        if scope is None:
+            self.status.setText("已取消导出诊断包")
+            return
+        # 默认安全诊断（后端 include_private=False）；完整诊断必须再次明确确认。
+        include_private = scope == "full"
+        if include_private and not self.confirm_full_diagnostics():
+            self.status.setText("已取消导出诊断包")
+            return
         default = self.data_dir / "feedback" / f"三谋诊断-{datetime.now():%Y%m%d-%H%M%S}.zip"
-        path, _ = QFileDialog.getSaveFileName(self, "导出问题诊断包（含游戏截图、昵称、坐标及本机路径，请核对后再发送）", str(default), "诊断包 (*.zip)")
+        title = "导出完整诊断包（含昵称、坐标及本机路径，请核对后再发送）" if include_private else "导出安全诊断包（不含配置、数据库、截图和原始日志）"
+        path, _ = QFileDialog.getSaveFileName(self, title, str(default), "诊断包 (*.zip)")
         if not path:
             return
         try:
-            export_diagnostics(self.data_dir, Path(path))
+            export_diagnostics(self.data_dir, Path(path), include_private=include_private)
             self.status.setText(f"诊断包已保存：{path}")
             QDesktopServices.openUrl(QUrl.fromLocalFile(str(Path(path).parent)))
         except (OSError, ValueError) as exc:
@@ -2462,8 +2520,9 @@ class AccountManagerWindow(QMainWindow):
         self.account_combo.setCurrentIndex(selected)
         self.account_stack.setCurrentIndex(selected)
         self.select_account(selected)
-        if self.store.migration_error:
-            self.current_window.status.setText(self.store.migration_error)
+        storage_warnings = ([self.store.migration_error] if self.store.migration_error else []) + self.store.load_errors
+        if storage_warnings:
+            self.current_window.status.setText("；".join(storage_warnings))
 
     @property
     def current_window(self):

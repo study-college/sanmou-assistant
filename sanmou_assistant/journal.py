@@ -169,9 +169,12 @@ class Journal:
                                (self.scope, task)).fetchall()
 
     def prepare_daily(self, task: str, evidence: dict) -> str:
-        """Freeze the date before submission; restart or midnight never resubmits an unknown spend."""
+        """Freeze the cycle before submission; recurring rewards isolate cycles, milestones do not reset."""
         cycle = cycle_key(task)
-        if self.pending_daily(task) or self.daily(task, cycle)[0] == 'done':
+        pending = self.pending_daily(task)
+        same_cycle_pending = any(row[0] == cycle for row in pending)
+        one_time_milestone = task.startswith("signin_milestone_") and pending
+        if same_cycle_pending or one_time_milestone or self.daily(task, cycle)[0] == 'done':
             raise RuntimeError(f"{task} 已完成或有待核对记录，禁止重复提交")
         _, count = self.daily(task, cycle)
         data = dict(evidence, created=time.time())

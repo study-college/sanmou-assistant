@@ -180,7 +180,7 @@ def test_diagnostics_include_each_account_profile_session_and_journal(tmp_path):
     (folder / "events.jsonl").write_text(json.dumps({"event": "error", "value": "账号二故障"}), encoding="utf-8")
     Journal(second.sessions_path / "runtime.sqlite", "second-scope").close()
     output = tmp_path / "diagnostics.zip"
-    report = export_diagnostics(tmp_path, output)
+    report = export_diagnostics(tmp_path, output, include_private=True)
     with zipfile.ZipFile(output) as archive:
         names = archive.namelist()
         assert f"accounts/{second.id}/profile.json" in names
@@ -188,6 +188,23 @@ def test_diagnostics_include_each_account_profile_session_and_journal(tmp_path):
         assert f"accounts/{second.id}/journal.json" in names
         assert "账号二故障" in archive.read("report.json").decode("utf-8")
     assert report["account_sessions"][f"accounts/{second.id}/sessions"] == ["20261031-010000"]
+
+    safe_output = tmp_path / "diagnostics-safe.zip"
+    safe_report = export_diagnostics(tmp_path, safe_output)
+    with zipfile.ZipFile(safe_output) as archive:
+        names = archive.namelist()
+        assert f"accounts/{second.id}/profile.json" not in names
+        assert f"accounts/{second.id}/sessions/20261031-010000/events.jsonl" not in names
+        assert f"accounts/{second.id}/journal.json" not in names
+        payload = b"".join(archive.read(name) for name in names)
+        assert "账号二故障".encode("utf-8") not in payload
+        summary = json.loads(archive.read("report.json").decode("utf-8"))
+        assert summary["mode"] == "safe"
+        assert summary["event_counts"]["error"] == 1
+        assert summary["files"][f"accounts/{second.id}/profile.json"] > 0
+        assert summary["files"][f"accounts/{second.id}/sessions/runtime.sqlite"] > 0
+        assert summary["attention"][-1]["event"] == "error"
+    assert safe_report["account_sessions"][f"accounts/{second.id}/sessions"] == ["20261031-010000"]
 
 
 def test_cli_profile_location_uses_selected_or_explicit_account(tmp_path):

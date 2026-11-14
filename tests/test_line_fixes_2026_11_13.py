@@ -528,7 +528,7 @@ def test_line_refill_emits_event_instead_of_calling_missing_publish():
     events = []
     game = Game.__new__(Game)
     game.v = types.SimpleNamespace(refill_quota=lambda img: 3828,
-                                   deployment_strength=lambda img, slot: 26000,
+                                   deployment_strength=lambda img, slot, center_x=None: 26000,
                                    refill_button=lambda img: (1700, 900))
     game.d = types.SimpleNamespace(tap=lambda *args, **kwargs: None)
     game.capture = lambda *args, **kwargs: image

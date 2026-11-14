@@ -54,12 +54,10 @@ def monthly(game, commit=True):
     elif page == 'monthly_claimed':
         if commit:
             pending = game.j.pending_daily('monthly')
-            if pending:
-                for (cycle,) in pending:
-                    if cycle == cycle_key('monthly'):
-                        game.j.finish_daily('monthly', cycle, {'panel': '已领取'})
-            else:
-                game.j.record_daily('monthly', 'done')
+            for (cycle,) in pending:
+                if cycle == cycle_key('monthly'):
+                    game.j.finish_daily('monthly', cycle, {'panel': '已领取'})
+            game.j.record_daily('monthly', 'done')
         game.emit('daily', {'task': 'monthly', 'result': '页面确认今日俸禄已领取'})
     elif getattr(game.v, "monthly_no_card", lambda *_: False)(image):
         # 账号没买月卡：页面只有购买/续费入口。自动跳过，不购买也不领取。
@@ -116,7 +114,7 @@ def signin(game, commit=True):
             scrolled_pending = True
         if count == before.get('count', -2) + 1 and card and card_claimed(game,image,card):
             game.j.finish_daily('signin_day', cycle, {'count_after':count, 'card':'已领取'})
-        else:
+        elif cycle == started_cycle:
             raise GameError('签到上次提交待核对；只读取，不重复领取')
     day_confirmed = game.j.daily('signin_day',started_cycle)[0] == 'done'
     if scrolled_pending and not day_confirmed:
@@ -257,7 +255,7 @@ def reconcile_visit(game, image):
     for task in ('visit_free','visit_half'):
         for (cycle,) in game.j.pending_daily(task):
             if cycle != cycle_key(task):
-                raise GameError('有跨日寻访待核对记录，暂停新增寻访，不重复消费')
+                continue
             before = game.j.daily_context(task,cycle) or {}
             confirmed = (task == 'visit_free' and offer in ('half','other') and gold == before.get('gold_before') and tickets == before.get('tickets_before'))
             if task == 'visit_half':

@@ -17,6 +17,53 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from sanmou_assistant import __version__
 
+TEXT_SUFFIXES = {".py", ".md", ".ps1", ".json", ".toml", ".txt", ".cmd", ".css", ".svg", ".yml"}
+
+
+def load_mapping(path: Path, *, allow_missing: bool) -> dict:
+    """本机脱敏映射缺失时默认失败，避免无声降级；只有已脱敏公开源码构建（CI）才允许显式跳过。"""
+    if path.is_file():
+        mapping = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(mapping, dict) or any(not isinstance(k, str) or not isinstance(v, str) for k, v in mapping.items()):
+            raise ValueError("Anonymization mapping must contain string keys and values")
+        return mapping
+    if allow_missing:
+        return {}
+    raise RuntimeError(
+        f"Missing anonymization mapping: {path}. Create it locally, or pass "
+        "--allow-no-anonymization only when packaging already-anonymized public source (e.g. CI).")
+
+
+def select_tests(root: Path):
+    """依赖本机 artifacts/data 的私有测试不进入公开分发包；只返回可独立运行的公开测试。"""
+    public, private = [], []
+    for path in sorted(list((root / "tests").glob("*.py")) + list((root / "research-tests").glob("*.py"))):
+        text = path.read_text(encoding="utf-8")
+        if path.parent.name == "research-tests" or "artifacts" in text or "data/sessions" in text:
+            private.append(path)
+        else:
+            public.append(path)
+    return public, private
+
+
+def audit_release(stage: Path, mapping: dict):
+    """有 mapping 时对打包文本执行审计；任何 private marker 命中都必须失败。"""
+    if not mapping:
+        return
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from audit_publication import Audit
+    audit = Audit(list(mapping))
+    for path in sorted(stage.rglob("*")):
+        if not path.is_file() or path.suffix.lower() not in TEXT_SUFFIXES:
+            continue
+        relative = path.relative_to(stage)
+        if relative.parts[0] == "app":
+            continue  # PyInstaller 产物由发布 ZIP 审计统一检查路径
+        audit.check(relative.as_posix(), path.read_bytes())
+    if audit.issues:
+        raise RuntimeError("Release package still contains private markers or paths: "
+                           + json.dumps(audit.issues, ensure_ascii=False))
+
 
 def copy_file(source, destination):
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -56,14 +103,14 @@ def assemble(app, output, anonymize=None):
         else:
             copy_file(path, source / "scripts" / name)
     fixture_tests = []
-    for path in sorted(list((ROOT / "tests").glob("*.py")) + list((ROOT / "research-tests").glob("*.py"))):
-        private = path.parent.name == "research-tests" or "artifacts" in path.read_text(encoding="utf-8") or "data/sessions" in path.read_text(encoding="utf-8")
+    public_tests, private_tests = select_tests(ROOT)
+    for path in private_tests:
+        fixture_tests.append(path.name)
+    for path in public_tests:
         public_test = path.read_text(encoding="utf-8")
         for original, anonymous in (anonymize or {}).items():
             public_test = public_test.replace(original, anonymous)
-        text_file(source / ("research-tests" if private else "tests") / path.name, public_test)
-        if private:
-            fixture_tests.append(path.name)
+        text_file(source / "tests" / path.name, public_test)
     for name in dict.fromkeys(("09-user-guide.md", "AGENT-GUIDE.md", "ROADMAP.md", "RELEASE-0.8.1.md", f"RELEASE-{__version__}.md")):
         copy_file(ROOT / "docs" / name, source / "docs" / name)
         public_name = "使用说明.md" if name == "09-user-guide.md" else name
@@ -113,6 +160,7 @@ def assemble(app, output, anonymize=None):
     if python_license.exists():
         copy_file(python_license, license_root / "Python-LICENSE.txt")
     text_file(license_root / "README.txt", "Third-party components retain their own licenses.\nQt/PySide6 libraries are dynamically linked and remain replaceable in app/_internal.\nQt/PySide6 source and license information: https://www.qt.io/qt-for-python and https://download.qt.io/official_releases/QtForPython/\nOCR runtime/model information: https://github.com/RapidAI/RapidOCR\nThis package does not contain MuMu, the game, or user credentials.\n")
+    audit_release(stage, anonymize or {})
     files = []
     for path in sorted(stage.rglob("*")):
         if path.is_file():
@@ -142,10 +190,12 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--app-dir", type=Path, default=ROOT / "dist" / "SanmouAssistant")
     parser.add_argument("--output", type=Path, default=ROOT / "dist" / f"SanmouAssistant-{__version__}-Windows-x64-full")
-    parser.add_argument("--anonymize", type=Path, help="Optional local JSON mapping for private test fixture names; this file is not distributed")
+    parser.add_argument("--anonymize", type=Path, help="本机脱敏映射；显式指定时文件必须存在，且不会进入分发包")
+    parser.add_argument("--allow-no-anonymization", action="store_true",
+                        help="Allow packaging without the local anonymization mapping; only for already-anonymized public source builds (CI)")
     args = parser.parse_args()
-    mapping_path = args.anonymize or ROOT / "artifacts" / "release-anonymization.local.json"
-    mapping = json.loads(mapping_path.read_text(encoding="utf-8")) if mapping_path.is_file() else {}
-    if not isinstance(mapping, dict) or any(not isinstance(k,str) or not isinstance(v,str) for k,v in mapping.items()):
-        raise ValueError("Anonymization mapping must contain string keys and values")
+    if args.anonymize:
+        mapping = load_mapping(args.anonymize, allow_missing=False)
+    else:
+        mapping = load_mapping(ROOT / "artifacts" / "release-anonymization.local.json", allow_missing=args.allow_no_anonymization)
     assemble(args.app_dir.resolve(), args.output.resolve(), mapping)

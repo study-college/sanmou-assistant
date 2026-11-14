@@ -561,3 +561,143 @@ def test_unassigned_pave_routes_do_not_block_start(tmp_path):
     assert window.save()
     window.close()
     app.processEvents()
+
+
+def test_remove_line_rows_keeps_group_actions_and_renumbers(tmp_path):
+    """2026-11-14：拉线表与武勋表同为 target-like，顺序在第 6 列；删除首行/中间行后组、指令、坐标不变，顺序连续。"""
+    from sanmou_assistant.models import Point
+    app = QApplication.instance() or QApplication([])
+    original = Profile(line_targets=[
+        Point(name='甲', x=101, y=201, group='第一组', actions=['march','guard'], priority=1),
+        Point(name='乙', x=102, y=202, group='第二组', actions=['occupy','march'], priority=2),
+        Point(name='丙', x=103, y=203, group='第一组', actions=['attack'], priority=3)])
+    (tmp_path/'active-profile.json').write_text(json.dumps(original.to_dict()), encoding='utf-8')
+    window = Window(tmp_path)
+    t = window.line_table
+    t.selectRow(0)
+    window.remove_row(t)
+    assert [t.item(r,1).text() for r in range(t.rowCount())] == ['乙','丙']
+    assert [t.item(r,6).text() for r in range(2)] == ['1','2'], "顺序仍写第 6 列且连续"
+    assert [t.item(r,4).text() for r in range(2)] == ['第二组','第一组'], "目标组不被顺序号覆盖"
+    assert [t.cellWidget(r,5)._actions for r in range(2)] == [['occupy','march'],['attack']]
+    assert [(t.cellWidget(r,2).value(),t.cellWidget(r,3).value()) for r in range(2)] == [(102,202),(103,203)]
+    window.add_line_target()
+    t.selectRow(1)
+    window.remove_row(t)
+    assert [t.item(r,1).text() for r in range(t.rowCount())] == ['乙','拉线目标 3']
+    assert [t.item(r,6).text() for r in range(2)] == ['1','2']
+    assert [t.item(r,4).text() for r in range(2)] == ['第二组','默认']
+    assert window.save()
+    reloaded = Profile.from_dict(json.loads((tmp_path/'active-profile.json').read_text(encoding='utf-8')))
+    assert [(p.name,p.priority,p.group,p.actions) for p in reloaded.line_targets] == [('乙',1,'第二组',['occupy','march']),('拉线目标 3',2,'默认',['occupy','march'])]
+    window.close(); app.processEvents()
+
+
+def test_error_event_jumps_to_log_page_and_keeps_error_record(tmp_path):
+    """error 事件必须跳到日志页（共 6 页，索引 5），并把内容作为 ERROR 写入日志而不是丢弃。"""
+    app = QApplication.instance() or QApplication([])
+    window = Window(tmp_path)
+    assert window.stack.count() == 6 and window.log_page_index == 5
+    window.nav.setCurrentRow(0)
+    window.handle_event('error', '设备断连：ADB 失去响应')
+    assert window.nav.currentRow() == window.log_page_index
+    assert window.stack.currentIndex() == window.log_page_index
+    assert any(record['level'] == 'ERROR' and 'ADB 失去响应' in record['message'] for record in window.log_records)
+    assert 'ERROR' in window.log_view.toPlainText() and 'ADB 失去响应' in window.log_view.toPlainText()
+    window.close(); app.processEvents()
+
+
+def test_import_config_rejects_invalid_profile_without_overwriting(tmp_path, monkeypatch):
+    """2026-11-14：导入配置先 validate；校验失败不覆盖原配置、不替换窗口，并提示原因。"""
+    import sanmou_assistant.ui as module
+    app = QApplication.instance() or QApplication([])
+    window = Window(tmp_path)
+    window.profile_name.setText('原配置')
+    assert window.save()
+    before = (tmp_path/'active-profile.json').read_text(encoding='utf-8')
+    bad = Profile().to_dict()
+    bad['poll_seconds'] = 5  # 合法 JSON、能解析，但校验必须拒绝
+    bad_path = tmp_path/'bad.json'
+    bad_path.write_text(json.dumps(bad, ensure_ascii=False), encoding='utf-8')
+    monkeypatch.setattr(module.QFileDialog, 'getOpenFileName', lambda *a, **k: (str(bad_path), ''))
+    warnings = []
+    monkeypatch.setattr(module.QMessageBox, 'warning', lambda *a, **k: warnings.append(a))
+    replaced = []
+    monkeypatch.setattr(Window, 'replace_window', lambda self, p: replaced.append(p))
+    window.import_config()
+    assert warnings and warnings[0][1] == '导入失败', "无效导入必须提示"
+    assert '监控间隔' in warnings[0][2]
+    assert not replaced, "校验失败不能替换窗口"
+    assert (tmp_path/'active-profile.json').read_text(encoding='utf-8') == before, "校验失败不能覆盖原配置"
+    window.close(); app.processEvents()
+
+
+def test_calibration_only_writes_verified_account_and_main_city(tmp_path):
+    """2026-11-14：校准只落盘已核实的账号与主城；表单里未保存的阈值不得夹带写入。"""
+    app = QApplication.instance() or QApplication([])
+    window = Window(tmp_path)
+    window.food_low.setValue(800000)
+    window.food_recover.setValue(2000000)
+    assert window.save()
+    window.food_low.setValue(123456)  # 界面上改了但没保存
+    window.handle_event('calibrated', {'account':'新主公','main_city':{'name':'我的主城','x':201,'y':202,'expected_name':'新主公'}})
+    saved = json.loads((tmp_path/'active-profile.json').read_text(encoding='utf-8'))
+    assert (saved['account'], saved['main_city']['x'], saved['main_city']['y']) == ('新主公', 201, 202)
+    assert saved['food_low'] == 800000 and saved['food_recover'] == 2000000, "未保存的阈值不能被校准夹带"
+    assert window.profile.account == '新主公' and window.profile.food_low == 800000
+    assert window.main_address.text() == '新主公(201,202)'
+    window.close(); app.processEvents()
+
+
+def test_calibration_failure_is_logged_and_keeps_saved_file(tmp_path):
+    """校准结果未通过校验时不写盘，保留 ERROR 日志，不静默吞错。"""
+    app = QApplication.instance() or QApplication([])
+    window = Window(tmp_path)
+    assert window.save()
+    before = (tmp_path/'active-profile.json').read_text(encoding='utf-8')
+    window.profile.package = 'bad package!'  # 让校验失败
+    window.handle_event('calibrated', {'account':'新主公','main_city':{'name':'我的主城','x':201,'y':202,'expected_name':'新主公'}})
+    assert (tmp_path/'active-profile.json').read_text(encoding='utf-8') == before, "校验失败不能覆盖已保存配置"
+    assert any(record['level'] == 'ERROR' and '未保存' in record['message'] for record in window.log_records)
+    assert '未保存' in window.status.text()
+    window.close(); app.processEvents()
+
+
+def test_export_diagnostics_safe_by_default_and_full_requires_confirmation(tmp_path, monkeypatch):
+    """2026-11-14：诊断导出默认安全（include_private=False）；完整诊断必须二次确认，取消或拒绝都不导出。"""
+    import sanmou_assistant.ui as module
+    app = QApplication.instance() or QApplication([])
+    window = Window(tmp_path)
+    calls = []
+    monkeypatch.setattr('sanmou_assistant.diagnostics.export_diagnostics',
+                        lambda data, destination, include_private=False: calls.append((data, destination, include_private)))
+    monkeypatch.setattr(module.QFileDialog, 'getSaveFileName', lambda *a, **k: (str(tmp_path/'diag.zip'), ''))
+    opened = []
+    monkeypatch.setattr(module.QDesktopServices, 'openUrl', lambda url: opened.append(url) or True)
+    monkeypatch.setattr(Window, 'choose_diagnostics_scope', lambda self: 'safe')
+    window.export_diagnostics()
+    assert [call[2] for call in calls] == [False], "默认安全诊断"
+    monkeypatch.setattr(Window, 'choose_diagnostics_scope', lambda self: 'full')
+    monkeypatch.setattr(Window, 'confirm_full_diagnostics', lambda self: True)
+    window.export_diagnostics()
+    assert [call[2] for call in calls] == [False, True], "完整诊断确认后按完整导出"
+    monkeypatch.setattr(Window, 'confirm_full_diagnostics', lambda self: False)
+    window.export_diagnostics()
+    assert [call[2] for call in calls] == [False, True], "完整诊断未再次确认不导出"
+    monkeypatch.setattr(Window, 'choose_diagnostics_scope', lambda self: None)
+    window.export_diagnostics()
+    assert len(calls) == 2, "取消选择不导出"
+    window.close(); app.processEvents()
+
+
+def test_confirm_full_diagnostics_requires_yes(tmp_path, monkeypatch):
+    """完整诊断的二次确认只有明确点是才算数，默认按钮为否。"""
+    import sanmou_assistant.ui as module
+    from PySide6.QtWidgets import QMessageBox
+    app = QApplication.instance() or QApplication([])
+    window = Window(tmp_path)
+    monkeypatch.setattr(module.QMessageBox, 'question', lambda *a, **k: QMessageBox.StandardButton.No)
+    assert window.confirm_full_diagnostics() is False
+    monkeypatch.setattr(module.QMessageBox, 'question', lambda *a, **k: QMessageBox.StandardButton.Yes)
+    assert window.confirm_full_diagnostics() is True
+    window.close(); app.processEvents()

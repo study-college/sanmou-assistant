@@ -69,3 +69,39 @@ def test_tls_key_delimiters_are_not_mistaken_for_a_private_key(tmp_path):
     result = subprocess.run(command, capture_output=True, text=True)
     assert result.returncode == 1
     assert json.loads(result.stdout)["issues"] == [{"path": "sample.txt", "rule": "private-key"}]
+
+
+def test_local_projects_path_is_flagged_but_public_install_paths_pass(tmp_path):
+    root = tmp_path / "source"
+    root.mkdir()
+    private_path = "F" + ":\\Projects\\example-project"
+    (root / "notes.md").write_text(
+        f"项目位于 {private_path}；模拟器在 D:\\Program Files\\Netease\\MuMu；"
+        "公开示例 C:\\Users\\Public\\MuMu 与 https://example.com/Projects/demo 不算隐私。\n", "utf-8")
+    result = subprocess.run([sys.executable, str(SCRIPT), "--repository", str(root)], capture_output=True, text=True)
+    assert result.returncode == 1
+    assert json.loads(result.stdout)["issues"] == [{"path": "notes.md", "rule": "local-projects-dir"}]
+
+
+def test_posix_and_home_projects_paths_are_flagged(tmp_path):
+    root = tmp_path / "source"
+    root.mkdir()
+    posix_path = "/" + "Projects/example-project"
+    home_path = "~/" + "Projects/example-project"
+    (root / "posix.md").write_text(f"cd {posix_path}\n", "utf-8")
+    result = subprocess.run([sys.executable, str(SCRIPT), "--repository", str(root)], capture_output=True, text=True)
+    assert result.returncode == 1
+    assert json.loads(result.stdout)["issues"] == [{"path": "posix.md", "rule": "local-projects-dir"}]
+    (root / "posix.md").write_text(f"cd {home_path}\n", "utf-8")
+    result = subprocess.run([sys.executable, str(SCRIPT), "--repository", str(root)], capture_output=True, text=True)
+    assert result.returncode == 1
+    assert json.loads(result.stdout)["issues"] == [{"path": "posix.md", "rule": "local-projects-dir"}]
+
+
+def test_relative_projects_segment_is_not_a_local_path(tmp_path):
+    root = tmp_path / "source"
+    root.mkdir()
+    (root / "clean.md").write_text(
+        "参见 docs/Projects/notes 与 https://example.com/Projects/demo；MuMu 装在 D:\\Program Files\\Netease\\MuMu。\n", "utf-8")
+    result = subprocess.run([sys.executable, str(SCRIPT), "--repository", str(root)], capture_output=True, text=True)
+    assert result.returncode == 0, result.stdout

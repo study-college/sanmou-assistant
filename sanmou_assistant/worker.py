@@ -68,6 +68,7 @@ class Worker(QThread):
     MERIT_INTERVAL = 1800
     # 拉线兵力缓存的刷新间隔：忙/可派且要按出击线判断时，超过这个秒数就完整读一次。
     LINE_STRENGTH_TTL = 180
+    EVENT_HISTORY_LIMIT = 2000
 
     def __init__(self, profile: Profile, folder: Path, command="scan", dry_run=True, max_orders=0, duration=0):
         super().__init__()
@@ -131,6 +132,8 @@ class Worker(QThread):
             with (self.folder / "events.jsonl").open("a", encoding="utf-8") as f:
                 f.write(json.dumps({"at":datetime.now().isoformat(), "event":kind, "value":value}, ensure_ascii=False)+"\n")
             self.published.append({"event": kind, "value": value})
+            if len(self.published) > self.EVENT_HISTORY_LIMIT:
+                del self.published[:-self.EVENT_HISTORY_LIMIT]
         self.event.emit(kind, value)
 
     def pause(self, value: bool):
@@ -688,16 +691,16 @@ class Worker(QThread):
                 self.journal.set_phase(policy.key,"")
             elif obs.state in ("marching", "returning", "guarding", "wounded"):
                 self.journal.finish(ident,"accepted","后续实时观测确认队伍已行动/重伤返回")
-                self.journal.set_phase(policy.key,"backup" if kind == "transfer" else "returning" if kind == "return" else "bandits" if kind == "bandits" else "guarding" if obs.state == "guarding" and kind == "merit" else "merit")
-            elif kind in ("merit", "transfer", "bandits") and obs.state in ("outside", "recruiting") and obs.strength is not None and obs.wounded is False:
+                self.journal.set_phase(policy.key,"backup" if kind == "transfer" else "returning" if kind == "return" else "bandits" if kind == "bandits" else "line" if kind == "line" else "guarding" if obs.state == "guarding" and kind == "merit" else "merit")
+            elif kind in ("merit", "transfer", "bandits", "line") and obs.state in ("outside", "recruiting") and obs.strength is not None and obs.wounded is False:
                 self.journal.finish(ident,"accepted","实时队伍详情确认已在城外到达或征兵")
-                self.journal.set_phase(policy.key,"backup" if kind == "transfer" else "bandits" if kind == "bandits" else "merit")
+                self.journal.set_phase(policy.key,"backup" if kind == "transfer" else "bandits" if kind == "bandits" else "line" if kind == "line" else "merit")
             elif kind != "pave" and obs.state == "home" and obs.strength is not None and obs.wounded is False and time.time()-created >= self.profile.retry_seconds:
                 # 讨贼加入成功会让队伍立刻出城；冷却后仍在主城说明未提交（如满员未消耗），
                 # 结清为 rejected 允许重试，不再永久锁定该队。
                 self.journal.finish(ident,"rejected","冷却后现场确认在主城，没有未结束的出征")
                 game.log(f"{policy.display} 的未确认命令已核对：队伍仍在主城，下一轮按策略自动重试","INFO")
-        if obs.state == "home" and self.journal.phase(policy.key) in ("backup", "returning", "bandits", "guarding"):
+        if obs.state == "home" and self.journal.phase(policy.key) in ("backup", "returning", "bandits", "guarding", "line"):
             self.journal.set_phase(policy.key, "")
         return obs
 
@@ -1331,6 +1334,18 @@ class Worker(QThread):
             self.control.checkpoint()
             if policy.group != "main" or not self.team_present(policy.key):
                 continue
+            if self.journal.pending(policy.key):
+                # 有未结清订单先按真实现场结清（observe_team 是通用结清入口）；
+                # 拉线的整帧角标/轻量快照会绕过它，不能直接跳过把订单永久锁住。
+                # 这一步放在“无目标/已完成/冷却跳过”之前：无目标时也必须先恢复 pending。
+                settled = self.observe_team(game, policy)
+                if settled is not None and settled.strength is not None and settled.maximum is not None:
+                    self.line_snapshot[policy.key] = (settled.strength, settled.maximum, time.time())
+                else:
+                    # 没读到新兵力就作废旧缓存，避免拿过期读数做出击线判定。
+                    self.line_snapshot.pop(policy.key, None)
+                if self.journal.pending(policy.key):
+                    continue
             if policy.key in self.line_finished:
                 continue
             target = line_target(self.profile, policy)
@@ -1340,7 +1355,7 @@ class Worker(QThread):
                               f"请在「目标与铺路 → 拉线目标」添加坐标并勾选启用，本队跳过",
                               every=1800)
                 continue
-            if self.journal.pending(policy.key) or time.time() < self.retry_at.get(f"line:{policy.key}", 0):
+            if time.time() < self.retry_at.get(f"line:{policy.key}", 0):
                 continue
             if food_recovery:
                 self.publish("decision", {"team": policy.key, "action": "wait",
@@ -1420,12 +1435,8 @@ class Worker(QThread):
                 self._line_transfer_backup(game, policy, obs)
                 continue
             decision = line_decision(policy, obs, target=target,
-                                     refill_button=bool(policy.refill_enabled),
                                      stopped=self.control.stop.is_set())
             self.publish("decision", {"team": policy.key, "action": decision.action, "reason": decision.reason})
-            if decision.action == "recall":
-                self._line_fallback(game, policy, obs)
-                continue
             if decision.action not in ("line", "refill"):
                 continue
             # 动作顺序完全按目标自己的配置（和刷武勋目标一样），不再写死攻占/行军。
@@ -1478,8 +1489,11 @@ class Worker(QThread):
                      f"等待兵力恢复后再启动", "WARN")
             self.publish("decision", {"team": policy.key, "action": "transfer",
                                       "reason": f"拉线任务结束：最后一次调动到 {point.name}"})
+        # 未拥有的拉线队（本赛季没有该槽位）不参与“还有谁没完成”的判定：
+        # 配置 5 队实际 2 队时，实际两队都完成就允许停止，不能被不存在的槽位拖住。
         remaining = [p.display for p in self.profile.teams
-                     if p.role == "line" and p.group == "main" and p.key not in self.line_finished]
+                     if p.role == "line" and p.group == "main"
+                     and self.team_present(p.key) and p.key not in self.line_finished]
         if remaining:
             self.publish("status", f"{policy.display} 拉线结束；继续 {'、'.join(remaining)}")
             return

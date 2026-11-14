@@ -78,6 +78,9 @@ class Vision:
     # 地块动作菜单的搜索范围与图标命中阈值（1920×1080 实机标定）。
     ACTION_MENU_BOX = (1050, 120, 1750, 950)
     ACTION_ICON_MIN = .85
+    # page 识别路径的共享存储置信度：page 各检查的最低消费置信度就是 .62，
+    # 帧内共享统一按 .62 存储，调用方再按自己的 minimum 过滤，结果与直接识别一致。
+    PAGE_STORE_MINIMUM = .62
 
     def __init__(self, control=None):
         self.checkpoint = control.checkpoint if control is not None else lambda: None
@@ -108,6 +111,8 @@ class Vision:
         self.page_cache = OrderedDict()
         self.line_cache = OrderedDict()
         self.saw_text = False
+        # page() 识别期间的帧内共享上下文；只在一次 _page 调用内存活，结束/异常即清空。
+        self._page_ctx = None
         self.emit = lambda kind, value: None
         # 右下角“隐藏”小眼睛：眼睛=可见，带斜杠=隐藏已开启（实机 2026-11-02 校准）。
         self.hide_eye_box = (1548, 108, 1618, 176)
@@ -178,6 +183,25 @@ class Vision:
     def read(self, image: np.ndarray, rect: tuple = (0, 0, 1920, 1080), minimum: float = .62, scale: float = 1) -> list[Text]:
         self.checkpoint()
         x0, y0, x1, y1 = rect
+        # page() 识别帧内共享：同一帧里先扫过的较大区域，其包含的小区域直接过滤共享结果，
+        # 不再重复 OCR（标题/底栏/中央弹层各检查互相重叠）。共享只发生在一次 _page 调用内，
+        # 且一律按 PAGE_STORE_MINIMUM 存储、按调用方 minimum 过滤，坐标保持原图映射。
+        ctx = getattr(self, "_page_ctx", None)
+        if (ctx is not None and scale == 1 and image is ctx["image"]
+                and image.shape[:2] == (1080, 1920)
+                and getattr(getattr(self.ocr, "text_det", None), "limit_side_len", None) == ctx["limit"]):
+            stored = None
+            for region, spans in ctx["regions"]:
+                if region[0] <= x0 and region[1] <= y0 and x1 <= region[2] and y1 <= region[3]:
+                    stored = spans
+                    break
+            if stored is None:
+                stored = tuple(self._scan_region(image, rect))
+                ctx["regions"].append((rect, stored))
+            found = [t for t in stored if t.score >= minimum and x0 <= t.x <= x1 and y0 <= t.y <= y1]
+            if found:
+                self.saw_text = True
+            return list(found)
         crop = image[y0:y1, x0:x1]
         if not crop.size:
             return []
@@ -207,6 +231,56 @@ class Vision:
         self.cache[key] = tuple(spans)
         if len(self.cache) > 96:
             self.cache.popitem(last=False)
+        return spans
+
+    def _page_headers(self, image) -> list[Text]:
+        """顶部左右两条固定标题区合成一张图一次识别；坐标映射回原图。
+
+        两条高度相同（0–175），上下叠放、中间垫 4 行黑边防止检测框跨缝；
+        上半是左条 (0,0,450,175)，下半是右条 (750,0,1190,175)。
+        """
+        gap = np.zeros((4, 450, 3), np.uint8)
+        right = image[0:175, 750:1190]
+        if right.shape[1] < 450:
+            right = np.hstack([right, np.zeros((175, 450 - right.shape[1], 3), np.uint8)])
+        stacked = np.vstack([image[0:175, 0:450], gap, right])
+        results, _ = self.ocr(stacked, use_cls=False)
+        self.checkpoint()
+        spans = []
+        for box, label, score in results or []:
+            if score < self.PAGE_STORE_MINIMUM:
+                continue
+            b = np.asarray(box)
+            x0, y0 = float(b[:, 0].min()), float(b[:, 1].min())
+            x1, y1 = float(b[:, 0].max()), float(b[:, 1].max())
+            if (y0 + y1) / 2 >= 175:  # 中心在下半：平移回原图右条位置，框顶抬到条内
+                y0, y1 = max(y0 - 179, 0), max(y1 - 179, 0)
+                x0, x1 = x0 + 750, x1 + 750
+            else:  # 中心在上半（含跨缝框）：按左条处理，框底压回条内
+                y1 = min(y1, 175)
+            spans.append(Text(label.strip(), float(score), (x0 + x1) / 2, (y0 + y1) / 2,
+                              (x0, y0, x1, y1)))
+        if spans:
+            self.saw_text = True
+        return spans
+
+    def _scan_region(self, image, rect) -> list[Text]:
+        """page 帧内共享的原始识别：按 PAGE_STORE_MINIMUM 存储，坐标映射回原图。"""
+        x0, y0, x1, y1 = rect
+        crop = image[y0:y1, x0:x1]
+        if not crop.size:
+            return []
+        results, _ = self.ocr(crop, use_cls=False)
+        self.checkpoint()
+        spans = []
+        for box, label, score in results or []:
+            if score < self.PAGE_STORE_MINIMUM:
+                continue
+            b = np.asarray(box)
+            left, top = float(b[:, 0].min() + x0), float(b[:, 1].min() + y0)
+            right, bottom = float(b[:, 0].max() + x0), float(b[:, 1].max() + y0)
+            spans.append(Text(label.strip(), float(score), (left + right) / 2, (top + bottom) / 2,
+                              (left, top, right, bottom)))
         return spans
 
     def joined(self, image, rect=(0, 0, 1920, 1080)) -> str:
@@ -472,8 +546,12 @@ class Vision:
             if original is not None:
                 detector.limit_side_len = 128
             self.saw_text = False
+            # 帧内共享上下文只覆盖这一次识别：帧对象、检测限长和带结果都按本次识别重建，
+            # 结束或异常立即清空，绝不跨帧/跨次复用（含 480 复核是独立的一次识别）。
+            self._page_ctx = {"image": image, "limit": getattr(detector, "limit_side_len", None), "regions": []}
             result = self._page(image)
         finally:
+            self._page_ctx = None
             if original is not None:
                 detector.limit_side_len = original
         # 一帧里连一个字都没读到（切页动画、黑屏）时原精度复核也读不出页型，
@@ -483,8 +561,10 @@ class Vision:
         if result == "unknown" and verify and original is not None and self.saw_text:
             try:
                 detector.limit_side_len = min(int(original), self.FALLBACK_DETECT_LIMIT)
+                self._page_ctx = {"image": image, "limit": getattr(detector, "limit_side_len", None), "regions": []}
                 result = self._page(image)
             finally:
+                self._page_ctx = None
                 detector.limit_side_len = original
         self.checkpoint()
         # 未复核的 unknown 不进缓存：同一帧之后若需要严格识别，还要能真正复核一次。
@@ -517,8 +597,18 @@ class Vision:
         # 左侧竖排艺术字无法稳定 OCR；使用右侧两处横排栏目与批复按钮共同核对。
         if self.war_summary_button(image):
             return "war_summary"
-        # 大横条会触发 OCR 的单行模式，把标题与右侧场景混在一起；分开读两处固定标题区。
-        header = self.joined(image, (0, 0, 450, 175)) + " | " + self.joined(image, (750, 0, 1190, 175))
+        # 出征页有选队提示、提交按钮和卡片状态三重独立证据，先命中就不必再为
+        # 其他页型识别标题和建筑列表；模态、断线、聊天与渠道仍在前面优先判断。
+        if self.deploy_button_enabled(image):
+            selection = self.find(image, ["请选择出征部队", "选择部队自动铺路"], (475, 675, 1265, 760))
+            rested_selection = self.find(image, ["休整状态"], (475, 675, 1265, 760)) and self.find(image, ["调动", "攻城", "攻占", "驻守", "行军"], (750, 20, 1190, 125), exact=True)
+            if selection or rested_selection:
+                if self.find(image, ["出征", "出证"], (1540, 932, 1895, 1036), exact=True):
+                    if any(self.deployment_status(image, slot) != "unknown" for slot in range(1, 6)):
+                        return "deployment"
+        # 顶部左右两条固定标题区：直接合成一张图一次识别（中间垫黑行防跨缝粘连），
+        # 避免宽带整读把标题与资源栏粘成大框，也比两条分开识别省一次调用。
+        header = " | ".join(t.text for t in self._page_headers(image))
         if "征兵" in header or "证兵" in header:
             settings = self.joined(image, (1230, 220, 1800, 290)).replace(" ", "")
             if "部队征兵设置" in settings or "部队证兵设置" in settings:
@@ -569,20 +659,24 @@ class Vision:
             cards = self.joined(image, (0, 710, 1160, 800))
             if all(name in cards for name in ("君王殿", "民居", "征兵所")):
                 return "city_buildings"
-        # 动态地图会把“攻城”与玩家名合并。改用选队提示、提交按钮和队伍卡片共同确认。
-        # 目标不与连接地相邻时，攻占页会切换成“选择部队自动铺路”，它仍是出征页。
+        # 非黄色按钮或快速通道未命中时仍走完整判定，灰色“出征不可用”也属于出征页。
         selection = self.find(image, ["请选择出征部队", "选择部队自动铺路"], (475, 675, 1265, 760))
-        # 选中有休整层数的队伍后，选择提示会被休整说明替换。
         rested_selection = self.find(image, ["休整状态"], (475, 675, 1265, 760)) and self.find(image, ["调动", "攻城", "攻占", "驻守", "行军"], (750, 20, 1190, 125), exact=True)
         if selection or rested_selection:
             if self.find(image, ["出征", "出证"], (1540, 932, 1895, 1036), exact=True):
                 if any(self.deployment_status(image, slot) != "unknown" for slot in range(1, 6)):
                     return "deployment"
         # 土地详情能遮住资源栏；沙盘还需用底部导航及右侧队伍页码交叉确认。
-        bottom = " | ".join(self.joined(image, r) for r in ((20,930,430,1075),(700,940,1000,1075),(1000,940,1450,1075),(1450,940,1915,1075)))
+        # 左条与上方聊天面板同帧共享一次识别（见 chat_close_point）；判读底栏时只看
+        # y≥930 的导航行，与旧左条 (20,930,430,1075) 口径一致，避免聊天内容里的
+        # 「前往」被误判成世界地图按钮。右条含武将/同盟/职业/征战/寻访导航。
+        left_zone = self.read(image, (0, 885, 430, 1075))
+        bottom = " | ".join(t.text for t in left_zone if t.y >= 930)
+        bottom += " | " + self.joined(image, (700, 930, 1915, 1075))
         if "前往" in bottom:
             return "worldmap"
-        # 出城与聊天文字相邻；独立核对按钮，避免拥挤文字漏检或聊天中同词误判。
+        # 出城与聊天文字相邻；独立核对按钮（左侧条已扫，这里只过滤共享结果），
+        # 避免拥挤文字漏检或聊天中同词误判。
         if self.find(image, ["出城"], (15, 1000, 180, 1075), exact=True):
             return "city"
         if sandbox_hud(bottom, self.sandbox_badge(image)):
@@ -835,7 +929,9 @@ class Vision:
         `继续进攻` 初始是灰色倒计时按钮，倒计时未走完点了是点空，调用方必须等待。
         返回 {continue_point, avoid_point, checkbox, countdown}；读不齐返回 None。
         """
-        title = self.joined(image, (300, 130, 1650, 250)).replace(" ", "")
+        # 左缘到 140：同帧寻访结果页「招贤纳士」标题与战事批复栏目也在这条带内，
+        # 一次识别供多处检查共享。
+        title = self.joined(image, (140, 130, 1650, 250)).replace(" ", "")
         if "强盛" not in title or "三思" not in title:
             return None
         avoid = self.find(image, ["暂且避让"], (750, 875, 1000, 965), exact=True)
@@ -877,7 +973,11 @@ class Vision:
                 "countdown": countdown}
 
     def chat_close_point(self, image):
-        if not self.find(image, ["前往好友"], (0, 885, 250, 972), exact=True):
+        # 左下聊天条与底部左侧导航条同帧共享一次识别：这里先扫合并条，
+        # 再按聊天面板原矩形过滤，保持「前往好友」只认面板内的判据。
+        zone = [t for t in self.read(image, (0, 885, 430, 1075))
+                if 0 <= t.x <= 250 and 885 <= t.y <= 972]
+        if not self.find_in(zone, ["前往好友"], exact=True):
             return None
         if not self.find(image, ["发送"], (960, 970, 1660, 1065), exact=True):
             return None
@@ -897,7 +997,8 @@ class Vision:
     def connection_prompt(self, image):
         """断线正文和独立重连按钮共同成立；异地登录优先停止。"""
         # 正文与按钮分区；普通沙盘没有断线正文时不扫描整片动态地图。
-        spans = self.read(image, (550,350,1370,600), minimum=.85)
+        # 矩形上缘与下方二次确认弹窗的「提示」标题对齐，使同帧多次检查共享一次识别。
+        spans = self.read(image, (550,345,1370,600), minimum=.85)
         body = "".join(t.text.replace(" ", "") for t in sorted(spans,key=lambda t:(t.y,t.x)))
         if "服务器维护" in body and self.find(image, ["回到登录"], (650, 600, 1300, 820), exact=True):
             return "maintenance", None
@@ -963,11 +1064,14 @@ class Vision:
                 return CityFarmSelection(f"{level}级农田", level, first, int(match[1]))
         return None
 
-    def deployment_strength(self, image, slot):
+    def deployment_strength(self, image, slot, center_x=None):
+        # 少队时卡片整组居中：调用方给了真实卡中心就按中心定位兵力数字窗
+        # （实机 2026-11-08 两队帧标定：数字中心 = 卡中心 + 60.5，窗口宽 109 与旧一致），
+        # 没给保持旧五列固定偏移；双阈值一致校验不变。
         if not 1 <= slot <= 5:
             return None
-        offset = (slot-1)*249
-        hsv = cv2.cvtColor(image[968:1006,145+offset:254+offset],cv2.COLOR_BGR2HSV)
+        left = 145 + (slot-1)*249 if center_x is None else round(center_x) + 6
+        hsv = cv2.cvtColor(image[968:1006,left:left+109],cv2.COLOR_BGR2HSV)
         readings = []
         for saturation,value in ((65,150),(80,140)):
             white = cv2.inRange(hsv,(0,0,value),(179,saturation,255))
@@ -1217,6 +1321,8 @@ class Vision:
 
         2026-11-12 实测（session-04）：表头「消耗辎重」，值 3828 → 点击后 0；
         必须与选中队伍同帧读取，禁止跨队缓存。
+        表头在但数值读不到＝没识别出来，同样返回 None：0 只能来自明确识别到的
+        数字 0。调用方只把 ==0 判为额度归零，OCR 抖动因此不会触发回城。
         """
         header = self.find(image, ["消耗辎重", "消耗辐重"], (1260, 890, 1580, 940), exact=False)
         if header is None:
@@ -1225,8 +1331,8 @@ class Vision:
             text = span.text.replace(" ", "").replace(",", "")
             if re.fullmatch(r"\d{1,6}", text):
                 return int(text)
-        # 表头在但数值读不到 = 区块已归零（点击后额度用尽，用户 2026-11-12 实测）。
-        return 0
+        # 表头在但数值读不到＝未识别（含数值被遮挡/涂灰的帧），不是“区块归零”。
+        return None
 
     def full_team(self, image: np.ndarray, key: str) -> Observation:
         obs = Observation(key)
