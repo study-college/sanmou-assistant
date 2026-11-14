@@ -719,7 +719,7 @@ class Window(QMainWindow):
         row = QHBoxLayout()
         row.setSpacing(8)
         self.metrics = {}
-        for name, value in (("游戏连接", "未连接"), ("粮食库存", "待识别"), ("账号与主城", "未校验"), ("本次出征", "0"), ("本次武勋", "待读取"), ("本次铺路", "—")):
+        for name, value in (("游戏连接", "未连接"), ("粮食库存", "待识别"), ("账号与主城", "未校验"), ("本次出征", "0"), ("本次武勋", "待读取")):
             chip = QFrame()
             chip.setObjectName("metric")
             inner = QHBoxLayout(chip)
@@ -878,6 +878,26 @@ class Window(QMainWindow):
         except (OSError, ValueError):
             return {}
 
+    def track_widths(self, name, widget):
+        """记忆一张表的列宽：重开时恢复上次拖动结果，拖动结束后防抖写 ui-state.json。
+
+        每张表一个独立键（live/teams/targets/backups/lines/pave），共用全应用同一份
+        ui-state.json，不按账号另造文件；没有记录、记录损坏或列数变化时保持当前默认。
+        """
+        defaults = [widget.columnWidth(c) for c in range(widget.columnCount())]
+        saved = self.saved_widths(name, defaults)
+        if saved:
+            for column, width in enumerate(saved):
+                widget.setColumnWidth(column, width)
+        if not hasattr(self, "_width_timers"):
+            self._width_timers = {}
+        timer = QTimer(self)
+        timer.setSingleShot(True)
+        timer.setInterval(400)
+        timer.timeout.connect(lambda: self.save_widths(name, widget))
+        self._width_timers[name] = timer
+        widget.horizontalHeader().sectionResized.connect(lambda *args: timer.start())
+
     def restore_splitter(self, key, splitter, defaults):
         """恢复上次拖动过的分区比例；没有记录时按窗口大小给默认值。"""
         value = self.load_ui_state().get("split-" + key)
@@ -916,15 +936,16 @@ class Window(QMainWindow):
         self.update_hidden_hint()
 
     def make_teams(self):
-        layout = self.page("部队任务", "每支队伍只做一件事：刷武勋、讨贼或铺路。第一次先点“读取全部队伍”确认本次实际有几队；没有的槽位会自动锁住，保留配置但不读取、不派兵。", scroll=False)
+        layout = self.page("部队任务", "每支队伍只做一件事：刷武勋、讨贼、铺路或拉线；暂时不用的选“空闲”，仍会显示并监控，只是不派单。第一次先点“读取全部队伍”确认本次实际有几队；没有的槽位会自动锁住，保留配置但不读取、不派兵。", scroll=False)
         self.team_table = table(["显示", "队伍", "任务", "兵力方式", "出击下限", "体力", "补给", "目标组 / 补兵点", "快速征兵", "回城自动补兵"])
         header = self.team_table.horizontalHeader()
         header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
         header.setStretchLastSection(True)
         header.setMinimumSectionSize(44)
         self.team_table.verticalHeader().setDefaultSectionSize(46)
-        for i, w in enumerate((52, 100, 235, 105, 100, 62, 62, 88, 78, 108)):
+        for i, w in enumerate((52, 100, 360, 105, 100, 62, 62, 88, 78, 108)):
             self.team_table.setColumnWidth(i, w)
+        self.track_widths("teams", self.team_table)
         f, inner = card("队伍安排", "点“详情”配置目标组和补兵点顺序；不用的队伍可在运行总览里隐藏")
         inner.addWidget(self.team_table, 1)
         layout.addWidget(f, 1)
@@ -954,15 +975,15 @@ class Window(QMainWindow):
     def role_cell(self, t, r):
         holder = QWidget()
         row = QHBoxLayout(holder)
-        row.setContentsMargins(8, 0, 6, 0)
-        row.setSpacing(10)
+        row.setContentsMargins(6, 0, 4, 0)
+        row.setSpacing(8)
         if t.group != "main":
             label = QLabel("暂不参与")
             label.setObjectName("muted")
             row.addWidget(label)
             row.addStretch()
             return holder
-        for role, text in (("merit", "刷武勋"), ("bandits", "讨贼"), ("pave", "铺路"), ("line", "拉线")):
+        for role, text in (("merit", "刷武勋"), ("bandits", "讨贼"), ("pave", "铺路"), ("line", "拉线"), ("idle", "空闲")):
             button = QRadioButton(text)
             button.setProperty("role", role)
             button.clicked.connect(lambda checked=False, row=r, role=role: self.team_role_clicked(row, role))
@@ -1173,6 +1194,7 @@ class Window(QMainWindow):
             header.setSectionResizeMode(column,QHeaderView.ResizeMode.Interactive)
             self.target_table.setColumnWidth(column,width)
         header.setSectionResizeMode(5,QHeaderView.ResizeMode.Stretch)
+        self.track_widths("targets", self.target_table)
         self.target_address = self.shared_address_row(layout, self.target_table)
         layout.addWidget(self.target_table, 1)
         self.target_order_buttons = self.point_order_row(layout,self.target_table)
@@ -1201,6 +1223,7 @@ class Window(QMainWindow):
             header.setSectionResizeMode(column,QHeaderView.ResizeMode.Interactive)
             self.line_table.setColumnWidth(column,width)
         header.setSectionResizeMode(5,QHeaderView.ResizeMode.Stretch)
+        self.track_widths("lines", self.line_table)
         self.line_address = self.shared_address_row(layout, self.line_table)
         layout.addWidget(self.line_table, 1)
         self.line_order_buttons = self.point_order_row(layout,self.line_table)
@@ -1242,6 +1265,7 @@ class Window(QMainWindow):
             header.setSectionResizeMode(column, QHeaderView.ResizeMode.Interactive)
             self.pave_table.setColumnWidth(column, width)
         header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        self.track_widths("pave", self.pave_table)
         self.pave_table.setMinimumHeight(230)
         inner.addWidget(self.pave_table)
         row = QHBoxLayout()
@@ -1359,6 +1383,7 @@ class Window(QMainWindow):
             header.setSectionResizeMode(column,QHeaderView.ResizeMode.Interactive)
             self.backup_table.setColumnWidth(column,width)
         header.setSectionResizeMode(5,QHeaderView.ResizeMode.Stretch)
+        self.track_widths("backups", self.backup_table)
         self.backup_address = self.shared_address_row(inner, self.backup_table)
         self.backup_table.setMinimumHeight(174)
         inner.addWidget(self.backup_table)
@@ -1600,8 +1625,6 @@ class Window(QMainWindow):
         self.metrics["本次出征"].setText("0")
         self.metrics["本次武勋"].setText("待读取")
         self.metrics["本次武勋"].setToolTip("每 30 分钟读一次个人信息页的武勋；只作展示，不影响派兵。")
-        self.metrics["本次铺路"].setText("—")
-        self.metrics["本次铺路"].setToolTip("本次铺路进度：已完成段数 / 总段数")
         self.team_table.setRowCount(len(self.profile.teams))
         self.live.setRowCount(len(self.profile.teams))
         for r,t in enumerate(self.profile.teams):
@@ -1997,7 +2020,6 @@ class Window(QMainWindow):
             self.pave_progress.clear()
             self.metrics["本次出征"].setText("0")
             self.metrics["本次武勋"].setText("待读取")
-            self.metrics["本次铺路"].setText("—")
             self.last_scan.setText("正在读取本次状态")
             self.refresh_live()
         self.run_state.setText("● 执行中" if command == "run" else "● 读取中" if command == "scan" else "● 处理中")
@@ -2177,11 +2199,7 @@ class Window(QMainWindow):
             team = value.get("team")
             self.pave_progress[team] = value
             done, total = value.get("done", 0), value.get("total", 0)
-            self.metrics["本次铺路"].setText(f"{done}/{total}" if total else "—")
-            tip = f"{value.get('route', '')} · 已完成 {done}/{total} 段"
-            if value.get("next"):
-                tip += f" · 下一点 ({value['next'][0]},{value['next'][1]})"
-            self.metrics["本次铺路"].setToolTip(tip)
+            # 逐队逐点进度显示在运行总览对应队伍行内；这里没有跨队汇总指标。
             self.status.setText(f"铺路 · {value.get('route','')} · 已完成 {done}/{total} 段")
             self.append_log({"time":datetime.now().strftime("%H:%M:%S"),"level":"INFO",
                              "message":f"铺路路线 {value.get('route','')}：{done}/{total} 段，"

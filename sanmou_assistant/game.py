@@ -169,6 +169,8 @@ class Game:
         self.food_gate = True
         # 本次运行是否进过城内/征兵所：游戏会在进出主城后自动关掉隐藏，回沙盘要重核。
         self.city_visited = False
+        # 阵容名缓存：同一次任务运行内每队只取一次（见 _remember_identity）。
+        self._identity_cache = {}
 
     def log(self, message, level="INFO"):
         self.emit("log", {"time": datetime.now().strftime("%H:%M:%S"), "level": level, "message": message})
@@ -913,7 +915,7 @@ class Game:
             for policy in ordered:
                 try:
                     image = self.select_full_team_slot(image, policy.slot)
-                    obs = self.v.full_team(image, policy.key)
+                    obs = self._full_team(image, policy.key)
                     self._team_detail_cache[policy.key] = (obs, time.time())
                     self.save_image(image, f"{policy.key}-detail", True)
                     self.sync_auto_refill(image, policy)
@@ -1004,7 +1006,7 @@ class Game:
                     detail_observed_at = self._team_detail_cache[policy.key][1]
                 else:
                     full = self.select_full_team_slot(full, policy.slot)
-                    obs = self.v.full_team(full, policy.key)
+                    obs = self._full_team(full, policy.key)
                     detail_observed_at = time.time()
                     self.save_image(full, f"{policy.key}-home", True)
                     self.sync_auto_refill(full, policy)
@@ -1272,6 +1274,32 @@ class Game:
         gold = cv2.inRange(roi, (12, 25, 140), (40, 170, 255))
         return cv2.countNonZero(gold) > roi.shape[0]*roi.shape[1]*.35
 
+    def _remember_identity(self, key: str, identity: str) -> str:
+        """阵容名每队只取一次：非空新读数更新缓存，空读数回填缓存值。
+
+        用户 2026-11-14：同一次任务运行内，后续 observation 不得把 UI 已显示的
+        阵容弄丢。缓存挂在 Game 实例上（键为队伍键），不跨 Game/账号/队伍，
+        任务结束随实例丢弃。名称来自详情/总览英雄区的同一次 OCR 跨度过滤，
+        不额外跑识别；兵力/体力/补给/重伤/角标/位置等动态字段不走这里，
+        每次都从现场画面重读。惰性初始化以兼容 __new__ 构造的测试工具。
+        """
+        cache = getattr(self, "_identity_cache", None)
+        if cache is None:
+            cache = self._identity_cache = {}
+        if identity:
+            cache[key] = identity
+            return identity
+        return cache.get(key, "")
+
+    def remembered_identity(self, key: str) -> str:
+        """本次任务运行内该队已读到的阵容名；未读过返回 ""（见 _remember_identity）。"""
+        return getattr(self, "_identity_cache", {}).get(key, "")
+
+    def _full_team(self, image, key):
+        obs = self.v.full_team(image, key)
+        obs.identity = self._remember_identity(key, obs.identity)
+        return obs
+
     def read_overview(self, image, key):
         obs = Observation(key)
         right = self.v.read(image, (1325, 475, 1800, 607))
@@ -1288,7 +1316,7 @@ class Game:
             obs.stamina = min(stamina)
         obs.wounded = True if any("重伤" in t.text for t in heroes) else (False if obs.strength is not None else None)
         names = sorted([t for t in heroes if 510 < t.y < 554 and re.match(r"\d+", t.text)], key=lambda t:t.x)
-        obs.identity = "/".join(re.sub(r"^[\d\s]+", "", t.text) for t in names)
+        obs.identity = self._remember_identity(key, "/".join(re.sub(r"^[\d\s]+", "", t.text) for t in names))
         return obs
 
     def read_merit(self):

@@ -259,6 +259,16 @@ class Worker(QThread):
         """本次是否有队伍选择刷武勋；粮食检查只跟随刷武勋。"""
         return any(t.role == "merit" for t in policies)
 
+    def merit_read_due(self):
+        """本次是否需要读个人主页武勋：存在实际在场的刷武勋或拉线队。
+
+        用户 2026-11-14：纯讨贼/铺路/日常不打开个人信息页；未拥有的槽位按
+        team_present 过滤。拉线队在场也读（仅展示），但不因此打开粮食门槛——
+        food_gate 仍只跟随刷武勋（见 has_merit_team / food_recovery_state）。
+        """
+        return any(t.group == "main" and t.role in ("merit", "line")
+                   and self.team_present(t.key) for t in self.profile.teams)
+
     def food_recovery_state(self, policies, grain, stored=False):
         """粮食恢复标记：只有存在刷武勋队、补粮开关打开时才可能为真。
 
@@ -519,7 +529,8 @@ class Worker(QThread):
                     game.reserved_teams = self.pave_team_keys()
                     # 2026-11-04：武勋只作展示——本次任务第一次读数作基线，之后每 30 分钟一次。
                     # 读不到就跳过一次，不影响任何派兵。
-                    if self.command == "run" and not self.dry_run:
+                    # 2026-11-14：只有本次实际存在刷武勋或拉线队才读；纯讨贼/铺路/日常不进个人信息页。
+                    if self.command == "run" and not self.dry_run and self.merit_read_due():
                         self.check_merit(game)
                     # 讨贼独立成队，按周期检查；武勋批次不因讨贼插入而中断。
                     if self.command == "run" and self.bandits_due() and any(t.role == "bandits" for t in policies):
@@ -658,7 +669,7 @@ class Worker(QThread):
         self.publish("transport", {"stage": "input", "recovery": "restored", "replayed": False})
         # 新循环从现场重新导航和读取；不继续之前的选队/派兵流程。
 
-    def observe_team(self, game, policy):
+    def observe_team(self, game, policy, marker_hint=None):
         try:
             obs = game.scan_team(policy)
         except TeamAbsent as exc:
@@ -672,6 +683,14 @@ class Worker(QThread):
             # 只恢复已识别页面；异地登录、未知页面会再次抛出并停止整机。
             game.ensure_sandbox()
             obs = Observation(policy.key, note=str(exc))
+            if marker_hint:
+                # 错误回退不得比整帧角标知道得更少：并入角标与缓存阵容，界面不被抹空。
+                # state 等字段保持未知，下方订单结清逻辑不受影响。
+                obs.marker_state = marker_hint["state"]
+                obs.marker_label = marker_hint["label"]
+                obs.marker_confidence = marker_hint["confidence"]
+                obs.marker_at = time.time()
+                obs.identity = game.remembered_identity(policy.key)
             self.publish("observation", obs.__dict__)
         if obs.state == "unknown":
             failures = self.unreadable_teams.get(policy.key, 0) + 1
@@ -854,10 +873,13 @@ class Worker(QThread):
         # 忙碌、行军、驻守等队伍本轮不派兵，没必要再逐队开详情，省掉分钟级扫描。
         markers = {}
         fast = self.command == "run" and not self.dry_run and hasattr(game, "read_all_marker_states")
+        frame_at = None
         if fast:
             markers = game.read_all_marker_states()
             if not markers:
                 self.publish("diagnostic", {"stage": "marker_batch", "result": "整帧角标不可用，退回逐队读取"})
+            else:
+                frame_at = time.time()
 
         forced = set()
 
@@ -872,21 +894,43 @@ class Worker(QThread):
                 return True
             return False
 
+        # needs_scan 只算一次：recheck_due 有记账副作用，预发布与 read_batch 共用同一份结果，
+        # 算两次会让到点复核队在第二次被判成"不用读详情"而丢掉强制开详情。
+        scan_needed = {policy.key: needs_scan(policy) for policy in policies}
+
+        def marker_observation(policy, marker, at):
+            # 整帧角标的同帧观测：只带角标与缓存阵容，不读详情，也绝不进入 decide。
+            return Observation(policy.key, state=LEGACY_STATE.get(marker["state"], "unknown"),
+                               wounded=(marker["state"] == "wounded") if marker["state"] == "wounded" else None,
+                               note="仅按单帧角标判定，未读详情",
+                               marker_state=marker["state"], marker_label=marker["label"],
+                               marker_confidence=marker["confidence"], marker_at=at,
+                               identity=game.remembered_identity(policy.key),
+                               observed_at=at)
+
+        # 同帧先把所有实际存在且未隐藏的队推给界面，再逐队读详情；详情完成后整帧替换。
+        # 铺路/拉线不在本批 policies 内，也只预发布，不进入本批决策。
+        # 这只是 UI 提前更新，不减少任何导航/OCR，也不改变派兵顺序。
+        if frame_at is not None:
+            ui_policies = [t for t in self.active_policies(self.profile.teams) if t.role != "hidden"]
+            for policy in ui_policies:
+                self.control.checkpoint()
+                marker = markers.get(policy.slot)
+                if not marker:
+                    continue
+                self.publish("observation", marker_observation(policy, marker, frame_at).__dict__)
+
         def read_batch():
             for policy in policies:
                 self.control.checkpoint()
-                if fast and not needs_scan(policy):
+                if fast and not scan_needed[policy.key]:
                     marker = markers[policy.slot]
-                    obs = Observation(policy.key, state=LEGACY_STATE.get(marker["state"], "unknown"),
-                                      wounded=(marker["state"] == "wounded") if marker["state"] == "wounded" else None,
-                                      note="仅按单帧角标判定，未读详情",
-                                      marker_state=marker["state"], marker_label=marker["label"],
-                                      marker_confidence=marker["confidence"], marker_at=time.time())
+                    obs = marker_observation(policy, marker, frame_at or time.time())
                     self.note_progress(policy, obs)
-                    self.publish("observation", obs.__dict__)
                     observations.append((policy, obs))
                     continue
-                obs = self.observe_team(game, policy)
+                obs = self.observe_team(game, policy,
+                                        marker_hint=markers.get(policy.slot) if markers else None)
                 if obs is None:
                     continue
                 self.note_progress(policy, obs)
