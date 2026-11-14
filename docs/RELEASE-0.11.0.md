@@ -2,7 +2,7 @@
 
 发布日期：2026-11-14
 
-> 本版为**本机源码版本**：已完成源码改动与源码侧验证，**尚未打包、尚未发布**；最新公开发行仍为 [v0.10.0](https://github.com/study-college/sanmou-assistant/releases/tag/v0.10.0)。Windows 完整包构建、白名单导出审计、GitHub Actions 与 Release 发布由后续流程完成，结果以届时登记为准。
+> 本版已于 **2026-11-14 正式发布**。源码、Windows 完整包与 SHA256 校验文件见 [v0.11.0 Release](https://github.com/study-college/sanmou-assistant/releases/tag/v0.11.0)。
 
 ## 概述
 
@@ -59,7 +59,9 @@
 - 上述性能数字为离线小样本同帧对比，不代表所有账号、赛季布局或长期实机收益。
 - 异常钩子、停止等待、事件文件滚动与大型结构拆分不在本轮完成范围。
 
-## 文件与校验（待后续构建）
+## 文件与校验
 
-- 本版 Windows 完整包与 `.sha256` 校验文件将由后续构建与发布流程产出并校验；本文档不预先登记构建结果，发布资产以 GitHub Release 页面届时显示为准。
-- 源码侧证据：`artifacts/ocr-optimization-2026-11-14/receipt.json`（含基线 `baseline.json`、优化后 `page-after.json` / `markers-after.json`、完整 pytest 日志 `pytest-full.log`、审计与诊断清单）。
+- 发布资产：`SanmouAssistant-0.11.0-Windows-x64-full.zip`，**138,249,103 字节**；SHA256：`5c40ef5035a125c17abe874ed5c0b6c0a7a0acdfa62e9fbc2dbbaf08e9bdb9ed`。对应 `.zip.sha256` 文件一并发布。
+- GitHub Actions：源码 CI `43577190773`、Windows Build `43577254432`、Release Verify `43577525640` 全部通过。Verify 已完整下载 ZIP，核对清单与摘要，并运行打包 exe 的 OCR 检查。
+- 本机预检包：138,904,751 字节，SHA256 `40cc65650a1b4447946a490440b955b443cd34888d8db2c743b148ebc7e25a82`；598 个清单文件与 599 项归档审计通过。
+- 源码侧证据：`artifacts/ocr-optimization-2026-11-14/receipt.json` 与 `artifacts/release-0.11.0/`（含测试日志、导出/历史/归档审计、runtime 与 UI 验证）。
