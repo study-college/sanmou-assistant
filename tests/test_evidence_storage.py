@@ -138,10 +138,12 @@ def test_pruning_refuses_nested_junction_without_following_it(tmp_path):
 
 def test_unknown_page_still_saves_frame_and_stops_with_no_game_input(tmp_path):
     frame = np.zeros((40, 60, 3), dtype=np.uint8)
-    taps = []
+    taps, swipes = [], []
     device = SimpleNamespace(capture=lambda: frame, control=SimpleNamespace(sleep=lambda *_: None),
-                             tap=lambda *a: taps.append(a))
+                             tap=lambda *a: taps.append(a), swipe=lambda *a: swipes.append(a))
     game = Game(device, SimpleNamespace(page=lambda _, verify=True: "unknown"), Profile(), None, tmp_path, lambda *a: None)
     with pytest.raises(GameError, match="未识别"):
         game.ensure_sandbox()
-    assert not taps and list(tmp_path.rglob("*unknown-page.png"))
+    # 未知页只允许一次地图往返拖动试探（用户 2026-11-15），绝不点击；仍要留证。
+    assert not taps and 0 < len(swipes) <= 2
+    assert list(tmp_path.rglob("*unknown-page.png"))

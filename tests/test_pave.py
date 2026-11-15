@@ -649,10 +649,14 @@ def test_pave_dispatch_blocked_by_wounded_card_never_submits(tmp_path):
     game.j.close()
 
 
-def test_low_food_still_settles_completed_pave_without_new_segment(tmp_path):
+def test_low_food_does_not_block_pave_dispatch(tmp_path):
+    # 用户 2026-11-15：粮食恢复只约束刷武勋新出征和备用调动，不约束铺路；
+    # 到点后照常派出下一段。
     worker = make_worker(tmp_path, make_profile([[400,400],[300,300]]))
     seeded(worker, idx=0, status='running')
     game = FakeGame(worker, {'main:2':observation('main:2','outside',(400,400))})
-    worker.process_pave(game, food_recovery=True)
-    assert progress(worker)['idx'] == 1 and not pave_calls(game)
+    worker.process_pave(game)
+    assert progress(worker)['idx'] == 1 and progress(worker)['status'] == 'running'
+    assert [call[2] for call in pave_calls(game)] == [(300, 300)]
     assert worker.pave_team_keys() == {'main:2'}
+    worker.journal.close()

@@ -11,7 +11,7 @@ import types
 
 import numpy as np
 import pytest
-from PySide6.QtWidgets import QApplication, QLabel
+from PySide6.QtWidgets import QApplication, QLabel, QPushButton
 
 from sanmou_assistant.game import DispatchUnconfirmed, Game, GameError
 from sanmou_assistant.models import (Observation, Point, Profile, TeamPolicy, line_decision,
@@ -179,6 +179,20 @@ def test_process_line_reads_one_hud_frame_for_decision(tmp_path):
     app.processEvents()
 
 
+def test_process_line_ignores_food_recovery(tmp_path):
+    """用户 2026-11-15：粮食恢复只约束刷武勋新出征和备用调动，拉线照常尝试派兵。"""
+    app = QApplication.instance() or QApplication([])
+    worker, profile, _point = make_worker(tmp_path, minimum=95)
+    profile.food_enabled = True   # 低粮恢复场景下也不能拦住拉线
+    game = FakeLineGame(np.zeros((1080, 1920, 3), np.uint8))
+    worker.process_line(game)
+    assert game.dispatched and game.dispatched[0][0] == "line"
+    assert not any(entry["event"] == "decision" and "粮食恢复" in entry["value"].get("reason", "")
+                   for entry in worker.published)
+    worker.deleteLater()
+    app.processEvents()
+
+
 # ---------- 3.4 队伍名不累积状态后缀 ----------
 
 def test_team_label_strips_every_suffix_variant():
@@ -218,63 +232,59 @@ def test_settings_page_does_not_save_unowned_suffix_into_names(tmp_path):
     app.processEvents()
 
 
-# ---------- 3.3 拉线详情不显示补兵点 ----------
+# ---------- 3.3 拉线详情只保留补兵回退（0.11.2 重构：目标组/补兵点编辑已移除） ----------
 
 def dialog_profile():
     return Profile(
-        teams=[TeamPolicy(slot=1, role="line"), TeamPolicy(slot=2, role="merit", backup_points=["营帐A"])],
-        line_targets=[Point(name="水面", x=800, y=800, group="拉线组", priority=1),
-                      Point(name="备用", x=1, y=2, group="默认", priority=2)],
-        targets=[Point(name="战场", x=640, y=286, group="战场组", priority=1)],
-        backups=[Point(name="营帐A", x=300, y=200)])
+        teams=[TeamPolicy(slot=1, role="line"), TeamPolicy(slot=2, role="merit")],
+        line_targets=[Point(name="水面", x=800, y=800, priority=1),
+                      Point(name="备用", x=1, y=2, priority=2)],
+        targets=[Point(name="战场", x=640, y=286, priority=1)],
+        line_backups={"main:1": Point(name="营帐A", x=300, y=200)})
 
 
-def test_line_team_detail_shows_backup_points_and_uses_line_groups():
+def test_line_team_detail_keeps_only_refill_fallback():
     app = QApplication.instance() or QApplication([])
     profile = dialog_profile()
-    profile.teams[0].backup_points = ["营帐A"]
     dialog = TeamDetailDialog(profile.teams[0], profile)
     assert dialog.line_role
-    assert dialog.points is not None and dialog.points.count() == 1
-    groups = [dialog.group.itemText(i) for i in range(dialog.group.count())]
-    assert "拉线组" in groups and "默认" in groups            # 目标组取自拉线目标
-    assert "战场组" not in groups
-    assert dialog.values()[1] == ["营帐A"]                     # 拉线的营帐（补兵点）顺序
     labels = [w.text() for w in dialog.findChildren(QLabel)]
     assert any("拉线补不动时" in text for text in labels)
-    assert any("补兵点 / 营帐" in text for text in labels)
+    assert dialog.values() == "recall"
+    dialog.fallback.setCurrentIndex(1)
+    assert dialog.values() == "stop"
     dialog.close()
     app.processEvents()
 
 
-def test_merit_team_detail_keeps_backup_points_without_line_fallback():
-    app = QApplication.instance() or QApplication([])
-    profile = dialog_profile()
-    dialog = TeamDetailDialog(profile.teams[1], profile)
-    assert not dialog.line_role
-    assert dialog.points.count() == 1
-    groups = [dialog.group.itemText(i) for i in range(dialog.group.count())]
-    assert "战场组" in groups and "拉线组" not in groups
-    labels = [w.text() for w in dialog.findChildren(QLabel)]
-    assert any("备用征兵地点" in text for text in labels)
-    assert not any("拉线补不动时" in text for text in labels)
-    assert dialog.values() == ("默认", ["营帐A"], "recall")
-    dialog.close()
-    app.processEvents()
-
-
-def test_line_team_summary_shows_its_real_target(tmp_path):
+def test_merit_team_has_no_detail_entry_and_edit_is_noop(tmp_path):
+    """0.11.2：非拉线队不再有任务细节；“详情”按钮只对拉线队可见，点开无操作。"""
     app = QApplication.instance() or QApplication([])
     window = Window(tmp_path)
-    team = window.profile.teams[0]
-    team.role, team.target_group = "line", "默认"
-    window.profile.line_targets = [Point(name="水面", x=800, y=800, group="默认", priority=1)]
-    summary = window.team_detail_summary(team)
-    assert "水面(800,800)" in summary
-    assert "补兵点" in summary          # 拉线的营帐（补兵点）也显示在行内摘要
+    window.set_team_role(1, "line")
+    for row, visible in ((0, False), (1, True)):
+        detail = window.team_table.cellWidget(row, 7).findChild(QPushButton)
+        assert detail is not None
+        assert detail.isVisibleTo(window.team_table) == visible
+    window.edit_team_detail(0)
+    assert window.profile.teams[0].refill_fallback == "recall"
     window.close()
     app.processEvents()
 
+
+def test_line_backup_editor_rows_follow_role_changes(tmp_path):
+    """拉线目标页按队显示征兵点输入框并回显游戏地址；角色切走该行即消失。"""
+    app = QApplication.instance() or QApplication([])
+    window = Window(tmp_path)
+    window.profile.line_backups = {"main:2": Point(name="营帐A", x=300, y=200)}
+    window.set_team_role(1, "line")
+    edits = window.line_backup_edits
+    assert set(edits) == {"main:2"}
+    assert edits["main:2"].text() == "营帐A(300,200)"
+    window.set_team_role(1, "merit")
+    assert window.line_backup_edits == {}
+    window.close()
+    app.processEvents()
 
 # ---------- 实机额外发现：提交前卡片已经重伤/撤退 ----------
 # 2026-11-13 实机：观测“停留”后走到目标，卡片已经是“撤退 00:01:22 / 重伤 04:25”，
@@ -411,11 +421,11 @@ def test_line_fallback_recalls_and_waits_for_backup(tmp_path):
 
 def test_line_home_below_line_finishes_task_immediately(tmp_path):
     """2026-11-13 用户：回主城瞬间就补完兵，之后不会再给队伍补兵；
-    到主城仍低于出击线 = 补不上，立刻做最后一次调动并结束，不等 8 分钟。"""
+    到主城仍低于出击线 = 补不上，立刻做最后一次调动并结束，不等 8 分钟。
+    2026-11-15：该队结束后只结束拉线模块，不停止整个程序。"""
     worker, profile, point = make_worker(tmp_path, minimum=95)
     policy = profile.teams[0]
-    profile.backups = [Point(name="补给营帐", x=700, y=700, enabled=True)]
-    policy.backup_points = ["补给营帐"]
+    profile.line_backups[policy.key] = Point(name="补给营帐", x=700, y=700, enabled=True)
     profile.main_city = Point(name="主城", x=331, y=562, group="默认")
     game = FakeLineGame(np.zeros((1080, 1920, 3), np.uint8), marker_state="idle",
                         scan_state="home", fail_dispatch=False,
@@ -423,13 +433,15 @@ def test_line_home_below_line_finishes_task_immediately(tmp_path):
     worker.process_line(game)
     assert game.dispatched and game.dispatched[0][0] == "transfer"
     assert game.dispatched[0][1].name == "补给营帐"
-    assert worker.control.stop.is_set()
-    worker.control.stop.clear()
+    assert not worker.control.stop.is_set()
+    assert any(entry["event"] == "status" and "拉线模块已结束，其他任务继续" in entry["value"]
+               for entry in worker.published)
     worker.deleteLater()
 
 
-def test_two_line_teams_finish_independently_then_stop(tmp_path):
-    """2026-11-13 用户：只要还有拉线队能补，任务就不算结束；所有队完成最后调动才停。"""
+def test_two_line_teams_finish_independently_then_line_module_ends(tmp_path):
+    """2026-11-13 用户：只要还有拉线队能补，任务就不算结束；所有队完成最后调动才结束。
+    2026-11-15：结束的是拉线模块本身——不 control.stop.set()，其他任务继续。"""
     point = Point(name="拉线目标 (800,800)", x=800, y=800, group="默认",
                   actions=["occupy", "march"], expected_name="")
     first = TeamPolicy(slot=1, role="line", backup_points=["补给营帐"])
@@ -446,15 +458,16 @@ def test_two_line_teams_finish_independently_then_stop(tmp_path):
     assert not worker.control.stop.is_set()
     assert first.key in worker.line_finished
     worker._line_finish(game, second, obs)
-    assert worker.control.stop.is_set()
-    worker.control.stop.clear()
+    assert not worker.control.stop.is_set()
+    assert any(entry["event"] == "status" and "拉线模块已结束，其他任务继续" in entry["value"]
+               for entry in worker.published)
     worker.deleteLater()
 
 
 def test_line_backup_transfers_to_the_configured_point(tmp_path):
     worker, profile, _point = make_worker(tmp_path)
     policy = profile.teams[0]
-    profile.backups = [Point(name="伏波营", x=592, y=655, enabled=True)]
+    profile.line_backups[policy.key] = Point(name="伏波营", x=592, y=655, enabled=True)
     worker.line_backup.add(policy.key)
     game = FakeLineGame(np.zeros((1080, 1920, 3), np.uint8), fail_dispatch=False)
     obs = Observation("main:1", state="home", location=(100, 200), wounded=False,
@@ -470,7 +483,7 @@ def test_process_line_at_home_with_backup_transfers_first(tmp_path):
     """用户 2026-11-13：有补兵点的拉线队，在主城（含自然征兵）就先转补兵点再拉。"""
     worker, profile, _point = make_worker(tmp_path)
     policy = profile.teams[0]
-    profile.backups = [Point(name="营帐B", x=660, y=753, enabled=True)]
+    profile.line_backups[policy.key] = Point(name="营帐B", x=660, y=753, enabled=True)
     profile.main_city = Point(name="主城", x=331, y=562, group="默认")
     game = FakeLineGame(np.zeros((1080, 1920, 3), np.uint8),
                         marker_state="idle", scan_state="home", fail_dispatch=False)
@@ -483,7 +496,7 @@ def test_process_line_at_home_with_backup_transfers_first(tmp_path):
 def test_process_line_after_recall_transfers_home_to_backup(tmp_path):
     worker, profile, _point = make_worker(tmp_path)
     policy = profile.teams[0]
-    profile.backups = [Point(name="伏波营", x=592, y=655, enabled=True)]
+    profile.line_backups[policy.key] = Point(name="伏波营", x=592, y=655, enabled=True)
     profile.main_city = Point(name="主城", x=331, y=562, group="默认")
     worker.line_backup.add(policy.key)
     game = FakeLineGame(np.zeros((1080, 1920, 3), np.uint8),
@@ -514,11 +527,11 @@ def test_unknown_page_swipe_clears_selection_and_returns_to_sandbox():
     swipes = []
     game.d = types.SimpleNamespace(swipe=lambda *args, **kwargs: swipes.append(args),
                                    control=types.SimpleNamespace(sleep=lambda seconds: None))
-    game.v = types.SimpleNamespace(page=lambda image: "sandbox" if len(swipes) >= 2 else "unknown")
+    game.v = types.SimpleNamespace(page=lambda image, verify=True: "sandbox" if len(swipes) >= 2 else "unknown")
     game.capture = lambda *args, **kwargs: "frame"
     assert game.deselect_unknown_page() is True
     assert len(swipes) == 2
-    game.v.page = lambda image: "unknown"
+    game.v.page = lambda image, verify=True: "unknown"
     assert game.deselect_unknown_page() is False
 
 

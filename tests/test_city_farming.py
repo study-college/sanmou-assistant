@@ -218,12 +218,18 @@ def test_old_map_farm_config_migrates_without_a_map_destination():
 
 def test_city_exit_waits_for_more_than_one_loading_frame_without_clicking(farm):
     game,journal,vision,taps,events = farm
-    frames = iter(['loading','loading','ready'])
-    game.capture = lambda *args:next(frames)
-    vision.page = lambda image:'sandbox' if image == 'ready' else 'unknown'
+    swipes = []
+    game.d.swipe = lambda *args, **kwargs: swipes.append(args)
+    frames = ['loading','loading','ready']
+    def capture(*args):
+        return frames.pop(0) if len(frames) > 1 else frames[0]
+    game.capture = capture
+    vision.page = lambda image, verify=True:'sandbox' if image == 'ready' else 'unknown'
     image = Game.ensure_sandbox(game)
     assert image == 'ready' and game.grain == 150000
+    # 未知帧只允许“地图往返拖动”取消选中，绝不在未知页点击。
     assert not taps
+    assert swipes
 
 
 def test_persistently_unknown_page_stops_after_bounded_wait_without_clicking(farm):
@@ -232,15 +238,17 @@ def test_persistently_unknown_page_stops_after_bounded_wait_without_clicking(far
     game,journal,vision,taps,events = farm
     frame = np.full((1080,1920,3),77,np.uint8)
     captures = []
+    swipes = []
+    game.d.swipe = lambda *args, **kwargs: swipes.append(args)
     def capture(*args):
         captures.append(1)
         return frame
     game.capture = capture
-    vision.page = lambda image:'unknown'
+    vision.page = lambda image, verify=True:'unknown'
     with pytest.raises(GameError,match='未识别'):
         Game.ensure_sandbox(game)
     assert not taps
-    assert sum(kind=='status' for kind,value in events) == 4
-    assert len(captures) == 5
+    # 用户 2026-11-15：未知页只做一次往返拖动试探，有上限、不反复拖。
+    assert 0 < len(swipes) <= 2
     evidence = next(value for kind,value in events if kind == 'evidence')
     assert np.array_equal(cv2.imread(evidence),frame)

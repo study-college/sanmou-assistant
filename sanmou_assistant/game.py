@@ -39,6 +39,13 @@ def stays_at_backup(phase, home, coord, city):
     return city is None or coord != city
 
 
+def configured_backup_points(profile):
+    points = [profile.merit_backup] if profile.merit_backup is not None else []
+    points += list(profile.line_backups.values())
+    points += [point for point in profile.backups if all(point is not other for other in points)]
+    return points
+
+
 class GameError(RuntimeError):
     pass
 
@@ -393,10 +400,14 @@ class Game:
         只在重判为沙盘时返回 True，其他情况返回 False，由调用方继续等待。
         """
         self.d.swipe(1580, 575, 1480, 575, 250)
-        self.d.control.sleep(.5)
-        self.d.swipe(1480, 575, 1580, 575, 250)
+        self.d.control.sleep(.25)
         image = self.capture()
-        return self.v.page(image) == "sandbox"
+        if self.v.page(image, verify=False) == "sandbox":
+            return True
+        self.d.swipe(1480, 575, 1580, 575, 250)
+        self.d.control.sleep(.25)
+        image = self.capture()
+        return self.v.page(image, verify=False) == "sandbox"
 
     def open_visit(self):
         image = self.ensure_sandbox()
@@ -415,8 +426,8 @@ class Game:
         for _ in range(max(1, tries) - 1):
             if _vcall(self.v, "frame_clear", True, image):
                 break
-            self.emit("status", "画面还在云雾过渡 · 等半秒重截")
-            self.d.control.sleep(.6)
+            self.emit("status", "画面还在云雾过渡 · 正在刷新")
+            self.d.control.sleep(.25)
             image = self.capture()
         return image
 
@@ -593,18 +604,22 @@ class Game:
                     continue
                 # 城内出城等切换可能跨过一次重读；有上限地等待，不在未知页点击。
                 if attempt < 4:
+                    if attempt == 1:
+                        # 用户 2026-11-15：选中地块/建筑详情会遮住底栏标志，导致页面无法识别。
+                        # 未知页只做一次地图往返拖动（不点击）取消选中，每次手势后都重判；
+                        # 仍读不清就交给后面的缩放按钮和等待，不在未知页反复拖动。
+                        if self.deselect_unknown_page():
+                            continue
                     if attempt >= 2:
-                        # 2026-11-13 实机：地图放大到水寨近景时，地图标签压住顶部状态栏，
-                        # 页型会一直 unknown。只点“识别到的”左下角缩小按钮退回沙盘再重读；
-                        # 按钮认不出就不点，避免在弹层上盲点。
+                        # 地图放大到水寨近景时，地图标签可能压住状态栏；只点识别到的缩小按钮。
                         zoom = getattr(self.v, "map_zoom_point", None)
                         point = zoom(image, zoom_in=False) if zoom else None
                         if point is not None:
                             self.save_image(image, "unknown-map-labelled", True)
                             self.d.long_press(point[0], point[1], 1.8)
                             continue
-                    self.emit("status", "等待游戏画面加载 · 暂不点击")
-                    self.d.control.sleep(1.1)
+                    self.emit("status", "画面暂未读清 · 短暂刷新后重看")
+                    self.d.control.sleep(.35)
                     continue
                 self.save_image(image,"unknown-page", True)
                 raise RecognitionUnavailable("当前页面暂未识别，等待画面恢复后自动重读")
@@ -759,8 +774,8 @@ class Game:
             if page in expected:
                 # 云雾过渡帧会整屏洗白：此时角标、血条、数字都不可信，等同"还在切换"。
                 if page == "sandbox" and not _vcall(self.v, "frame_clear", True, image) and attempt < 4:
-                    self.emit("status", "画面还在云雾过渡 · 等一秒重截")
-                    self.d.control.sleep(.8)
+                    self.emit("status", "画面还在云雾过渡 · 正在刷新")
+                    self.d.control.sleep(.25)
                     image = self.capture()
                     continue
                 return image
@@ -782,8 +797,8 @@ class Game:
             if page not in transitional or attempt == 4:
                 self.save_image(image,"transition-not-recognized",True)
                 raise RecognitionUnavailable("游戏画面切换未完成或页面暂未识别")
-            self.emit("status","等待游戏画面切换 · 暂不点击")
-            self.d.control.sleep(.8)
+            self.emit("status","等待游戏画面切换 · 正在刷新")
+            self.d.control.sleep(.25)
             image = self.capture()
         raise GameError("页面切换未完成")
 
@@ -1231,7 +1246,7 @@ class Game:
         if self.v.stationary_return_visible(image,policy.slot):
             # 普通回城箭头证明已停留；地块菜单“行军”不代表这支队伍在移动。
             # 铺路只认“停留/行军/占领”，不再读营帐标题猜状态（角标已经给出答案）。
-            base = bool(coord and any((b.x,b.y) == coord for b in self.p.backups))
+            base = bool(coord and any((b.x,b.y) == coord for b in configured_backup_points(self.p)))
             if phase == "backup" and base:
                 return "recruiting" if gold > 70 else "outside"
             return "outside"
@@ -2046,7 +2061,7 @@ class Game:
             # 手动回城或已到备用点时，只点当前队伍实际识别到的普通回城箭头。
             coord = self.v.map_coordinates(image)
             arrow = self.v.stationary_return_point(image, policy.slot)
-            if arrow is None or not (manual or coord and any((b.x, b.y) == coord for b in self.p.backups)):
+            if arrow is None or not (manual or coord and any((b.x, b.y) == coord for b in configured_backup_points(self.p))):
                 raise GameError("未确认补兵点位置和回城按钮")
             request = arrow
         # 用户可以在游戏里关闭回城提示；首次点回城前就保存意图，不能等弹窗出现后才记录。

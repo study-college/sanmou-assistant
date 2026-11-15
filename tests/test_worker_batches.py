@@ -425,6 +425,83 @@ def test_food_recovery_prevents_whole_battle_batch(batch):
     assert not any(c[0] == "dispatch" for c in game.calls)
 
 
+def _patch_run_environment(monkeypatch, calls, game_class):
+    """按 test_startup 的既有模式替换设备/视觉/游戏，驱动一次真实 run()。"""
+    from types import SimpleNamespace
+    import sanmou_assistant.worker as module
+    class Device:
+        serial,width,height = "test",1920,1080
+        def __init__(self,*args): pass
+        def connect(self,**kwargs): pass
+        def capture(self): return "沙盘画面"
+        def launch_game(self,package): calls.append(("launch",package))
+        def close(self): calls.append(("close",))
+    monkeypatch.setattr(module,"Device",Device)
+    monkeypatch.setattr(module,"Game",game_class)
+    monkeypatch.setattr(module,"Vision",lambda *args:SimpleNamespace(page=lambda image, verify=True:"sandbox"))
+    monkeypatch.setattr(module,"discover_cli",lambda *args:"test")
+    monkeypatch.setattr(module,"instances",lambda *args:[])
+
+
+def test_farming_command_runs_without_merit_team(tmp_path,monkeypatch):
+    """用户 2026-11-15：屯粮检查是独立功能，单独执行不再要求有刷武勋队。"""
+    calls = []
+    class Game:
+        def __init__(self,*args): pass
+        def capture(self,*args): return "沙盘画面"
+        def ensure_sandbox(self,**kwargs): return "沙盘画面"
+        def calibrate_home(self): calls.append(("calibrate",))
+        def farming(self,execute): calls.append(("farming",execute))
+    _patch_run_environment(monkeypatch,calls,Game)
+    profile = Profile(account="测试",main_city=Point(x=100,y=200))
+    assert not any(t.role == "merit" for t in profile.teams)
+    worker = Worker(profile,tmp_path/"session","farming",False)
+    events = []
+    worker.publish = lambda kind,value:events.append((kind,value))
+    worker.run()
+    assert ("farming",True) in calls
+    assert ("status","屯粮检查结束") in events
+    assert calls[-1] == ("close",)
+
+
+def test_food_recovery_does_not_block_bandit_join_in_run_loop(tmp_path,monkeypatch):
+    """用户 2026-11-15：粮食恢复只拦刷武勋新出征和备用调动，不禁止讨贼加入。"""
+    calls = []
+    profile = Profile(account="测试",main_city=Point(x=100,y=200),
+                      targets=[Point(name="战场",x=120,y=200)])
+    profile.teams[0].role = "merit"
+    profile.teams[4].role = "bandits"
+    profile.dailies["bandits"] = True
+    profile.food_enabled = True
+    worker = Worker(profile,tmp_path/"session","run",False)
+    journal = Journal(tmp_path/"runtime.sqlite",worker._scope())
+    journal.set_flag("food_recovery",True)   # 重启后恢复标记仍在的场景
+    journal.close()
+    class Game:
+        def __init__(self,*args):
+            self.grain = 1
+            self.active_slots = None
+            self.city_visited = False
+        def capture(self,*args): return "沙盘画面"
+        def ensure_sandbox(self,**kwargs): calls.append(("sandbox",)); return "沙盘画面"
+        def ensure_hide_on(self): calls.append(("hide",)); return True
+        def calibrate_home(self): calls.append(("calibrate",))
+        def read_roster(self,slot): self.active_slots = {1,5}
+        def farming(self,execute,force=False): calls.append(("farming",execute,force))
+        def read_merit(self): calls.append(("merit",)); return (12345,"12345")
+        def bandits(self,execute):
+            calls.append(("bandits",execute))
+            worker.stop()
+            raise Stopped()
+        def log(self,*args): pass
+    _patch_run_environment(monkeypatch,calls,Game)
+    worker.run()
+    # 低粮 + 恢复标记仍在：自动屯田触发，但讨贼照常提交（execute=True）。
+    assert ("farming",True,True) in calls
+    assert ("bandits",True) in calls
+    assert ("close",) in calls
+
+
 @pytest.mark.parametrize("failure",[False,True])
 def test_bandit_check_closes_window_and_uses_independent_interval(batch,monkeypatch,failure):
     worker,game,teams = batch
@@ -566,7 +643,9 @@ def test_backup_cycle_survives_restart_and_returns_at_threshold(batch,monkeypatc
     clock = [1000.0]
     monkeypatch.setattr(time,'time',lambda:clock[0])
     worker.profile.backup_enabled = True
-    worker.profile.backups = [Point(name='补兵城池',x=80,y=180)]
+    worker.profile.merit_backup = Point(name='补兵城池',x=80,y=180)
+    # 0.11.2 重构：decide 用 merit_backup；normalize 派生旧读取方（Worker）用的 backups 视图。
+    worker.profile.normalize()
     dispatch = game.dispatch
     def accepted_dispatch(policy,obs,point,kind,reuse_target=False):
         dispatch(policy,obs,point,kind,reuse_target)

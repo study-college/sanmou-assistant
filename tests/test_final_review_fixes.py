@@ -165,7 +165,7 @@ def test_dispatch_refill_check_uses_the_real_card_center(tmp_path):
     assert calls == [517], "拉线补兵核对必须按真实卡中心读数"
 
 
-# ---------- _line_finish：未拥有的拉线队不阻止停止 ----------
+# ---------- _line_finish：未拥有的拉线队不阻止拉线模块结束 ----------
 
 
 class FinishJournal:
@@ -200,13 +200,15 @@ class FinishGame:
 
 
 def test_line_finish_ignores_teams_the_account_does_not_have(tmp_path):
-    """配置 5 支拉线队、实际只拥有 2 支：实际两队都完成后必须停止，
-    不能被本赛季不存在的 3～5 队拖成“永不清零”。"""
+    """配置 5 支拉线队、实际只拥有 2 支：实际两队都完成后拉线模块结束，
+    不能被本赛季不存在的 3～5 队拖成“永不清零”；结束后不停整个程序（用户 2026-11-15）。"""
     point = Point(name="拉线目标 (800,800)", x=800, y=800, group="默认",
                   actions=["occupy", "march"], expected_name="")
-    teams = [TeamPolicy(slot=slot, role="line", backup_points=["补给营帐"]) for slot in range(1, 6)]
-    profile = Profile(teams=teams, line_targets=[point],
-                      backups=[Point(name="补给营帐", x=700, y=700, enabled=True)])
+    teams = [TeamPolicy(slot=slot, role="line") for slot in range(1, 6)]
+    # 0.11.3 起拉线征兵点按队存放在 line_backups（不再用旧的全局 backups/backup_points）。
+    backups = {"main:1": Point(name="补给营帐", x=700, y=700, enabled=True),
+               "main:2": Point(name="补给营帐", x=700, y=700, enabled=True)}
+    profile = Profile(teams=teams, line_targets=[point], line_backups=backups)
     worker = Worker(profile, tmp_path, command="run", dry_run=False)
     worker.journal = FinishJournal()
     worker.active_slots = {1, 2}
@@ -214,11 +216,12 @@ def test_line_finish_ignores_teams_the_account_does_not_have(tmp_path):
     obs = Observation("main:1", state="home", location=(100, 200), wounded=False,
                       strength=18000, maximum=28200)
     worker._line_finish(game, teams[0], obs)
-    assert not worker.control.stop.is_set(), "实际拥有的第 2 队还没完成，不能停"
+    assert not worker.control.stop.is_set(), "实际拥有的第 2 队还没完成，不能结束拉线模块"
     worker._line_finish(game, teams[1], obs)
-    assert worker.control.stop.is_set(), "实际两队都完成就应停止，未拥有的队不参与判定"
+    assert not worker.control.stop.is_set(), "拉线模块结束不等于停止程序，其他任务继续"
+    assert any(entry["event"] == "status" and "拉线模块已结束，其他任务继续" in entry["value"]
+               for entry in worker.published)
     assert [key for key, _kind, _name in game.dispatched] == ["main:1", "main:2"]
-    worker.control.stop.clear()
     worker.deleteLater()
 
 

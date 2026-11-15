@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import time
 import threading
 from dataclasses import replace
@@ -107,7 +108,7 @@ class Worker(QThread):
         self.line_backup = set()
         # 已回到主城、做过一次完整兵力复核的拉线队（避免整帧缓存把回城补兵误判成没补）。
         self.line_home_seen = set()
-        # 已完成“最后一次调动”的拉线队；所有拉线队都完成才停程序（用户 2026-11-13）。
+        # 已完成“最后一次调动”的拉线队；全部完成后只结束拉线模块，其他任务继续（用户 2026-11-15）。
         self.line_finished = set()
         self.merit_prev = None       # 上一次读数，用于单次增量
         self.next_merit_at = 0.0
@@ -119,7 +120,8 @@ class Worker(QThread):
         self.roster_checked = False
         # 每次任务启动都重新核实主城坐标；不是每轮巡检都做。
         self.home_checked = False
-        # 本次是否有实际刷武勋队；粮食检查和讨贼补粮门槛只跟随它。
+        # 本次是否有实际刷武勋队；粮食恢复标记与 food_gate 只跟随它，
+        # 讨贼/铺路/拉线不受粮食恢复约束（用户 2026-11-15）。
         self.merit_active = False
 
     def request_refresh(self):
@@ -434,10 +436,8 @@ class Worker(QThread):
                 self.publish("status", "征兵所已读取")
                 return
             if self.command == "farming":
-                # 屯田只跟随刷武勋；没有刷武勋队时不执行，即使手动点屯田检查。
-                if not any(t.role == "merit" for t in self.profile.teams):
-                    self.publish("status", "没有刷武勋队；屯田只跟随刷武勋，本次不屯田")
-                    return
+                # 用户 2026-11-15：屯粮检查是独立功能，单独执行不再要求有刷武勋队；
+                # run 循环里的自动触发仍只跟随刷武勋（见下方 merit_active 判断）。
                 game.farming(not self.dry_run)
                 self.publish("status","屯粮检查结束")
                 return
@@ -534,7 +534,8 @@ class Worker(QThread):
                         self.check_merit(game)
                     # 讨贼独立成队，按周期检查；武勋批次不因讨贼插入而中断。
                     if self.command == "run" and self.bandits_due() and any(t.role == "bandits" for t in policies):
-                        self.check_bandits(game,allow_execute=not food_recovery)
+                        # 讨贼加入不受粮食恢复约束：粮食恢复只拦刷武勋新出征和备用调动。
+                        self.check_bandits(game)
                     limited = self.order_limit_reached()
                     # 粮食恢复标记按已读库存重算：只有刷武勋时才可能置位；
                     # 没有刷武勋队时保持 false，讨贼/铺路/日常不受粮食影响。
@@ -550,12 +551,13 @@ class Worker(QThread):
                         limited = self.process_team_batch(game, batch_policies, food_recovery)
                     if self.command == "run" and not self.dry_run:
                         # 铺路路线独立推进：到达当前段才派下一段，不占武勋批次。
-                        self.process_pave(game, food_recovery)
+                        # 粮食恢复不约束铺路和拉线（用户 2026-11-15）。
+                        self.process_pave(game)
                         # 拉线独立推进：单坐标反复拉，独立于刷武勋与铺路。
-                        self.process_line(game, food_recovery)
+                        self.process_line(game)
                     if self.command == "run" and self.bandits_due():
-                        # 验收达到出征上限以后仍可只读列表，绝不再提交新出征。
-                        self.check_bandits(game,allow_execute=not food_recovery and not limited)
+                        # 验收达到出征上限以后仍可只读列表，绝不再提交新出征；粮食恢复不影响讨贼。
+                        self.check_bandits(game, allow_execute=not limited)
                         limited = limited or self.order_limit_reached()
                     if limited:
                         game.ensure_sandbox()
@@ -748,6 +750,8 @@ class Worker(QThread):
             return Decision(reason="该队保留给未完成的铺路路线")
         decision = decide(self.profile, policy, obs, game.grain, self.journal.phase(policy.key),
                           food_gate=self.merit_active)
+        # 用户 2026-11-15：粮食恢复只拦刷武勋新出征（merit）和备用调动（transfer）；
+        # 回城（含备用队够兵回城）、讨贼、铺路、拉线都不受它约束。
         if food_recovery and decision.action in ("merit", "transfer"):
             decision = Decision(reason="粮食恢复中，等待达到恢复库存")
         if self.journal.pending(policy.key):
@@ -859,7 +863,7 @@ class Worker(QThread):
         delta = value - self.merit_base
         step = value - previous if previous is not None else 0
         # 游戏按“x.x万”显示时读数只能精确到 0.1 万；展示时标“约”，不做跨精度换算。
-        unit = 10000000 if "亿" in text else 1000 if "万" in text else 1
+        unit = 10000000 if "亿" in text else 10000 if "万" in text else 1
         self.publish("merit", {"value": value, "text": text, "base": self.merit_base,
                                "delta": delta, "step": step, "unit": unit})
         game.log(f"武勋 {text}；本次任务累计 {delta:+d}", "INFO")
@@ -899,9 +903,12 @@ class Worker(QThread):
         scan_needed = {policy.key: needs_scan(policy) for policy in policies}
 
         def marker_observation(policy, marker, at):
-            # 整帧角标的同帧观测：只带角标与缓存阵容，不读详情，也绝不进入 decide。
+            # 整帧角标不重新读倒计时，但保留详情页已经读到的重伤剩余时间。
+            until = self.wounded_until.get(policy.key)
+            remaining = max(0, math.ceil(until - at)) if marker["state"] == "wounded" and until else None
             return Observation(policy.key, state=LEGACY_STATE.get(marker["state"], "unknown"),
                                wounded=(marker["state"] == "wounded") if marker["state"] == "wounded" else None,
+                               injury_seconds=remaining,
                                note="仅按单帧角标判定，未读详情",
                                marker_state=marker["state"], marker_label=marker["label"],
                                marker_confidence=marker["confidence"], marker_at=at,
@@ -979,14 +986,10 @@ class Worker(QThread):
             try:
                 if decision.action in ("merit", "transfer"):
                     if decision.action == "merit":
-                        points = sorted([p for p in self.profile.targets
-                                         if p.enabled and p.group == policy.target_group],
+                        points = sorted([p for p in self.profile.targets if p.enabled],
                                         key=lambda p: p.priority)
                     else:
-                        order = {name: i for i, name in enumerate(policy.backup_points)}
-                        candidates = [p for p in self.profile.backups if p.enabled
-                                      and (not order or p.name in order)]
-                        points = sorted(candidates, key=lambda p: (order.get(p.name, 10 ** 6), p.priority))
+                        points = [self.profile.merit_backup] if self.profile.merit_backup is not None else []
                     for point in points:
                         key = (point.x,point.y,point.name,tuple(point.actions),point.expected_name,decision.action)
                         try:
@@ -1175,8 +1178,11 @@ class Worker(QThread):
                 game.log(f"{policy.display} 铺路订单核对为未出发，下一轮重试", "INFO")
         # 其余情况保持待核对，不自动重发。
 
-    def process_pave(self, game, food_recovery=False):
-        """游标可连续跳过无攻占点；每轮每条路线最多成功派出一段。"""
+    def process_pave(self, game):
+        """游标可连续跳过无攻占点；每轮每条路线最多成功派出一段。
+
+        用户 2026-11-15：粮食恢复不约束铺路，低粮也照常核对并推进路线。
+        """
         if self.command != "run" or self.dry_run:
             return
         # 只执行被某支队伍选中的路线；未分配的路线只是草稿，不参与执行。
@@ -1276,9 +1282,6 @@ class Worker(QThread):
             while True:
                 if self.journal.pending(policy.key):
                     break
-                if food_recovery:
-                    self.publish("decision", {"team": policy.key, "action": "wait", "reason": "铺路：粮食恢复中，继续核对已有进度，暂停新出征"})
-                    break
                 if not _can_dispatch(obs):
                     self.log_once(f"pave-undispatchable:{route.name}",
                                   f"{policy.display} 本段未派出：现场状态 {obs.marker_label or obs.state or '未知'}"
@@ -1368,21 +1371,18 @@ class Worker(QThread):
         return obs
 
     def line_backup_point(self, policy):
-        """拉线的备用征兵地点（补兵点/营帐）：按本队指定顺序，否则全部启用点。"""
-        order = {name: i for i, name in enumerate(policy.backup_points)}
-        candidates = [p for p in self.profile.backups if p.enabled
-                      and (not order or p.name in order)]
-        candidates.sort(key=lambda p: (order.get(p.name, 10 ** 6), p.priority))
-        return candidates[0] if candidates else None
+        """拉线只使用本队在拉线目标区域配置的征兵点，不与武勋共用。"""
+        return self.profile.line_backups.get(policy.key)
 
-    def process_line(self, game, food_recovery=False):
+    def process_line(self, game):
         """拉线模块（用户 2026-11-13 MVP 口径）。
 
         - 目标动作按拉线目标自己的指令顺序（和武勋目标一样，由使用者排列）；
         - 每轮每队最多点一次「出征」，没确认就交给下一轮重读；
         - 忙碌（占领/自然征兵）但兵力已到出击线：去出征页核对，是征兵就拉、是占领就放弃；
         - 补不动：回城 → 按补兵点调动到营帐 → 到营帐后够线就拉，不够就自然征兵到线再拉；
-        - 一轮只截一帧读所有槽位状态；只在要派兵/回城/调动时才导航。
+        - 一轮只截一帧读所有槽位状态；只在要派兵/回城/调动时才导航；
+        - 用户 2026-11-15：粮食恢复不约束拉线，低粮也照常拉线。
         """
         if self.command != "run" or self.dry_run:
             return
@@ -1419,15 +1419,11 @@ class Worker(QThread):
             target = line_target(self.profile, policy)
             if target is None:
                 self.log_once(f"line-target:{policy.key}",
-                              f"{policy.display} 未配置启用的拉线目标（目标组 {policy.target_group}）；"
+                              f"{policy.display} 未配置启用的拉线目标；"
                               f"请在「目标与铺路 → 拉线目标」添加坐标并勾选启用，本队跳过",
                               every=1800)
                 continue
             if time.time() < self.retry_at.get(f"line:{policy.key}", 0):
-                continue
-            if food_recovery:
-                self.publish("decision", {"team": policy.key, "action": "wait",
-                                          "reason": "拉线：粮食恢复中，暂停新出征"})
                 continue
             if not game.account_checked:
                 try:
@@ -1534,10 +1530,11 @@ class Worker(QThread):
                                           "reason": f"拉线已提交 {point_label(target)}"})
 
     def _line_finish(self, game, policy, obs):
-        """主城也补不上兵：最后一次调动到补兵点；所有拉线队都完成后才停程序。
+        """主城也补不上兵：最后一次调动到补兵点；全部完成后只结束拉线模块。
 
-        用户 2026-11-13：一支队补不上不代表任务结束——只要还有拉线队能补能拉，
-        任务就继续；等所有被选为拉线的队伍都完成“最后一次调动”，任务才算结束。
+        用户 2026-11-15：一支队补不上不代表其他队结束；所有拉线队都完成
+        “最后一次调动”后仅拉线模块结束，刷武勋/讨贼/铺路/日常等其他任务继续，
+        不再 control.stop.set() 停止整个程序。
         """
         point = self.line_backup_point(policy)
         submitted = False
@@ -1558,17 +1555,17 @@ class Worker(QThread):
             self.publish("decision", {"team": policy.key, "action": "transfer",
                                       "reason": f"拉线任务结束：最后一次调动到 {point.name}"})
         # 未拥有的拉线队（本赛季没有该槽位）不参与“还有谁没完成”的判定：
-        # 配置 5 队实际 2 队时，实际两队都完成就允许停止，不能被不存在的槽位拖住。
+        # 配置 5 队实际 2 队时，实际两队都完成就允许结束，不能被不存在的槽位拖住。
         remaining = [p.display for p in self.profile.teams
                      if p.role == "line" and p.group == "main"
                      and self.team_present(p.key) and p.key not in self.line_finished]
         if remaining:
             self.publish("status", f"{policy.display} 拉线结束；继续 {'、'.join(remaining)}")
             return
-        self.publish("status", "拉线任务结束 · 所有拉线队已发出调动令（补兵点）")
+        self.publish("status", "拉线模块已结束，其他任务继续 · 所有拉线队已发出调动令（补兵点）")
         if submitted:
-            game.log("所有拉线队伍都已发出调动令（补兵点）；拉线任务结束，程序停止", "WARN")
-        self.control.stop.set()
+            game.log("所有拉线队伍都已发出调动令（补兵点）；拉线模块已结束，其他任务继续", "WARN")
+        # 不停 worker：刷武勋、讨贼、铺路、日常等其他模块继续运行。
 
     def _line_transfer_backup(self, game, policy, obs):
         """回城后按补兵点调动到营帐；到达营帐后再按状态继续拉。"""

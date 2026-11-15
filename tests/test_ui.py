@@ -2,7 +2,7 @@ import json
 from types import SimpleNamespace
 from pathlib import Path
 
-from PySide6.QtWidgets import QApplication, QRadioButton
+from PySide6.QtWidgets import QApplication, QCheckBox, QRadioButton
 
 from sanmou_assistant.models import Profile
 from sanmou_assistant.ui import Window
@@ -51,10 +51,8 @@ def test_desktop_forms_preserve_team_and_target_settings(tmp_path):
             button.click()
     window.team_table.cellWidget(1,4).setValue(77)
     window.team_table.cellWidget(1,5).setValue(53)
-    window.add_backup()
-    window.backup_table.item(0,1).setText("补兵营帐")
-    window.profile.teams[1].backup_points = ["补兵营帐"]
-    window.sync_team_row(1)
+    window.merit_backup_address.setText("补兵营帐(300,200)")
+    window.backup_enabled.setChecked(True)
     window.food_low.setValue(800000)
     window.food_recover.setValue(2000000)
     window.bandit_interval.setValue(240)
@@ -63,13 +61,16 @@ def test_desktop_forms_preserve_team_and_target_settings(tmp_path):
     p = Profile.from_dict(json.loads((tmp_path/"active-profile.json").read_text(encoding="utf-8")))
     assert p.teams[1].role == "merit" and p.teams[1].minimum == 77 and p.teams[1].stamina == 53
     assert p.targets[0].x == 640 and p.targets[0].y == 286
-    assert p.teams[1].backup_points == ["补兵营帐"]
+    assert (p.merit_backup.name, p.merit_backup.x, p.merit_backup.y) == ("补兵营帐", 300, 200)
+    assert p.backup_enabled is True
     assert p.food_low == 800000 and p.food_recover == 2000000
     assert p.bandit_interval == 240
     assert p.bandit_allow_assist is True
     reopened = Window(tmp_path)
     assert reopened.team_table.cellWidget(1,4).value() == 77
     assert reopened.target_table.rowCount() == 1
+    assert reopened.merit_backup_address.text() == "补兵营帐(300,200)"
+    assert reopened.backup_enabled.isChecked()
     assert reopened.bandit_interval.value() == 240
     assert reopened.bandit_allow_assist.isChecked()
     window.close()
@@ -91,7 +92,7 @@ def test_missing_teams_are_locked_and_guard_rows_hidden(tmp_path):
     assert all(not button.isEnabled() for button in window.team_table.cellWidget(2, 2).findChildren(QRadioButton))
     assert not window.team_table.cellWidget(2, 3).isEnabled()
     assert not window.team_table.cellWidget(2, 4).isEnabled()
-    assert not window.team_table.cellWidget(2, 7).isEnabled()
+    assert not window.team_table.cellWidget(2, 7).findChild(QCheckBox).isEnabled()
     assert "未拥有" in window.team_table.item(2, 1).text()
     assert not window.live.cellWidget(2, 0).isEnabled()
     # 亲卫不参与三个功能，设置页不再显示。
@@ -168,7 +169,7 @@ def test_fresh_wound_read_replaces_action_and_timer_never_claims_recovery(tmp_pa
     app = QApplication.instance() or QApplication([])
     window = Window(tmp_path)
     window.handle_event("dispatch",{"team":"main:1","kind":"merit","target":"战场","state":"marching","action":"攻城"})
-    window.handle_event("decision",{"team":"main:1","reason":"已达到出击条件"})
+    window.handle_event("decision",{"team":"main:1","reason":"角标显示重伤恢复，本轮不派兵"})
     monkeypatch.setattr(module.time,"time",lambda:1100.0)
     obs = Observation("main:1",observed_at=1000,state="wounded",strength=33000,maximum=33000,wounded=True,injury_seconds=199).__dict__
     window.handle_event("observation",obs)
@@ -193,25 +194,25 @@ def test_game_address_paste_for_targets_backups_and_main(tmp_path, monkeypatch):
     assert window.add_shared_points(window.target_table)
     assert window.target_table.rowCount() == 5
     window.target_table.cellWidget(3,0).setChecked(True)
-    window.target_table.cellWidget(3,5)._actions = ["guard"]
-    window.target_table.cellWidget(3,5).setText("驻守  ✎")
+    window.target_table.cellWidget(3,4)._actions = ["guard"]
+    window.target_table.cellWidget(3,4).setText("驻守  ✎")
     assert window.add_shared_points(window.target_table, "丁城(400,400)")
     assert window.target_table.rowCount() == 5
     assert window.target_table.cellWidget(3,0).isChecked()
-    assert window.target_table.cellWidget(3,5)._actions == ["guard"]
-    window.backup_address.setText("甲城（100，100）")
+    assert window.target_table.cellWidget(3,4)._actions == ["guard"]
+    window.line_address.setText("甲城（100，100）")
     window.main_address.setText("丙城(300,300)")
     # 保存也识别尚未点应用的地址；城内农田没有地图地址输入。
     assert window.save()
     profile = Profile.from_dict(json.loads((tmp_path/'active-profile.json').read_text(encoding='utf-8')))
     assert (profile.account,profile.main_city.x,profile.main_city.y) == ("丙城",300,300)
-    assert (profile.backups[0].name,profile.backups[0].x,profile.backups[0].y) == ("甲城",100,100)
+    assert (profile.line_targets[0].name,profile.line_targets[0].x,profile.line_targets[0].y) == ("甲城",100,100)
     assert 'grain_field' not in profile.to_dict()
     assert not hasattr(window,"farm_address")
     assert not hasattr(window,"use_farm_mark")
     assert "无需填写地址" in window.farm_position.text()
-    assert not profile.backups[0].enabled
-    window.copy_addresses(window.backup_table)
+    assert not profile.line_targets[0].enabled
+    window.copy_addresses(window.line_table)
     assert copied == ["甲城(100,100)"]
     window.handle_event('calibrated',{'account':'新主公','main_city':{'name':'我的主城','x':201,'y':202,'expected_name':'新主公'}})
     assert window.collect().main_city.x == 201
@@ -225,8 +226,8 @@ def test_bad_bulk_address_never_partially_changes_table(tmp_path):
     window = Window(tmp_path)
     assert not window.add_shared_points(window.target_table, "甲(1,2)坏(1,)")
     assert window.target_table.rowCount() == 0
-    assert window.add_shared_points(window.backup_table, "营帐(1,2)营帐(3,4)")
-    assert [window.backup_table.item(r,1).text() for r in range(2)] == ['营帐','营帐 2']
+    assert window.add_shared_points(window.line_table, "营帐(1,2)营帐(3,4)")
+    assert [window.line_table.item(r,1).text() for r in range(2)] == ['营帐','营帐 2']
     window.main_address.setText("甲(1,2)乙(3,4)")
     assert not window.apply_main_address()
     assert window.profile.main_city is None
@@ -243,15 +244,15 @@ def test_target_action_order_editor_roundtrip_with_march(tmp_path):
     window.target_table.item(0,1).setText("山道")
     window.target_table.cellWidget(0,2).setValue(636)
     window.target_table.cellWidget(0,3).setValue(286)
-    b = window.target_table.cellWidget(0,5)
+    b = window.target_table.cellWidget(0,4)
     b._actions = ["march","guard","attack"]
     b.setText(actions_label(b._actions) + "  ✎")
     assert window.save()
     p = Profile.from_dict(json.loads((tmp_path/"active-profile.json").read_text(encoding="utf-8")))
     assert p.targets[0].actions == ["march","guard","attack"]
     reopened = Window(tmp_path)
-    assert reopened.target_table.cellWidget(0,5)._actions == ["march","guard","attack"]
-    assert "行军" in reopened.target_table.cellWidget(0,5).text()
+    assert reopened.target_table.cellWidget(0,4)._actions == ["march","guard","attack"]
+    assert "行军" in reopened.target_table.cellWidget(0,4).text()
     # 编辑器：勾选状态与上下移后的顺序即指令优先级
     dialog = ActionOrderDialog(["march","attack"], window)
     keys = [dialog.list.item(r).data(Qt.ItemDataRole.UserRole) for r in range(dialog.list.count())]
@@ -369,39 +370,66 @@ def test_target_order_is_visible_editable_and_persists_without_losing_strategy(t
     assert all(p.expected_name == '' for p in saved.targets)
     select(1)
     window.remove_row(t)
-    assert [t.item(r,6).text() for r in range(t.rowCount())] == ['1','2']
+    assert [t.item(r,5).text() for r in range(t.rowCount())] == ['1','2']
     window.close(); reopened.close(); app.processEvents()
 
 
-def test_backup_order_persists_and_scheduler_uses_it_with_named_override(tmp_path):
+def test_merit_backup_point_roundtrips_and_decide_uses_it(tmp_path):
+    """2026-11-15 重构：武勋备用征兵点是一个共用点，保存/重开/决策全链路一致。"""
     from sanmou_assistant.models import Point, decide
     app = QApplication.instance() or QApplication([])
     p = Profile(account='测试',main_city=Point(x=10,y=20),backup_enabled=True,
-        backups=[Point(name='甲',x=11,y=21,priority=4,expected_name='甲城',capacity=2,actions=['guard'],group='保留'),
-                 Point(name='乙',x=12,y=22,priority=1,expected_name='乙城')])
+        targets=[Point(name='战场',x=120,y=200)],
+        merit_backup=Point(name='伏波营',x=11,y=21,priority=4,expected_name='伏波营',capacity=2,actions=['guard'],group='保留'))
     p.teams[0].role = "merit"
     (tmp_path/'active-profile.json').write_text(json.dumps(p.to_dict()),encoding='utf-8')
     window = Window(tmp_path)
-    t = window.backup_table
-    assert [t.item(r,1).text() for r in range(2)] == ['乙','甲']
-    t.selectRow(1)
-    window.backup_order_buttons[2].click()
-    assert [t.item(r,1).text() for r in range(2)] == ['甲','乙']
+    assert window.merit_backup_address.text() == "伏波营(11,21)"
+    assert window.backup_enabled.isChecked()
     assert window.save()
     reopened = Window(tmp_path)
     result = reopened.collect()
-    assert [b.priority for b in result.backups] == [1,2]
-    assert result.backups[0].expected_name == '甲城'
-    assert (result.backups[0].actions,result.backups[0].capacity,result.backups[0].group) == (['guard'],2,'保留')
+    assert result.merit_backup.name == '伏波营' and result.merit_backup.priority == 4
+    assert (result.merit_backup.actions,result.merit_backup.capacity,result.merit_backup.group) == (['guard'],2,'保留')
+    assert 'backups' not in json.loads((tmp_path/'active-profile.json').read_text(encoding='utf-8'))
     obs = Observation('main:1',state='home',strength=100,maximum=1000,stamina=100,supply=100,wounded=False,auto_refill=True)
-    assert decide(result,result.teams[0],obs,10000000).target.name == '甲'
-    result.teams[0].backup_points = ['乙']
-    assert decide(result,result.teams[0],obs,10000000).target.name == '乙'
-    t.selectRow(0)
-    window.remove_row(t)
-    assert t.item(0,4).text() == '1'
-    window.add_backup()
-    assert not t.cellWidget(1,0).isChecked()
+    assert decide(result,result.teams[0],obs,10000000).target.name == '伏波营'
+    # 清空地址保存 = 不使用备用征兵点
+    reopened.merit_backup_address.clear()
+    assert reopened.save()
+    again = Window(tmp_path)
+    assert again.merit_backup_address.text() == ''
+    assert again.collect().merit_backup is None
+    window.close();reopened.close();again.close();app.processEvents()
+
+
+def test_line_backup_points_roundtrip_per_team_and_share_one_address(tmp_path):
+    """2026-11-15 重构：拉线征兵点按 main:slot 每队一个点，多队可共用同一地址。"""
+    from sanmou_assistant.models import Point
+    app = QApplication.instance() or QApplication([])
+    p = Profile(account='测试',main_city=Point(x=10,y=20),
+        line_targets=[Point(name='水面',x=800,y=800,enabled=True)])
+    p.teams[0].role = "line"
+    p.teams[1].role = "line"
+    p.line_backups = {"main:1": Point(name='营帐甲',x=300,y=200),
+                      "main:2": Point(name='营帐甲',x=300,y=200)}
+    (tmp_path/'active-profile.json').write_text(json.dumps(p.to_dict()),encoding='utf-8')
+    window = Window(tmp_path)
+    assert set(window.line_backup_edits) == {"main:1", "main:2"}
+    assert window.line_backup_edits["main:1"].text() == "营帐甲(300,200)"
+    assert window.line_backup_edits["main:2"].text() == "营帐甲(300,200)"
+    # 其中一队改地址，另一队不动：保存后互不影响
+    window.line_backup_edits["main:2"].setText("营帐乙(400,300)")
+    assert window.save()
+    saved = Profile.from_dict(json.loads((tmp_path/'active-profile.json').read_text(encoding='utf-8')))
+    assert (saved.line_backups["main:1"].x, saved.line_backups["main:1"].y) == (300, 200)
+    assert (saved.line_backups["main:2"].name, saved.line_backups["main:2"].x) == ("营帐乙", 400)
+    # 清空一队的地址 = 该队不用备用征兵点，另一队保留
+    reopened = Window(tmp_path)
+    reopened.line_backup_edits["main:1"].clear()
+    assert reopened.save()
+    again = Profile.from_dict(json.loads((tmp_path/'active-profile.json').read_text(encoding='utf-8')))
+    assert "main:1" not in again.line_backups and again.line_backups["main:2"].name == "营帐乙"
     window.close();reopened.close();app.processEvents()
 
 
@@ -577,16 +605,14 @@ def test_remove_line_rows_keeps_group_actions_and_renumbers(tmp_path):
     t.selectRow(0)
     window.remove_row(t)
     assert [t.item(r,1).text() for r in range(t.rowCount())] == ['乙','丙']
-    assert [t.item(r,6).text() for r in range(2)] == ['1','2'], "顺序仍写第 6 列且连续"
-    assert [t.item(r,4).text() for r in range(2)] == ['第二组','第一组'], "目标组不被顺序号覆盖"
-    assert [t.cellWidget(r,5)._actions for r in range(2)] == [['occupy','march'],['attack']]
+    assert [t.item(r,5).text() for r in range(2)] == ['1','2'], "顺序仍写第 5 列且连续"
+    assert [t.cellWidget(r,4)._actions for r in range(2)] == [['occupy','march'],['attack']]
     assert [(t.cellWidget(r,2).value(),t.cellWidget(r,3).value()) for r in range(2)] == [(102,202),(103,203)]
     window.add_line_target()
     t.selectRow(1)
     window.remove_row(t)
     assert [t.item(r,1).text() for r in range(t.rowCount())] == ['乙','拉线目标 3']
-    assert [t.item(r,6).text() for r in range(2)] == ['1','2']
-    assert [t.item(r,4).text() for r in range(2)] == ['第二组','默认']
+    assert [t.item(r,5).text() for r in range(2)] == ['1','2']
     assert window.save()
     reloaded = Profile.from_dict(json.loads((tmp_path/'active-profile.json').read_text(encoding='utf-8')))
     assert [(p.name,p.priority,p.group,p.actions) for p in reloaded.line_targets] == [('乙',1,'第二组',['occupy','march']),('拉线目标 3',2,'默认',['occupy','march'])]

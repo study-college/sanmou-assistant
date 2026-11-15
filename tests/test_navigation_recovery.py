@@ -8,21 +8,27 @@ from sanmou_assistant.models import Point, Profile
 
 
 def recovery(tmp_path, pages):
-    taps, events = [], []
-    frames = iter(pages)
-    device = SimpleNamespace(tap=lambda *a: taps.append(a), control=SimpleNamespace(sleep=lambda _: None))
+    taps, events, swipes = [], [], []
+    queue = list(pages)
+
+    def frame(*_a):
+        # 未知页会多截几帧（取消选中的往返拖动要每步重判），最后一页之后重复它。
+        return queue.pop(0) if len(queue) > 1 else queue[0]
+
+    device = SimpleNamespace(tap=lambda *a: taps.append(a), swipe=lambda *a: swipes.append(a),
+                             control=SimpleNamespace(sleep=lambda _: None))
     vision = SimpleNamespace(page=lambda image, **_: image, grain=lambda _: 6000000,
         navigation_back_point=lambda _: dict(x=138, y=38, title="活动详情", score=.99))
     journal = Journal(tmp_path / "runtime.sqlite", "test")
     game = Game(device, vision, Profile(), journal, tmp_path, lambda *a: events.append(a))
-    game.capture = lambda *a: next(frames)
+    game.capture = frame
     game.save_image = lambda *a: None
     game.account_checked = True
-    return game, taps, events
+    return game, taps, events, swipes
 
 
 def test_return_invalidates_batch_and_preserves_unconfirmed_order(tmp_path):
-    game, taps, events = recovery(tmp_path, ["navigable_page", "sandbox"])
+    game, taps, events, swipes = recovery(tmp_path, ["navigable_page", "sandbox"])
     try:
         ident = game.j.prepare("main:1", "merit", "target")
         game.j.finish(ident, "uncertain")
@@ -39,17 +45,19 @@ def test_return_invalidates_batch_and_preserves_unconfirmed_order(tmp_path):
 
 @pytest.mark.parametrize("page", ["unknown", "blocked", "maintenance"])
 def test_ambiguous_or_protected_page_is_never_blindly_clicked(tmp_path, page):
-    game, taps, _ = recovery(tmp_path, [page] * 5)
+    game, taps, _, swipes = recovery(tmp_path, [page] * 5)
     try:
         with pytest.raises(GameError):
             game.ensure_sandbox()
-        assert not taps
+        assert not taps, "未知/受保护页面绝不盲点"
+        # 只有“未知页”允许一次地图往返拖动试探；受保护页面（异地登录/维护）连拖动都不做。
+        assert len(swipes) <= 2 and (swipes or page != "unknown")
     finally:
         game.j.close()
 
 
 def test_recovery_is_bounded_per_incident_and_across_cycles(tmp_path):
-    game, taps, _ = recovery(tmp_path, ["navigable_page"] * 8)
+    game, taps, _, swipes = recovery(tmp_path, ["navigable_page"] * 8)
     try:
         with pytest.raises(GameError, match="上限"):
             game.ensure_sandbox()
@@ -63,7 +71,7 @@ def test_recovery_is_bounded_per_incident_and_across_cycles(tmp_path):
 
 @pytest.mark.parametrize("page", ["navigable_page", "activity", "welfare"])
 def test_transition_recovery_does_not_resume_old_navigation(tmp_path, page):
-    game, taps, _ = recovery(tmp_path, [page, "sandbox"])
+    game, taps, _, swipes = recovery(tmp_path, [page, "sandbox"])
     try:
         with pytest.raises(NavigationRecovered):
             game.wait_transition(page, expected=("worldmap",))

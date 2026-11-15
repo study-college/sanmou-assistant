@@ -40,7 +40,7 @@ def test_backup_returns_once_threshold_reached(ready):
     """2026-11-04：自然征兵只要够出击下限就回城，不要求征到满兵。"""
     p,t,o = ready
     p.backup_enabled = True
-    p.backups = [Point(name="营帐",x=80,y=200)]
+    p.merit_backup = Point(name="营帐",x=80,y=200)
     o.strength = 20000
     o.reserve = 100000
     assert decide(p,t,o,1000000).action == "transfer"
@@ -57,7 +57,7 @@ def test_backup_returns_once_threshold_reached(ready):
 def test_home_refill_does_not_control_backup_recruitment(ready, home_refill):
     p,t,o = ready
     p.backup_enabled = True
-    p.backups = [Point(name='补兵城池',x=80,y=200)]
+    p.merit_backup = Point(name='补兵城池',x=80,y=200)
     o.strength, o.auto_refill = 20000, home_refill
     assert decide(p,t,o,1000000).action == 'transfer'
 
@@ -193,7 +193,7 @@ def test_outside_idle_dispatch_and_backup_ownership(ready):
     assert decide(p,t,o,1000000,'backup').action == 'return'
     o.strength = 10000
     p.backup_enabled = True
-    p.backups = [Point(name='备用点',x=1,y=2)]
+    p.merit_backup = Point(name='备用点',x=1,y=2)
     assert decide(p,t,o,1000000,'backup').action == 'wait'
     assert decide(p,t,o,1000000).action == 'transfer'
     o.wounded = True

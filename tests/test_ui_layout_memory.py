@@ -4,7 +4,7 @@
 """
 import json
 
-from PySide6.QtWidgets import QApplication, QRadioButton
+from PySide6.QtWidgets import QApplication, QCheckBox, QPushButton, QRadioButton
 
 from sanmou_assistant.models import Profile
 from sanmou_assistant.ui import Window
@@ -48,13 +48,18 @@ def test_idle_teams_stay_visible_monitored_and_detail_enabled(tmp_path):
     window.set_team_role(1, "pave")
     assert window.profile.teams[1].role == "pave"
     assert _role_button(window, 1, "pave").isChecked()
-    # 空闲队详情仍可配置；隐藏队才锁死。
-    assert window.team_table.cellWidget(1, 7).isEnabled()
+    # 拉线队才有“快速征兵”勾选与“详情”入口；空闲/铺路等其他角色不显示。
+    window.set_team_role(1, "line")
+    refill = window.team_table.cellWidget(1, 7).findChild(QCheckBox)
+    detail = window.team_table.cellWidget(1, 7).findChild(QPushButton)
+    assert refill is not None and refill.isEnabled()
+    assert detail is not None and detail.isVisibleTo(window.team_table)
+    window.set_team_role(1, "idle")
     window.live.cellWidget(1, 0).setChecked(False)
     assert window.profile.teams[1].role == "hidden"
     assert window.live.isRowHidden(1), "隐藏的队伍才从总览消失"
     assert all(not b.isEnabled() for b in window.team_table.cellWidget(1, 2).findChildren(QRadioButton))
-    assert not window.team_table.cellWidget(1, 7).isEnabled()
+    assert not window.team_table.cellWidget(1, 7).findChild(QCheckBox).isEnabled()
     window.close(); app.processEvents()
 
 
@@ -98,22 +103,22 @@ def test_existing_config_roles_still_load_and_collect(tmp_path):
 
 
 def test_two_tables_remember_widths_independently_and_reopen(tmp_path):
-    """拖动后备份表与铺路表分别保存，重开后各自恢复、互不串键。"""
+    """拖动后拉线表与铺路表分别保存，重开后各自恢复、互不串键。"""
     app = QApplication.instance() or QApplication([])
     window = Window(tmp_path)
-    window.add_backup()
+    window.add_line_target()
     window.add_pave_route()
-    window.backup_table.setColumnWidth(1, 210)
-    window.backup_table.setColumnWidth(2, 120)
+    window.line_table.setColumnWidth(1, 210)
+    window.line_table.setColumnWidth(2, 120)
     window.pave_table.setColumnWidth(0, 260)
     window.pave_table.setColumnWidth(4, 150)
-    window.save_widths("backups", window.backup_table)
+    window.save_widths("lines", window.line_table)
     window.save_widths("pave", window.pave_table)
     state = json.loads((tmp_path / "ui-state.json").read_text(encoding="utf-8"))
-    assert set(("backups", "pave")) <= set(state)
+    assert set(("lines", "pave")) <= set(state)
     reopened = Window(tmp_path)
-    assert reopened.backup_table.columnWidth(1) == 210
-    assert reopened.backup_table.columnWidth(2) == 120
+    assert reopened.line_table.columnWidth(1) == 210
+    assert reopened.line_table.columnWidth(2) == 120
     assert reopened.pave_table.columnWidth(0) == 260
     assert reopened.pave_table.columnWidth(4) == 150
     window.close(); reopened.close(); app.processEvents()
@@ -123,7 +128,7 @@ def test_column_drag_schedules_debounced_save(tmp_path):
     """拖动列宽后防抖计时器启动（400ms 单次），不会每次像素都写盘。"""
     app = QApplication.instance() or QApplication([])
     window = Window(tmp_path)
-    for name in ("teams", "targets", "backups", "lines", "pave"):
+    for name in ("teams", "targets", "lines", "pave"):
         window._width_timers[name].stop()
     window.target_table.setColumnWidth(1, 220)
     assert window._width_timers["targets"].isActive()
@@ -139,7 +144,7 @@ def test_corrupt_ui_state_falls_back_to_defaults(tmp_path):
     (tmp_path / "ui-state.json").write_text("{损坏", encoding="utf-8")
     window = Window(tmp_path)
     assert window.target_table.columnWidth(1) == 150
-    assert window.backup_table.columnWidth(1) == 160
+    assert window.line_table.columnWidth(1) == 150
     assert window.team_table.columnWidth(2) == 360
     window.close(); app.processEvents()
 
@@ -153,16 +158,16 @@ def test_column_count_change_falls_back_without_harming_other_tables(tmp_path):
     window.save_widths("targets", window.target_table)
     (tmp_path / "ui-state.json").write_text(json.dumps({
         "targets": [1, 2, 3],  # 列数不对：整张表回退默认
-        "backups": [44, 210, 120, 90, 90, 30],
+        "lines": [44, 210, 120, 90, 90, 30],
         "split-dashboard": "QUJD",  # 分栏状态必须原样保留
     }, ensure_ascii=False), encoding="utf-8")
     reopened = Window(tmp_path)
     assert reopened.target_table.columnWidth(1) == 150, "列数变化的表回退默认"
-    assert reopened.backup_table.columnWidth(1) == 210, "其他表不受影响"
+    assert reopened.line_table.columnWidth(1) == 210, "其他表不受影响"
     reopened.save_widths("pave", reopened.pave_table)
     state = json.loads((tmp_path / "ui-state.json").read_text(encoding="utf-8"))
     assert state["split-dashboard"] == "QUJD", "保存列宽不得覆盖分栏状态"
-    assert state["backups"][1] == 210
+    assert state["lines"][1] == 210
     assert "pave" in state
     window.close(); reopened.close(); app.processEvents()
 

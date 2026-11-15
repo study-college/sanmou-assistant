@@ -68,15 +68,15 @@ def sandbox_hud(bottom: str, xunfang: bool) -> bool:
     沙盘界面上底栏“武将/同盟/职业/征战”和右下角“寻访”必定存在；寻访用模板匹配，
     比 OCR 稳（隐藏模式的“隐藏”小字会盖住“寻访”两个字的底部）。
     """
-    return bool(xunfang and "武将" in bottom and "同盟" in bottom
-                and ("职业" in bottom or "征战" in bottom or "证战" in bottom))
+    third = any(name in bottom for name in ("职业", "征战", "证战", "业", "战"))
+    return bool(xunfang and "武将" in bottom and "同盟" in bottom and third)
 
 
 class Vision:
     # 页型第一次识别为 unknown 时，第二次复核用的检测边长（模型默认 736，越慢但越细）。
     FALLBACK_DETECT_LIMIT = 480
     # 地块动作菜单的搜索范围与图标命中阈值（1920×1080 实机标定）。
-    ACTION_MENU_BOX = (1050, 120, 1750, 950)
+    ACTION_MENU_BOX = (1050, 120, 1920, 950)
     ACTION_ICON_MIN = .85
     # page 识别路径的共享存储置信度：page 各检查的最低消费置信度就是 .62，
     # 帧内共享统一按 .62 存储，调用方再按自己的 minimum 过滤，结果与直接识别一致。
@@ -577,6 +577,24 @@ class Vision:
             self.emit("vision", {"stage":"page", "page":result, "seconds":round(seconds,3)})
         return result
 
+    def selected_sandbox(self, image) -> bool:
+        """地块菜单和完整沙盘底栏同时在场时，确认“沙盘里选中了地块”。
+
+        这种页面不是未知页：菜单把右侧导航/资源栏遮住一部分，页型会一直落到
+        unknown，沙盘恢复就会被反复重试拖慢（2026-11-15 实机约 21 秒降到约 1.7 秒）。
+
+        只作兜底用（其他页型全部识别失败后才采纳）：渠道浮球面板、城内建筑抽屉
+        同样有底栏和动作图标，提前吞成 sandbox 会漏掉它们自己的关闭/处理流程。
+        """
+        if not self.sandbox_badge(image):
+            return False
+        if not self.action_buttons(image):
+            return False
+        left_zone = self.read(image, (0, 885, 430, 1075))
+        bottom = " | ".join(t.text for t in left_zone if t.y >= 930)
+        bottom += " | " + self.joined(image, (700, 930, 1915, 1075))
+        return sandbox_hud(bottom, True)
+
     def _page(self, image) -> str:
         prompt, _ = self.connection_prompt(image)
         if prompt:
@@ -695,6 +713,10 @@ class Vision:
             return "dismissible_overlay"
         if self.navigation_back_point(image) is not None:
             return "navigable_page"
+        # 兜底：底栏 + 地块菜单同时在场就是“沙盘里选中了地块”，不再当未知页反复重试。
+        # 放在最后一步，渠道面板/城内建筑抽屉等有自己证据的页型不会被吞成 sandbox。
+        if self.selected_sandbox(image):
+            return "sandbox"
         return "unknown"
 
     def navigation_back_point(self, image, require_title=True):
@@ -779,13 +801,14 @@ class Vision:
 
     def sandbox_badge(self, image, minimum=.75) -> bool:
         """右下角“寻访”徽记是否存在；沙盘页型的硬证据（不受顶部半透明资源栏影响）。"""
-        if (self.xunfang is None or image is None or not isinstance(image, np.ndarray)
+        template = getattr(self, "xunfang", None)
+        if (template is None or image is None or not isinstance(image, np.ndarray)
                 or image.shape[:2] != (1080, 1920)):
             return False
         roi = cv2.cvtColor(image[900:1040, 1680:1920], cv2.COLOR_BGR2GRAY)
-        if self.xunfang.shape[0] > roi.shape[0] or self.xunfang.shape[1] > roi.shape[1]:
+        if template.shape[0] > roi.shape[0] or template.shape[1] > roi.shape[1]:
             return False
-        return float(cv2.matchTemplate(roi, self.xunfang, cv2.TM_CCOEFF_NORMED).max()) >= minimum
+        return float(cv2.matchTemplate(roi, template, cv2.TM_CCOEFF_NORMED).max()) >= minimum
 
     # 地图左下角常驻的缩小（上箭头）/放大（下箭头）按钮：实机 2026-11-13 标定，
     # 位置固定、不会随弹层移动；只在这个小框里找，避免点到地图上的其他控件。
@@ -1090,14 +1113,15 @@ class Vision:
         key 与 assets/action-icons 一致：march/transfer/guard/siege/occupy/recruit/upgrade。
         图标匹配比文字识别快一个数量级，命中即可直接点；全不中时调用方再退回 OCR。
         """
-        if not self.action_icons:
+        icons = getattr(self, "action_icons", None)
+        if not icons:
             return {}
         x1, y1, x2, y2 = self.ACTION_MENU_BOX
         roi = image[y1:y2, x1:x2]
         if roi.size == 0:
             return {}
         found = {}
-        for key, template in self.action_icons.items():
+        for key, template in icons.items():
             if template.shape[0] > roi.shape[0] or template.shape[1] > roi.shape[1]:
                 continue
             result = cv2.matchTemplate(roi, template, cv2.TM_CCOEFF_NORMED)
@@ -1385,27 +1409,41 @@ class Vision:
         return obs
 
     def profile_merit(self, image) -> tuple[int | None, str]:
-        """个人信息页右上角的“武勋”数值（实机样本 501.5万）。
+        """个人信息页右上角的“武勋”数值（实机样本 501.5万、15.1/15.2/15.6万）。
 
         读数只用于展示“这轮挂机大概涨了多少武勋”，不参与派兵判断；读不到就返回
         (None, "")，调用方记一条日志后继续，不重试成环。
+
+        2026-11-15 真实帧复核（artifacts/analysis-2026-11-15-merit-read）：数字单独一个
+        OCR 候选、置信度 0.9997；左侧勋章内「武」字稳定可识（「勋」常被误识成「助」，
+        所以锚定只认「武」）。据此整行读取并要求数字紧邻「武」标签右侧、同一行：
+        标签缺失、候选不是恰好一个、或几何位置对不上，一律当作没读到，不猜数。
         """
         def pick(spans):
+            label = None
             found = []
             for t in spans:
+                if "武" in t.text:
+                    label = label or t
                 text = t.text.replace(",", "").replace(" ", "")
                 if re.fullmatch(r"\d+(?:\.\d+)?[万亿]?", text):
                     value = quantity(text)
                     if value is not None:
-                        found.append((value, text))
-            return found[0] if len(found) == 1 else (None, "")
+                        found.append((value, text, t))
+            return label, found
 
-        value, text = pick(self.read(image, (1675, 432, 1880, 516)))
-        if value is not None:
-            return value, text
-        # 字号或描边变化时整条数字可能左移；扩一圈仍要求只有一个纯数字，避免读到繁荣值。
-        spans = self.read(image, (1690, 425, 1900, 520))
-        return pick(spans)
+        label, found = pick(self.read(image, (1500, 420, 1905, 525)))
+        if label is None or len(found) != 1:
+            return None, ""
+        value, text, number = found[0]
+        lx0, ly0, lx1, ly1 = label.box
+        nx0, ny0, nx1, ny1 = number.box
+        if lx1 > nx0 + 8:
+            return None, ""  # 数字不在「武」标签右侧：位置对不上，不采纳。
+        heights = (ly1 - ly0, ny1 - ny0)
+        if min(heights) > 0 and min(ly1, ny1) - max(ly0, ny0) < 0.4 * min(heights):
+            return None, ""  # 与标签不在同一行：可能漂到别行数字，不采纳。
+        return value, text
 
     def grain(self, image) -> int | None:
         # 资源数字为浅色，前线玩家名为彩色描边；先移除背景文字，再核对库存与容量。

@@ -78,8 +78,9 @@ class TeamPolicy:
     minimum: int = 90
     stamina: int = 40
     supply: int = 80
+    # 旧版按队配置（目标组 / 补兵点顺序）：0.11.3 起只在读取旧配置迁移时使用一次，
+    # 保存不再写出；武勋共用 Profile.merit_backup，拉线每队用 Profile.line_backups。
     target_group: str = "默认"
-    # 本队专用补兵点，按列表顺序尝试；为空时使用全部已启用补兵点。
     backup_points: list = field(default_factory=list)
     # role == "pave" 时使用的路线名称。
     route: str = ""
@@ -180,8 +181,13 @@ class Profile:
     main_city: Optional[Point] = None
     teams: list[TeamPolicy] = field(default_factory=lambda: [TeamPolicy(slot=i) for i in range(1, 6)] + [TeamPolicy(slot=i, group="guard") for i in range(1, 4)])
     targets: list[Point] = field(default_factory=list)
+    # 旧版全局备用征兵点表：0.11.3 起仅用于读取旧配置时迁移，保存不再写出。
     backups: list[Point] = field(default_factory=list)
-    # 拉线目标：与武勋目标同一套坐标/目标组/顺序，拉线队按自己的目标组取第一个启用的点。
+    # 武勋备用征兵点：所有刷武勋队共用一个点（backup_enabled 仍是总开关；可选）。
+    merit_backup: Optional[Point] = None
+    # 拉线备用征兵点：按 main:slot 每队一个点，与武勋不共用；允许多队填同一个点（可选）。
+    line_backups: dict = field(default_factory=dict)
+    # 拉线目标：与武勋目标同一套坐标/顺序管理（不再有目标组），拉线队取第一个启用的点。
     line_targets: list[Point] = field(default_factory=list)
     pave_routes: list[PaveRoute] = field(default_factory=list)
     cli_path: str = ""
@@ -224,7 +230,6 @@ class Profile:
             errors.append("补粮恢复库存应高于触发库存，单周期屯田预算须为 0～30 次")
         route_names = [r.name for r in self.pave_routes]
         route_set = set(route_names)
-        backup_names = {p.name for p in self.backups}
         keys = []
         pave_used = []
         for t in self.teams:
@@ -252,7 +257,7 @@ class Profile:
             if t.role == "line":
                 if t.group != "main":
                     errors.append(f"{t.display} 的拉线只能由主城队伍执行")
-                if active and not any(p.enabled and p.group == t.target_group for p in self.line_targets):
+                if active and not any(p.enabled for p in self.line_targets):
                     errors.append(f"{t.display} 未配置启用的拉线目标")
             if t.role == "pave":
                 if t.group != "main":
@@ -265,16 +270,18 @@ class Profile:
                     pave_used.append(t.route)
             elif t.route:
                 errors.append(f"{t.display} 只有铺路任务才能指定路线")
-            if t.role == "merit" and active and not any(p.enabled and p.group == t.target_group for p in self.targets):
+            if t.role == "merit" and active and not any(p.enabled for p in self.targets):
                 errors.append(f"{t.display} 未配置启用的武勋目标")
-            for name in t.backup_points:
-                if name not in backup_names:
-                    errors.append(f"{t.display} 指定的补兵点 {name!r} 不存在")
         if len(keys) != len(set(keys)):
             errors.append("存在重复队伍槽位")
         if len(pave_used) != len(set(pave_used)):
             errors.append("同一条铺路路线只能分配给一支队伍")
-        for points in (self.targets, self.backups, self.line_targets, [self.main_city] if self.main_city else []):
+        # 征兵点校验与目标一致（名称、坐标、优先级、指令），但始终可选：
+        # 配置了拉线征兵点不会要求拉线目标，也不会拦刷武勋；缺地址只是该队不用备用点。
+        # 拉线允许多队同一个点，所以征兵点不做跨条目重名检查。
+        backup_points = [self.merit_backup] if self.merit_backup else []
+        backup_points += list(self.line_backups.values())
+        for points in (self.targets, self.line_targets, [self.main_city] if self.main_city else []):
             names = []
             for p in points:
                 names.append(p.name)
@@ -284,7 +291,15 @@ class Profile:
                     errors.append(f"地点 {p.name!r} 的允许动作无效")
             if len(names) != len(set(names)):
                 errors.append("地点名称重复，请为每个地点取不同的名称")
+        for p in backup_points:
+            if not p.name.strip() or not 0 <= p.x <= 3000 or not 0 <= p.y <= 3000 or not 1 <= p.priority <= 100:
+                errors.append(f"地点 {p.name!r} 的名称、坐标或优先级无效")
+            if not p.actions or any(a not in ACTION_NAMES for a in p.actions):
+                errors.append(f"地点 {p.name!r} 的允许动作无效")
         team_keys = {t.key for t in self.teams}
+        for key in self.line_backups:
+            if key not in team_keys or not key.startswith("main:"):
+                errors.append(f"拉线征兵点 {key!r} 不是有效的主城队伍")
         route_names = []
         for route in self.pave_routes:
             route_names.append(route.name)
@@ -320,6 +335,9 @@ class Profile:
 
         路线自身只保留“由哪支队执行”的存储字段，用户界面永远以队伍的任务为准，
         避免两个页面各写一份归属。
+        旧版全局 backups 与队伍 target_group/backup_points 只做迁移来源；
+        迁移完成后清空，保存不再依赖（to_dict 也不写出）。backups 另保留一份
+        由 merit_backup / line_backups 派生的内存兼容视图，供尚未接线的旧读取方使用。
         """
         owners = {}
         for team in self.teams:
@@ -331,10 +349,68 @@ class Profile:
             route.team = owners.get(route.name, "")
             route.enabled = bool(route.team)
         self.dailies["bandits"] = any(t.role == "bandits" for t in self.teams)
+        self.backups = []
+        for team in self.teams:
+            team.target_group = "默认"
+            team.backup_points = []
+        # 旧 Worker 仍读 profile.backups：由新字段派生同一份内存视图，行为不变；
+        # to_dict 仍剥离 backups，保存后不写出。Worker 直接读 merit_backup/line_backups
+        # 后即可删除这段派生。
+        seen = set()
+        for point in ([self.merit_backup] if self.merit_backup else []) + list(self.line_backups.values()):
+            if id(point) not in seen:
+                seen.add(id(point))
+                self.backups.append(point)
         return self
 
+    def _migrate_legacy_backups(self):
+        """旧全局 backups / 队伍 backup_points 一次性迁移到新的征兵点字段，保证地址不丢。
+
+        迁移规则（明确且可测）：
+        - 武勋共用点：按队伍顺序找第一支刷武勋队，取它 backup_points 里第一个
+          “存在且已启用”的旧点；没有队伍指定则回退旧全局顺序（priority 升序，
+          同优先级保持原列表顺序）里第一个已启用的点。一个都没有则为 None。
+        - 拉线每队：该队 backup_points 里第一个“存在且已启用”的点；
+          没指定或都没启用则回退旧全局首选点。只有拉线队生成条目。
+        新配置里已填的 merit_backup / line_backups 不被覆盖。
+        """
+        by_name = {p.name: p for p in self.backups}
+        enabled = sorted([p for p in self.backups if p.enabled], key=lambda p: p.priority)
+        global_first = enabled[0] if enabled else None
+        if self.merit_backup is None:
+            for team in self.teams:
+                if team.role != "merit":
+                    continue
+                for name in team.backup_points:
+                    point = by_name.get(name)
+                    if point is not None and point.enabled:
+                        self.merit_backup = point
+                        break
+                if self.merit_backup is not None:
+                    break
+            if self.merit_backup is None:
+                self.merit_backup = global_first
+        for team in self.teams:
+            if team.role != "line" or team.key in self.line_backups:
+                continue
+            chosen = None
+            for name in team.backup_points:
+                point = by_name.get(name)
+                if point is not None and point.enabled:
+                    chosen = point
+                    break
+            if chosen is None:
+                chosen = global_first
+            if chosen is not None:
+                self.line_backups[team.key] = chosen
+
     def to_dict(self):
-        return asdict(self)
+        data = asdict(self)
+        data.pop("backups", None)
+        for team in data["teams"]:
+            team.pop("target_group", None)
+            team.pop("backup_points", None)
+        return data
 
     @classmethod
     def from_dict(cls, value: dict) -> "Profile":
@@ -404,7 +480,20 @@ class Profile:
                     raise ValueError("队伍任务必须是文字")
                 if "backup_points" in team and not isinstance(team["backup_points"], list):
                     raise ValueError("队伍补兵点必须是列表")
-            for point in data.get("targets", []) + data.get("backups", []) + data.get("line_targets", []) + ([data["main_city"]] if data.get("main_city") else []):
+            point_dicts = list(data.get("targets", [])) + list(data.get("backups", [])) + list(data.get("line_targets", []))
+            point_dicts += [data["main_city"]] if data.get("main_city") else []
+            if data.get("merit_backup") is not None:
+                if not isinstance(data["merit_backup"], dict):
+                    raise ValueError("武勋备用征兵点格式不正确")
+                point_dicts.append(data["merit_backup"])
+            if "line_backups" in data:
+                if not isinstance(data["line_backups"], dict):
+                    raise ValueError("拉线征兵点必须是按队伍索引的地点")
+                for key, value in data["line_backups"].items():
+                    if not isinstance(key, str) or not isinstance(value, dict):
+                        raise ValueError("拉线征兵点必须是按队伍索引的地点")
+                    point_dicts.append(value)
+            for point in point_dicts:
                 for name in ("x", "y", "priority", "capacity"):
                     if name in point and type(point[name]) is not int:
                         raise ValueError(f"地点 {name} 必须是整数")
@@ -423,7 +512,10 @@ class Profile:
             data["line_targets"] = [Point(**t) for t in data.get("line_targets", [])]
             data["pave_routes"] = [PaveRoute(**r) for r in data.get("pave_routes", [])]
             data["main_city"] = Point(**data["main_city"]) if data.get("main_city") else None
+            data["merit_backup"] = Point(**data["merit_backup"]) if data.get("merit_backup") else None
+            data["line_backups"] = {key: Point(**value) for key, value in data.get("line_backups", {}).items()}
             obj = cls(**data)
+            obj._migrate_legacy_backups()
             obj.normalize()
             errors = obj.validate()
         except (TypeError, KeyError, IndexError, AttributeError) as exc:
@@ -501,11 +593,8 @@ def decide(profile: Profile, policy: TeamPolicy, obs: Observation, grain: Option
     if food_gate and profile.food_enabled and grain is not None and grain < profile.food_low:
         return Decision(reason="全局粮食库存低于下限，等待补粮")
     if obs.strength is not None and obs.maximum is not None and obs.strength < policy.threshold(obs.maximum):
-        order = {name: i for i, name in enumerate(policy.backup_points)}
-        backups = sorted([p for p in profile.backups if p.enabled and (not order or p.name in order)],
-                         key=lambda p: (order.get(p.name, 10 ** 6), p.priority))
-        if profile.backup_enabled and backups and grain is not None and grain >= profile.food_low:
-            return Decision("transfer", "兵力不足，调动到备用地点征满", backups[0])
+        if profile.backup_enabled and profile.merit_backup is not None and grain is not None and grain >= profile.food_low:
+            return Decision("transfer", "兵力不足，调动到备用地点征满", profile.merit_backup)
         return Decision(reason=f"兵力 {obs.strength} / 出击下限 {policy.threshold(obs.maximum)}，等待补兵")
     # 有意策略（docs/16、docs/18）：在主城的队伍要求游戏内「回城自动补兵」处于开启状态。
     # 这条对满兵队伍同样生效——脚本只提示、不替使用者改游戏设置；要打开请去游戏里操作。
@@ -515,7 +604,7 @@ def decide(profile: Profile, policy: TeamPolicy, obs: Observation, grain: Option
         return Decision(reason="等待体力达到设置下限")
     if obs.supply is not None and obs.supply < policy.supply:
         return Decision(reason="等待补给达到设置下限")
-    targets = sorted([p for p in profile.targets if p.enabled and p.group == policy.target_group], key=lambda p: p.priority)
+    targets = sorted([p for p in profile.targets if p.enabled], key=lambda p: p.priority)
     return Decision("merit", "当前队伍可尝试出击", targets[0]) if targets else Decision(reason="没有启用的战场目标")
 
 
@@ -569,14 +658,22 @@ def _legacy_line_point(text: str) -> Optional[dict]:
 
 
 def line_target(profile: "Profile", policy: TeamPolicy) -> Optional[Point]:
-    """拉线目标：本队目标组里按顺序第一个启用的点（与武勋目标同一套口径）。
+    """拉线目标：按顺序第一个启用的拉线目标点（与武勋目标同一套口径，不再有目标组）。
 
     用户 2026-11-13：拉线目标就是坐标点，和武勋目标一样放在「目标与铺路」里，
     名称只作备注，定位只认坐标；不再单独造一套只认 "x,y" 的格式。
+    2026-11-15：目标组取消，启用点全表按优先级取第一个。
     """
-    candidates = sorted([p for p in profile.line_targets if p.enabled and p.group == policy.target_group],
-                        key=lambda p: p.priority)
+    candidates = sorted([p for p in profile.line_targets if p.enabled], key=lambda p: p.priority)
     return candidates[0] if candidates else None
+
+
+def line_backup_point(profile: "Profile", policy: TeamPolicy) -> Optional[Point]:
+    """拉线队的备用征兵点：line_backups 按 main:slot 每队一个点，与武勋不共用。
+
+    允许多队配置同一个点；没有配置（或留空）时该队不使用拉线备用征兵点。
+    """
+    return profile.line_backups.get(policy.key)
 
 
 def line_decision(policy: TeamPolicy, obs: Observation, *, target: Optional[Point] = None,
