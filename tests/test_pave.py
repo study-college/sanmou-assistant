@@ -149,6 +149,27 @@ def test_pave_advances_after_arrival_and_dispatches_next(tmp_path):
     assert state["idx"] == 1 and state["status"] == "running" and state["note"] == "(300,300)"
 
 
+def test_pave_full_recheck_at_target_does_not_dispatch_duplicate(tmp_path):
+    worker = make_worker(tmp_path, make_profile([[400, 400]]))
+    seeded(worker)
+    game = FakeGame(worker, {})
+    readings = iter([observation("main:2", "outside", (399, 400)),
+                     observation("main:2", "outside", (400, 400))])
+    game.scan_team = lambda policy: (game.calls.append(("scan", policy.key)), next(readings))[1]
+    worker.process_pave(game)
+    assert not pave_calls(game)
+    assert progress(worker)["idx"] == 1 and progress(worker)["status"] == "done"
+
+
+def test_pave_missing_location_after_full_recheck_waits_without_dispatch(tmp_path):
+    worker = make_worker(tmp_path, make_profile([[400, 400]]))
+    seeded(worker)
+    game = FakeGame(worker, {"main:2": observation("main:2", "outside", None)})
+    worker.process_pave(game)
+    assert not pave_calls(game)
+    assert progress(worker)["idx"] == 0 and progress(worker)["status"] == "running"
+
+
 def test_pave_marks_done_after_last_point(tmp_path):
     worker = make_worker(tmp_path, make_profile([[400, 400]]))
     seeded(worker, note="(400,400)")
@@ -228,20 +249,31 @@ def test_pave_event_carries_progress_and_next_point():
     assert done["next"] is None and done["done"] == done["total"]
 
 
-def test_pave_skips_point_without_occupy_and_continues_next_point(tmp_path):
-    """用户 2026-11-10：别人已铺到该点、菜单没有攻占时跳过该点，继续下一个点。"""
+def test_pave_skips_consecutive_unavailable_points_and_dispatches_next(tmp_path):
+    worker = make_worker(tmp_path, make_profile([[400, 400], [300, 300], [560, 235]]))
+    game = FakeGame(worker, {"main:2": observation("main:2", "outside", (100, 100))})
+
+    def dispatch(policy, obs, target, ident):
+        game.calls.append(("pave", policy.key, tuple(target), ident))
+        if tuple(target) != (560, 235):
+            raise PavePointUnavailable(f"测试：{target} 没有攻占")
+
+    game.pave_dispatch = dispatch
+    worker.process_pave(game)
+    state = progress(worker)
+    assert [call[2] for call in pave_calls(game)] == [(400, 400), (300, 300), (560, 235)]
+    assert state["idx"] == 2 and state["status"] == "running"
+    assert state["intent"] == "" and worker.journal.pending("main:2") == []
+
+
+def test_pave_startup_skips_all_already_paved_points_in_one_pass(tmp_path):
     worker = make_worker(tmp_path, make_profile([[400, 400], [300, 300], [560, 235]]))
     game = FakeGame(worker, {"main:2": observation("main:2", "outside", (100, 100))})
     game.unavailable = True
     worker.process_pave(game)
-    state = progress(worker)
-    assert state["idx"] == 1 and state["status"] == "idle"
-    assert state["intent"] == "" and worker.journal.pending("main:2") == []
-    game.unavailable = False
-    worker.retry_at.clear()
-    game.calls.clear()
-    worker.process_pave(game)
-    assert pave_calls(game)[0][2] == (300, 300)
+    assert len(pave_calls(game)) == 3
+    assert progress(worker)["idx"] == 3 and progress(worker)["status"] == "done"
+    assert worker.journal.pending("main:2") == []
 
 
 def test_pave_skip_last_point_marks_route_done(tmp_path):
@@ -279,6 +311,17 @@ def test_pave_recovers_at_target_after_restart(tmp_path):
     assert state["idx"] == 1 and state["status"] == "done" and state["intent"] == ""
     assert worker.journal.pending("main:2") == []
     assert worker.journal.db.execute("SELECT status FROM intents WHERE id=?", (ident,)).fetchone()[0] == "accepted"
+
+
+def test_pave_restart_arrival_immediately_continues_next_segment(tmp_path):
+    worker = make_worker(tmp_path, make_profile([[400, 400], [300, 300]]))
+    fingerprint = worker.pave_fingerprint(worker.profile.pave_routes[0])
+    worker.journal.begin_pave("main:2", "路线A", 0, "攻占 (400, 400)", "100,100", fingerprint)
+    game = FakeGame(worker, {"main:2": observation("main:2", "outside", (400, 400))})
+    worker.process_pave(game)
+    assert [call[2] for call in pave_calls(game)] == [(300, 300)]
+    assert progress(worker)["idx"] == 1 and progress(worker)["status"] == "running"
+    assert worker.journal.pending("main:2") == []
 
 
 def test_pave_origin_unchanged_after_cooldown_is_rejected(tmp_path):
@@ -440,6 +483,40 @@ def stub_game(tmp_path, vision, image):
     game.save_image = lambda *args: None
     game.go_to = lambda point: image
     return game
+
+
+class MenuVision(MarkerVision):
+    def __init__(self, buttons):
+        super().__init__()
+        self.buttons = buttons
+
+    def action_buttons(self, image):
+        return self.buttons
+
+    def find(self, image, labels, rect=None, exact=False):
+        return None
+
+
+def test_pave_unreadable_action_menu_is_not_treated_as_unavailable(tmp_path):
+    image = np.zeros((1080, 1920, 3), np.uint8)
+    game = stub_game(tmp_path, MenuVision({}), image)
+    policy = game.p.teams[0]
+    obs = observation(policy.key, "outside", (400, 400))
+    ident = game.j.begin_pave(policy.key, "路线A", 0, "攻占 (400,400)", "100,100", "fp")
+    with pytest.raises(GameError, match="动作菜单未确认"):
+        game.pave_dispatch(policy, obs, (400, 400), ident)
+    assert not game.d.taps
+
+
+def test_pave_confirmed_menu_without_occupy_is_unavailable(tmp_path):
+    image = np.zeros((1080, 1920, 3), np.uint8)
+    game = stub_game(tmp_path, MenuVision({"march": (1238, 365, .99)}), image)
+    policy = game.p.teams[0]
+    obs = observation(policy.key, "outside", (400, 400))
+    ident = game.j.begin_pave(policy.key, "路线A", 0, "攻占 (400,400)", "100,100", "fp")
+    with pytest.raises(PavePointUnavailable):
+        game.pave_dispatch(policy, obs, (400, 400), ident)
+    assert not game.d.taps
 
 
 def test_pave_dispatch_requires_new_evidence_after_submit(tmp_path):

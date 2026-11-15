@@ -1121,6 +1121,17 @@ class Worker(QThread):
         return {"route": route.name, "team": team, "done": idx,
                 "total": len(route.points), "status": status, "next": nxt}
 
+    def _advance_pave(self, route, policy, idx, fingerprint, note="", intent=None, intent_status="rejected"):
+        new_idx = idx + 1
+        status = "done" if new_idx >= len(route.points) else "idle"
+        if intent:
+            self.journal.settle_pave(intent, intent_status, route.name, new_idx, status, note)
+        else:
+            self.journal.set_pave(route.name, new_idx, status, note, fingerprint=fingerprint)
+        self.retry_at.pop(f"pave:{route.name}", None)
+        self.publish("pave", self.pave_event(route, policy.key, new_idx, status))
+        return new_idx, status
+
     def _recover_pave(self, game, policy, route, progress):
         """dispatching：订单已写但结果未知。只按现场核对，不重发。"""
         idx, intent, origin = progress["idx"], progress["intent"], progress["origin"]
@@ -1134,12 +1145,10 @@ class Worker(QThread):
             except ValueError:
                 origin_point = None
         if target and pave_at_point(obs, target):
-            new_idx = idx + 1
-            status = "done" if new_idx >= len(route.points) else "idle"
-            self.journal.settle_pave(intent, "accepted", route.name, new_idx, status,
-                                     "恢复核对：已在目标点停留")
+            _new_idx, status = self._advance_pave(
+                route, policy, idx, progress["fingerprint"], "恢复核对：已在目标点停留", intent, "accepted")
             game.log(f"{policy.display} 恢复核对：已到达铺路目标，路线 {status}")
-            self.publish("pave", self.pave_event(route, policy.key, new_idx, status))
+            return obs
         elif marker == "busy":
             # 占领、建筑内自然征兵等：队伍确实已经动了，只是还没停在目标点。
             self.journal.settle_pave(intent, "accepted", route.name, idx, "running",
@@ -1167,7 +1176,7 @@ class Worker(QThread):
         # 其余情况保持待核对，不自动重发。
 
     def process_pave(self, game, food_recovery=False):
-        """每轮最多为每条路线推进一段；订单与进度原子落盘，结果未知不重发。"""
+        """游标可连续跳过无攻占点；每轮每条路线最多成功派出一段。"""
         if self.command != "run" or self.dry_run:
             return
         # 只执行被某支队伍选中的路线；未分配的路线只是草稿，不参与执行。
@@ -1203,14 +1212,20 @@ class Worker(QThread):
                 progress = self.journal.pave_progress(route.name)
             if progress["status"] in ("blocked", "done") or progress["idx"] >= len(route.points):
                 continue
+            obs = None
             if progress["status"] == "dispatching" and progress["intent"]:
-                self._recover_pave(game, policy, route, progress)
-                continue
+                obs = self._recover_pave(game, policy, route, progress)
+                if obs is None:
+                    continue
+                progress = self.journal.pave_progress(route.name)
+                if progress["status"] == "done" or progress["idx"] >= len(route.points):
+                    continue
             if time.time() < self.retry_at.get(f"pave:{route.name}", 0):
                 continue
             self.journal.set_phase(policy.key, "pave")
-            obs = self.observe_pave_team(
-                game, policy, full=progress["status"] not in ("running", "recovering"))
+            if obs is None:
+                obs = self.observe_pave_team(
+                    game, policy, full=progress["status"] not in ("running", "recovering"))
             if obs is None:
                 continue
             if obs.state == "wounded" or obs.wounded is True:
@@ -1220,8 +1235,7 @@ class Worker(QThread):
             idx = progress["idx"]
             marker = marker_of(obs)
             if marker in ("queued_battle", "fighting", "retreat"):
-                # 2026-11-10 用户：攻占空地时与守军战斗是铺路的正常过程，不当异常；
-                # 战斗结束后自动继续下一段。只有战斗后出现重伤才需要另行处理（下一阶段）。
+                # 攻占后的守军战斗属于在途现场；撤退则等队伍恢复后再核对。
                 name = {"queued_battle": "排队进入战斗", "fighting": "战斗中", "retreat": "撤退中"}[marker]
                 if marker == "retreat":
                     game.log(f"{policy.display} 铺路：角标显示{name}，暂停推进下一段，等现场恢复", "WARN")
@@ -1233,90 +1247,100 @@ class Worker(QThread):
                 continue
             if progress["status"] in ("running", "recovering"):
                 target = tuple(route.points[idx][:2])
+                if not pave_at_point(obs, target) and _can_dispatch(obs) and obs.wounded is False:
+                    # 快照可能刚错过到点或漏读坐标；结论只以完整重读为准。
+                    obs = self.observe_team(game, policy)
+                    if obs is None:
+                        continue
                 if pave_at_point(obs, target):
-                    idx += 1
-                    status = "done" if idx >= len(route.points) else "idle"
-                    self.journal.set_pave(route.name, idx, status, "", fingerprint=fingerprint)
+                    idx, status = self._advance_pave(route, policy, idx, fingerprint)
                     game.log(f"{policy.display} 已铺到 ({target[0]},{target[1]})"
                              + ("，路线完成" if status == "done" else "，继续下一段"))
-                    self.publish("pave", self.pave_event(route, policy.key, idx, status))
                     if status == "done":
                         continue
                     progress = self.journal.pave_progress(route.name)
                 elif _can_dispatch(obs) and obs.wounded is False:
-                    # 队伍已经停下（在主城或任意停留点）：恢复当前未完成段，不额外做补兵/回城判断。
+                    if obs.location is None:
+                        self.log_once(f"pave-location:{route.name}",
+                                      f"{policy.display} 已停下但坐标连续未读出，暂停恢复本段，避免向旧目标重复派兵",
+                                      every=600)
+                        self.publish("pave", self.pave_event(route, policy.key, idx, "waiting"))
+                        continue
                     self.journal.set_pave(route.name, idx, "idle", "队伍已停下，恢复当前未完成段", fingerprint=fingerprint)
                     progress = self.journal.pave_progress(route.name)
-                    # 刚才可能导航核对目标，派出前必须重新读取本队，不能沿用过期观测。
-                    obs = self.observe_team(game, policy)
-                    if obs is None:
-                        continue
                 else:
                     self.publish("decision", {"team": policy.key, "action": "wait", "reason": "铺路仍在进行或状态待确认；按现场等待"})
                     continue
-            if self.journal.pending(policy.key):
-                continue
-            if food_recovery:
-                self.publish("decision", {"team": policy.key, "action": "wait", "reason": "铺路：粮食恢复中，继续核对已有进度，暂停新出征"})
-                continue
-            if not _can_dispatch(obs):
-                continue
-            if obs.wounded is not False or obs.strength is None or obs.strength <= 0:
-                continue
-            point = route.points[idx]
-            target = (int(point[0]), int(point[1]))
-            if self.order_limit_reached():
-                return
-            if not game.account_checked:
-                try:
-                    if not game.verify_account():
-                        game.log("账号与主城未核对通过，铺路暂停", "WARN")
-                        return
-                except GameError as exc:
-                    game.log(f"铺路前账号核对失败：{exc}", "WARN")
+
+            # idx 始终指向下一个未处理点。可连续跳过，但每轮最多成功派出一段。
+            while True:
+                if self.journal.pending(policy.key):
+                    break
+                if food_recovery:
+                    self.publish("decision", {"team": policy.key, "action": "wait", "reason": "铺路：粮食恢复中，继续核对已有进度，暂停新出征"})
+                    break
+                if not _can_dispatch(obs):
+                    self.log_once(f"pave-undispatchable:{route.name}",
+                                  f"{policy.display} 本段未派出：现场状态 {obs.marker_label or obs.state or '未知'}"
+                                  f"（{obs.note or '没有可派证据'}），按现场等待", every=600)
+                    self.publish("pave", self.pave_event(route, policy.key, idx, "waiting"))
+                    break
+                if obs.wounded is not False or obs.strength is None or obs.strength <= 0:
+                    break
+                point = route.points[idx]
+                target = (int(point[0]), int(point[1]))
+                if self.order_limit_reached():
                     return
-            origin = f"{obs.location[0]},{obs.location[1]}" if obs.location else ""
-            ident = self.journal.begin_pave(policy.key, route.name, idx, f"攻占 {target}",
-                                            origin, fingerprint)
-            try:
-                game.pave_dispatch(policy, obs, target, ident)
-            except PaveUnknown as exc:
-                self.journal.mark_pave_unknown(ident, route.name, idx, str(exc))
-                self.retry_at[f"pave:{route.name}"] = time.time() + self.profile.retry_seconds
-                game.ensure_sandbox()
-                continue
-            except PavePointUnavailable as exc:
-                # 用户 2026-11-10：目标已被别人铺到/没有攻占时跳过该点，继续下一个点。
-                new_idx = idx + 1
-                status = "done" if new_idx >= len(route.points) else "idle"
-                self.journal.settle_pave(ident, "rejected", route.name, new_idx, status,
-                                         f"目标没有攻占指令，跳过该点：{exc}")
-                game.log(f"{policy.display} 铺路第 {idx+1} 段 {target} 没有攻占指令"
-                         "（可能已被别人铺到），按规则跳过并继续下一点", "INFO")
-                self.publish("pave", self.pave_event(route, policy.key, new_idx, status))
-                self.retry_at.pop(f"pave:{route.name}", None)
+                if not game.account_checked:
+                    try:
+                        if not game.verify_account():
+                            game.log("账号与主城未核对通过，铺路暂停", "WARN")
+                            return
+                    except GameError as exc:
+                        game.log(f"铺路前账号核对失败：{exc}", "WARN")
+                        return
+                origin = f"{obs.location[0]},{obs.location[1]}" if obs.location else ""
+                ident = self.journal.begin_pave(policy.key, route.name, idx, f"攻占 {target}",
+                                                origin, fingerprint)
                 try:
+                    game.pave_dispatch(policy, obs, target, ident)
+                except PaveUnknown as exc:
+                    self.journal.mark_pave_unknown(ident, route.name, idx, str(exc))
+                    self.retry_at[f"pave:{route.name}"] = time.time() + self.profile.retry_seconds
                     game.ensure_sandbox()
-                except GameError:
-                    pass
-                continue
-            except ObservationExpired:
-                self.journal.settle_pave(ident, "rejected", route.name, idx, "idle", "读数过期，未提交")
-                continue
-            except NetworkRecovered:
-                self.journal.settle_pave(ident, "rejected", route.name, idx, "idle", "网络重连，未提交")
-                raise
-            except GameError as exc:
-                self.journal.settle_pave(ident, "rejected", route.name, idx, "idle", f"未提交：{exc}")
-                game.log(f"{policy.display} 铺路段 {idx+1} 未派出：{exc}", "WARN")
-                self.retry_at[f"pave:{route.name}"] = time.time() + self.profile.retry_seconds
-                game.ensure_sandbox()
-                continue
-            self.journal.settle_pave(ident, "accepted", route.name, idx, "running",
-                                     f"({target[0]},{target[1]})")
-            self.retry_at[policy.key] = time.time() + self.profile.retry_seconds
-            self.publish("decision", {"team": policy.key, "action": "pave",
-                                      "reason": f"铺路路线 {route.name} 第 {idx+1} 段 → ({target[0]},{target[1]})"})
+                    break
+                except PavePointUnavailable as exc:
+                    idx, status = self._advance_pave(
+                        route, policy, idx, fingerprint, f"目标没有攻占指令，跳过该点：{exc}", ident)
+                    game.log(f"{policy.display} 铺路第 {idx} 段 {target} 没有攻占指令"
+                             "（可能已被别人铺到），按规则跳过并继续下一点", "INFO")
+                    self.retry_at.pop(f"pave:{route.name}", None)
+                    try:
+                        game.ensure_sandbox()
+                    except GameError:
+                        pass
+                    if status == "done":
+                        break
+                    progress = self.journal.pave_progress(route.name)
+                    continue
+                except ObservationExpired:
+                    self.journal.settle_pave(ident, "rejected", route.name, idx, "idle", "读数过期，未提交")
+                    break
+                except NetworkRecovered:
+                    self.journal.settle_pave(ident, "rejected", route.name, idx, "idle", "网络重连，未提交")
+                    raise
+                except GameError as exc:
+                    self.journal.settle_pave(ident, "rejected", route.name, idx, "idle", f"未提交：{exc}")
+                    game.log(f"{policy.display} 铺路段 {idx+1} 未派出：{exc}", "WARN")
+                    self.retry_at[f"pave:{route.name}"] = time.time() + self.profile.retry_seconds
+                    game.ensure_sandbox()
+                    break
+                self.journal.settle_pave(ident, "accepted", route.name, idx, "running",
+                                         f"({target[0]},{target[1]})")
+                self.retry_at[policy.key] = time.time() + self.profile.retry_seconds
+                self.publish("decision", {"team": policy.key, "action": "pave",
+                                          "reason": f"铺路路线 {route.name} 第 {idx+1} 段 → ({target[0]},{target[1]})"})
+                break
 
     def line_team_keys(self):
         return {t.key for t in self.profile.teams

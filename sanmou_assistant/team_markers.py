@@ -34,12 +34,9 @@ BADGE_SIZE = 58
 BADGE_X = 1840
 BADGE_DY = -8
 
-# 右侧队伍头像不是固定 x。2026-11-13 用户截图 + 本机真帧实测：
-# 选中建筑物（如寒沙寨）后，**驻扎在该建筑里的队伍**整行左移 25px（头像/血条/角标一起），
-# 同一帧里不在该建筑的队伍仍在原位；旧代码只按固定 x=1840 ±10 找角标，
-# 建筑内队伍因此被读成“未识别”。这里改成“每个槽位在已知布局里各试一次，
-# 取匹配最强的那套”，不要求整列一起移动。新增布局必须先有真帧实测再写进来。
-# 候选之间用 SEARCH_DX 的残差连成连续区间：0±6、-12±6、-25±6 → 覆盖 -31..+6。
+# 选中建筑物后，驻扎队伍整行可能左移（头像/血条/角标一起），且各行独立。
+# 这些实测锚点只限定血条位置测量范围，不再逐套猜角标布局；
+# hud_offset 在 -31..+6 内连续测量，模板搜索只补偿小残差。
 HUD_OFFSETS = (0, -12, -25)
 SEARCH_DX = 6
 SEARCH_DY = 10
@@ -66,6 +63,14 @@ GLYPH_MIN_SIDE = 20
 GLYPH_CENTRE = 16
 GLYPH_RING_DARK = 110
 
+# 2026-11-15 实机：掩罩半径 22 会越过角标黑色菱形底盘、伸进头像（亮肤色/发丝），
+# 减均值后的相关系数被背景拉低——同样的"停留"图标，深色头像下 0.93、亮色头像下只有
+# 0.828，低于 MATCH_MIN 就被判成"角标未识别"，铺路整段卡住。
+# 收到 17 只覆盖底盘内部：停留 0.828→0.946、停留真机 0.931→0.992，其他状态串判分数
+# 仍在 0.5 以下（见 artifacts/analysis-2026-11-15-pave-stall/）。
+MATCH_RADIUS = 17
+PLAQUE_RADIUS = 25
+
 _MATCH_MASK = None
 
 
@@ -83,7 +88,7 @@ def _diamond(radius):
 def _match_mask():
     global _MATCH_MASK
     if _MATCH_MASK is None:
-        _MATCH_MASK = _diamond(22)
+        _MATCH_MASK = _diamond(MATCH_RADIUS)
     return _MATCH_MASK
 
 
@@ -182,6 +187,25 @@ class TeamMarkerReader:
                 return True
         return False
 
+    @staticmethod
+    def hud_offset(image: np.ndarray, slot: int) -> int | None:
+        """由本队血条独立测量水平位置；测量不到就不能正向确认空闲。"""
+        if not 1 <= slot <= 5 or image is None or image.shape[:2] != (1080, 1920):
+            return None
+        y = SLOT_Y[slot - 1]
+        minimum, maximum = min(HUD_OFFSETS) - SEARCH_DX, max(HUD_OFFSETS) + SEARCH_DX
+        left, right = 1800 + minimum, 1884 + maximum
+        hsv = cv2.cvtColor(image[y + 45:y + 70, left:right], cv2.COLOR_BGR2HSV)
+        colored = (hsv[:, :, 1] > 90) & (hsv[:, :, 2] > 120)
+        scores = []
+        for dy in range(colored.shape[0] - 5):
+            rows = colored[dy:dy + 6]
+            for dx in range(minimum, maximum + 1):
+                start = dx - minimum
+                scores.append((float(rows[:, start:start + 84].mean()), dx))
+        score, dx = max(scores)
+        return dx if score >= .15 else None
+
     def hud_frame_confirmed(self, image: np.ndarray) -> bool:
         """这一帧能不能当作“右侧队伍 HUD 真实存在”的画面。
 
@@ -259,27 +283,11 @@ class TeamMarkerReader:
                           "ring": round(float(np.median(value[ring])), 1)})
         return found
 
-    def badge_like_anywhere(self, image, slot) -> bool:
-        """本行头像区域任意 x 上有没有“像角标”的形状。
-
-        用途只有一个：第一套布局没匹配上时，判断还要不要再试左移布局。
-        没有这种形状就当空闲；有但认不出，后面会保守报“未识别”，不降级成空闲。
-        """
-        y = SLOT_Y[slot - 1]
-        row = image[y - 22:y + 32, 1740 + min(HUD_OFFSETS):1920 + max(HUD_OFFSETS)]
-        if row.size == 0:
-            return False
-        value = cv2.cvtColor(row, cv2.COLOR_BGR2HSV)[:, :, 2]
-        bright = (value >= GLYPH_BRIGHT).astype(np.uint8)
-        count, labels, stats, centres = cv2.connectedComponentsWithStats(bright, 8)
-        return any(self._glyph_like(value, labels, stats, index)
-                   for index in range(1, count))
-
     def plaque_score(self, image, slot, dx=0):
-        """诊断用：菱形区域内近黑像素占比。不能单独当"有没有角标"的判据。"""
+        """诊断用：完整菱形区域的近黑像素占比，不单独作为角标证据。"""
         window = self._window(image, slot, dx)
         value = cv2.cvtColor(window, cv2.COLOR_BGR2HSV)[:, :, 2]
-        return float((value[_match_mask()] < 40).mean())
+        return float((value[_diamond(PLAQUE_RADIUS)] < 40).mean())
 
     def _scores(self, image, slot, dx=0):
         mask = _match_mask()
@@ -324,69 +332,49 @@ class TeamMarkerReader:
     def _read_slot(self, ctx: _FrameContext, slot: int, offset: int | None = None) -> dict:
         if not 1 <= slot <= 5:
             raise ValueError("主队槽位必须为1～5")
-        # 已知布局逐个试，取匹配最强的一套：建筑内队伍左移、其他队不动，不能假定整列一致。
-        # 为控制耗时：第一套布局匹配到可信状态就结束；第一套连“角标形状”都没有就当空闲，
-        # 只有“有角标但没认出”时才继续试左移布局（通常只有建筑内那 1～2 支队）。
-        candidates = (int(offset),) if offset is not None else HUD_OFFSETS
         image = ctx.image
-        head = None
-        all_glyphs = []
-        for index, dx in enumerate(candidates):
-            scores = self._scores(image, slot, dx)
-            ranked = sorted(scores.items(), key=lambda kv: kv[1][0], reverse=True)
-            best_state, (best_score, local_dx, local_dy) = ranked[0]
-            second_state, (second_score, *_rest) = ranked[1] if len(ranked) > 1 else ("unknown", (-2.0, 0, 0))
-            glyphs = self.glyph_candidates(image, slot, dx)
-            all_glyphs.extend(glyphs)
-            entry = {
-                "rank": (best_score, bool(glyphs)),
-                "dx": dx,
-                "state": best_state,
-                "score": best_score,
-                "local": (local_dx, local_dy),
-                "second": (second_state, second_score),
-                "glyphs": glyphs,
-                "plaque": self.plaque_score(image, slot, dx),
+        dx = int(offset) if offset is not None else self.hud_offset(image, slot)
+        if dx is None:
+            reason = "队伍行未确认" if ctx.hud_frame_confirmed() else "画面未确认"
+            return {
+                "slot": slot, "state": "unknown", "label": label("unknown"),
+                "reason": reason, "confidence": 0.0, "plaque": 0.0,
+                "glyph": None, "matched": None, "matched_label": None,
+                "matched_score": None, "second": None, "second_score": None,
+                "hud_dx": None, "shift": None,
             }
-            if head is None or entry["rank"] > head["rank"]:
-                head = entry
-            if head["score"] >= MATCH_MIN:
-                break
-            if index == 0 and not self.badge_like_anywhere(image, slot):
-                # 第一套布局没有任何角标形状：空闲，不必再为其他布局重复整窗匹配。
-                break
-        best_score = head["score"]
+        scores = self._scores(image, slot, dx)
+        ranked = sorted(scores.items(), key=lambda kv: kv[1][0], reverse=True)
+        best_state, (best_score, local_dx, local_dy) = ranked[0]
+        second_state, (second_score, *_rest) = ranked[1] if len(ranked) > 1 else ("unknown", (-2.0, 0, 0))
+        glyphs = self.glyph_candidates(image, slot, dx)
+        plaque = self.plaque_score(image, slot, dx)
         if best_score >= MATCH_MIN:
-            state, reason = head["state"], "模板匹配"
-        elif all_glyphs:
+            state, reason = best_state, "模板匹配"
+        elif glyphs:
             state, reason = "unknown", "角标未识别"
+        elif best_score < BEST_IDLE_MAX and ctx.hud_frame_confirmed():
+            # 空闲是正向结论：本队血条已定位、整帧 HUD 有效、本格没有角标。
+            state, reason = "idle", "无角标"
         elif best_score < BEST_IDLE_MAX:
-            # “无角标＝空闲”只在整帧确认是有效 HUD 时成立：全黑（切页/黑屏）、随机
-            # 噪声（采集花屏）等画面无法确认 HUD，一律 unknown，绝不读成空闲。
-            if ctx.hud_frame_confirmed():
-                state, reason = "idle", "无角标"
-            else:
-                state, reason = "unknown", "画面未确认"
+            state, reason = "unknown", "画面未确认"
         else:
             state, reason = "unknown", "角标未识别"
         idle = state == "idle"
-        glyph = head["glyphs"][0] if head["glyphs"] else (all_glyphs[0] if all_glyphs else None)
-        local_dx, local_dy = head["local"]
-        second_state, second_score = head["second"]
         return {
             "slot": slot,
             "state": state,
             "label": label(state),
             "reason": reason,
             "confidence": round(1 - min(best_score, .99), 3) if idle else round(best_score, 3),
-            "plaque": round(head["plaque"], 3),
-            "glyph": glyph,
-            "matched": None if idle else head["state"],
-            "matched_label": None if idle else label(head["state"]),
+            "plaque": round(plaque, 3),
+            "glyph": glyphs[0] if glyphs else None,
+            "matched": None if idle else best_state,
+            "matched_label": None if idle else label(best_state),
             "matched_score": None if idle else round(best_score, 3),
             "second": None if idle else second_state,
             "second_score": None if idle else round(second_score, 3),
-            "hud_dx": head["dx"],
+            "hud_dx": dx,
             "shift": None if idle else [local_dx, local_dy],
         }
 

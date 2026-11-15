@@ -103,6 +103,14 @@ ENGAGED = ("queued_battle", "fighting", "guard")
 MOVING = ("march", "transfer", "retreat")
 
 
+def marker_with_home_evidence(marker, home: bool):
+    """空闲/练兵只存在于主城；与位置矛盾时不得作为可派证据。"""
+    if marker and marker.get("state") in ("idle", "training") and not home:
+        return {**marker, "state": "unknown", "label": label("unknown"),
+                "reason": "主城状态与位置矛盾"}
+    return marker
+
+
 def can_dispatch(state: str) -> bool:
     return state in DISPATCHABLE
 

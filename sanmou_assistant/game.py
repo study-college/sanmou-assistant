@@ -15,8 +15,8 @@ from .journal import Journal, cycle_key
 from .evidence import EvidenceStore, EvidenceLimitError
 from .models import (ACTION_NAMES, Observation, Point, Profile, TeamPolicy, bandit_decision,
                      observation_expired, point_label)
-from .team_markers import HUD_OFFSETS, TeamMarkerReader
-from .team_states import LEGACY_STATE, can_dispatch, label as state_label
+from .team_markers import HUD_OFFSETS, SEARCH_DX, TeamMarkerReader
+from .team_states import LEGACY_STATE, can_dispatch, marker_with_home_evidence, label as state_label
 from .transport import Device, Stopped, TransportUnavailable
 from .vision import Vision, clock_seconds, pairs, quantity
 
@@ -985,7 +985,7 @@ class Game:
         self.check_account(image)
         home = bool(self.p.main_city and self.main_city_selected(image, coord))
         # 与状态判定同一帧读角标，避免"兵马数值一帧、状态另一帧"。
-        marker = self.read_team_marker(image, policy.slot)
+        marker = marker_with_home_evidence(self.read_team_marker(image, policy.slot), home)
         detail_observed_at = None
         if home:
             # 与主城定位使用同一套详情裁剪，名称和坐标共同确认账号。
@@ -1084,7 +1084,8 @@ class Game:
             if attempt == 0:
                 self.d.control.sleep(.6)
                 image = self.wait_transition(self.capture())
-        marker = self.read_team_marker(image, policy.slot)
+        home = bool(self.p.main_city and coord == (self.p.main_city.x, self.p.main_city.y))
+        marker = marker_with_home_evidence(self.read_team_marker(image, policy.slot), home)
         # 重伤和角标必须来自同一帧：read_team_marker 在过渡帧会自己重截，用它的那一帧。
         wounded_frame = getattr(self, "marker_frame", None)
         wounded = self.v.team_wounded(wounded_frame if wounded_frame is not None else image, policy.slot)
@@ -1762,7 +1763,7 @@ class Game:
             activity = self.v.joined(image, (1690 + min(HUD_OFFSETS), y-60, 1915, y+78))
             # 颜色扫描用标准布局：已确认角标时按它的布局读，读不到再退回标准布局，
             # 不拿 -25 去扫地图（会把地图金色/蓝色误当成受理证据）。
-            dx = hud_dx if hud_dx in HUD_OFFSETS else 0
+            dx = hud_dx if isinstance(hud_dx, (int, float)) and min(HUD_OFFSETS) - SEARCH_DX <= hud_dx <= max(HUD_OFFSETS) + SEARCH_DX else 0
             hsv = cv2.cvtColor(image[y+3:y+42, 1840+dx:1900+dx], cv2.COLOR_BGR2HSV)
             yellow = cv2.countNonZero(cv2.inRange(hsv, (18, 100, 150), (40, 255, 255)))
             blue = cv2.countNonZero(cv2.inRange(hsv, (90, 70, 110), (125, 255, 255)))
@@ -1909,6 +1910,12 @@ class Game:
         else:
             button = self.v.find(image, ["攻占"], (1080, 150, 1810, 880), exact=True)
             if not button:
+                other_action = bool(buttons) or self.v.find(
+                    image, ["行军", "调动", "驻守", "攻城", "征兵", "升级", "扫荡"],
+                    (1080, 150, 1810, 880), exact=True)
+                if not other_action:
+                    self.save_image(image, "pave-point-unconfirmed", True)
+                    raise GameError(f"目标 {name} 的地块动作菜单未确认，不能按无攻占跳过")
                 self.save_image(image, "pave-point-unavailable", True)
                 raise PavePointUnavailable(f"目标 {name} 当前没有攻占指令")
             self.d.tap(button.x, button.y, .45)
