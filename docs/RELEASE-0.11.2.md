@@ -45,12 +45,16 @@
 
 - 角标与状态判定：`tests/test_team_markers*.py`、`tests/test_marker_states.py`、`tests/test_hud_layout.py`、`tests/test_marker_debounce_2026_11_13.py` 覆盖血条二维测量、掩罩半径、连续偏移、空闲正向结论与矛盾转 unknown。
 - 铺路状态机：`tests/test_pave.py` 覆盖统一游标推进、连续跳点、每轮单段、坐标不明等待、菜单未确认不得跳过、重复到点不重派、启动恢复共用流程。
-- 完整全量测试结果、运行时自检（`--command runtime`）、UI 渲染验证（`--ui-proof`）与源码审计结果待构建后补充回填；本说明不预写任何通过结论。
+- 本机全量测试：**713 passed / 57 skipped / 0 failed**（480.45 秒）；公开副本独立测试：**391 passed / 13 skipped / 0 failed**（91.62 秒）。
+- 运行时自检（`--command runtime`）：Qt / OpenCV / ONNX / OCR 加载与数值样本识别通过；六页 UI proof 均生成，offscreen 字体边界见下节。
+- 源码导出审计 170 项、Git 历史审计 595 项、发布归档审计 601 项，均 0 问题；本机预检包 600 个清单文件校验通过。
 
-## 发布与校验（待构建）
+## 发布与校验
 
-- 发布状态：待构建。发布资产（Windows 完整包）、字节数、SHA256 校验、GitHub Actions 运行号与本机预检包信息在此版本构建与校验完成后回填。
-- 全量测试、runtime 自检、ui-proof 与源码审计的最终结果随构建一并回填。
+- 发布状态：**2026-11-15 正式 published**。源码提交 `7733ba8b1fd123be9f2024987dcfc2ed13c9e061`，附注标签对象 `edf0002a4b7edfe459ecc940c17213e841339bf2`，标签 `v0.11.2`。
+- 发布资产：`SanmouAssistant-0.11.2-Windows-x64-full.zip`，**138,276,268 字节**；SHA256：`38e738262675c06f6e4976378a9056656180b06a85f2f2b25ba4c21a45b8224f`。对应 `.zip.sha256` 文件一并发布。
+- GitHub Actions：源码 CI `43672108101`、Windows Build `43672163276`、Release Verify `43672401306` 全部成功；Verify 完整下载 ZIP，比对摘要，核对清单并运行打包 exe 的 OCR 检查。
+- 本机预检包：138,931,292 字节，SHA256 `0beab47b5b08d7075e0ae97352a803d42331b161d53629c8775f7640db3e67cf`。
 
 ## 已知限制与边界
 
