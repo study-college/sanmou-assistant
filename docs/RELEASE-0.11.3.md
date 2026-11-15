@@ -68,11 +68,11 @@
 
 ## 验证范围（源码侧）
 
-- 全量离线测试：**756 passed / 57 skipped / 0 failed**。
+- 全量离线测试：**756 passed / 57 skipped / 0 failed（743.46 秒）**，日志 `artifacts/release-0.11.3/pytest-source.log`；公开副本独立测试：**427 passed / 14 skipped / 0 failed（121.48 秒）**，日志 `artifacts/release-0.11.3/pytest-public-export.log`。
 - 定向：UI 与粘贴识别 56 项、画面识别管线 21 项、本轮行为改动 52 项，全部通过。
 - 真实截图复核：选中地块/主城、渠道福利浮窗、城内征兵抽屉、武勋个人信息页（15.2/15.6 万）。
-- 配置兼容：本机两个账号的真实配置与示例配置，读入 → 校验 → 保存 → 再读一致。
-- 运行时自检 `--command runtime` 通过；六页 UI 截图生成。
+- 配置兼容：本机两个账号的真实配置与示例配置，读入 → 校验 → 保存 → 再读一致；导出目录审计 172 项、发布归档审计 603 项均 0 问题。
+- 运行时自检（源码与打包 exe 各一次）通过；六页 UI 截图生成。
 
 ## 已知限制与边界
 
@@ -82,4 +82,7 @@
 
 ## 发布与校验
 
-- 待发布后补充：源码提交、标签对象、Release 资产大小与 SHA256、Actions 运行编号。
+- 发布状态：**2026-11-15 正式 published**（Latest）。源码提交 `f6b175485e0b3affe1efab2da954ef7ef40caefb`，附注标签对象 `1baa4f5db4d1470a67b1e67add0e5cce12cf62a0`，标签 `v0.11.3`。
+- 发布资产：`SanmouAssistant-0.11.3-Windows-x64-full.zip`，**138,303,415 字节**；SHA256：`5a7db3ea6998c949b324d0a9cca91aa7d7541466021ced43e2e1c2d4fbb8b454`。同名 `.zip.sha256` 一并发布。
+- GitHub Actions：源码 CI `43724239853`、Windows Build `43724281140`、Release Verify `43725080168` 全部成功；Verify 完整下载 ZIP，比对摘要，核对清单并运行打包 exe 的 OCR 检查。
+- 本机预检包：138,959,466 字节，SHA256 `eafccfd88727cdbc29a36eb2348b702e11f5aa704a1f8274b967acbc01464777`，602 个清单文件校验通过；打包 exe 运行时自检与六页 UI proof 通过。
