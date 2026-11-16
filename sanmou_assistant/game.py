@@ -380,7 +380,42 @@ class Game:
         if page == "enemy_warning":
             self.resolve_enemy_warning(image)
             return page
+        if page == "pave_stamina_prompt":
+            return page if self.resolve_pave_stamina_prompt(image) else None
         return None
+
+    def resolve_pave_stamina_prompt(self, image):
+        """「本次出征中铺路地块将消耗体力，是否确认出征？」：勾选今日不再提示→确定。
+
+        用户 2026-11-15 明确要求：这个页面要勾上“今日登录不再提示”再继续出征。
+        勾选状态必须复读确认；读不到复选框/勾选未确认时只记 WARN，仍按用户口径确认出征。
+        返回是否真的处理了（识别不齐返回 False，不点击）。
+        """
+        info = _vcall(self.v, "pave_stamina_prompt", None, image)
+        if info is None:
+            return False
+        self.save_image(image, "pave-stamina-prompt", True)
+        self.emit("status", "出征提示 · 勾选“今日登录不再提示”并继续出征")
+        label = info.get("remember_label")
+        if label is None:
+            self.log("铺路体力提示：未读到“今日登录不再提示”，本次只确认", "WARN")
+        else:
+            box = _vcall(self.v, "checkbox_before", None, image, label)
+            if box is None:
+                self.log(f"铺路体力提示：未定位“{label.text}”前的复选框，本次只确认", "WARN")
+            else:
+                state = _vcall(self.v, "checked", None, image, *box)
+                if state is False:
+                    self.d.tap(*box, .35)
+                    image = self.capture()
+                    state = _vcall(self.v, "checked", None, image, *box)
+                if state:
+                    self.log(f"铺路体力提示：已勾选“{label.text}”", "INFO")
+                else:
+                    self.log(f"铺路体力提示：未能确认“{label.text}”已勾选，本次只确认", "WARN")
+        self.d.tap(*info["confirm_point"], 1.2)
+        self.log("铺路体力提示：已确认出征，继续核对出发", "INFO")
+        return True
 
     def clear_map_selection(self, image=None, expected_page="sandbox"):
         image = self.ensure_sandbox(refresh_grain=False) if image is None else image
@@ -526,6 +561,9 @@ class Game:
                     raise RecognitionUnavailable("出征确认弹窗暂未读清，等待重读")
                 self.emit("status", "出征二次确认 · 选择继续出征")
                 self.d.tap(*info["continue_point"], .9)
+            elif page == "pave_stamina_prompt":
+                # 铺路体力提示若残留到巡检阶段，同样按用户口径勾选并确认，不当作未知页。
+                self.resolve_pave_stamina_prompt(image)
             elif page == "enemy_warning":
                 self.resolve_enemy_warning(image)
             elif page == "monthly_claimed":
@@ -1070,6 +1108,10 @@ class Game:
             obs.marker_at = time.time()
             if marker["state"] != "unknown" and not home:
                 obs.state = LEGACY_STATE.get(marker["state"], obs.state)
+            if marker["state"] == "wounded" or obs.wounded is True:
+                obs.wounded = True
+                obs.marker_state = "wounded"
+                obs.marker_label = state_label("wounded")
         # 自然征兵的队伍只能从主城出发。2026-11-04 实机：涪县征兵期间角标读到“空闲”，
         # LEGACY_STATE 把空闲一律当 home，程序据此清了 backup 阶段并从征兵点直接拉线。
         # 这里以发兵记录为准：没确认回到主城坐标就按城外处理，交给 decide() 走“够兵→回城”。
@@ -1101,16 +1143,15 @@ class Game:
                 image = self.wait_transition(self.capture())
         home = bool(self.p.main_city and coord == (self.p.main_city.x, self.p.main_city.y))
         marker = marker_with_home_evidence(self.read_team_marker(image, policy.slot), home)
-        # 重伤和角标必须来自同一帧：read_team_marker 在过渡帧会自己重截，用它的那一帧。
-        wounded_frame = getattr(self, "marker_frame", None)
-        wounded = self.v.team_wounded(wounded_frame if wounded_frame is not None else image, policy.slot)
         obs = Observation(policy.key, state=LEGACY_STATE.get(marker["state"], "unknown") if marker else "unknown",
-                          location=coord, wounded=wounded, note="铺路快照")
+                          location=coord, wounded=marker["wounded"] if marker else None, note="铺路快照")
         if marker:
             obs.marker_state = marker["state"]
             obs.marker_label = marker["label"]
             obs.marker_confidence = marker["confidence"]
             obs.marker_at = time.time()
+            if marker["state"] == "unknown":
+                obs.note = marker["reason"]
         self.emit("observation", asdict(obs))
         return obs
 
@@ -1125,6 +1166,16 @@ class Game:
             self._marker_reader = reader
         return reader
 
+    def _marker_with_wound(self, image, slot, marker):
+        """同帧读取头像文字，已识别的行动角标也可能叠加重伤。"""
+        if marker.get("reason") in ("画面未确认", "队伍行未确认"):
+            return {**marker, "wounded": None}
+        wounded = _vcall(self.v, "team_wounded", None, image, slot)
+        if wounded:
+            return {**marker, "wounded": True, "state": "wounded",
+                    "label": state_label("wounded"), "reason": "头像重伤文字"}
+        return {**marker, "wounded": wounded}
+
     def read_team_marker(self, image, slot):
         """单帧读一个槽位的角标状态；画面还在过渡就重截，读不到返回 None。"""
         self.marker_frame = None
@@ -1138,27 +1189,25 @@ class Game:
                 self.marker_last = {}
             for attempt in range(2):
                 if _vcall(self.v, "frame_clear", True, image) and reader.avatars_visible(image):
-                    # 记录真正用于读角标的这一帧：重伤必须和角标同帧判断，
-                    # 否则会拿一张过渡帧的“没读到重伤”去盖掉另一帧的结论。
-                    self.marker_frame = image
-                    marker = reader.read_slot(image, slot)
-                    if marker and marker["state"] in ("idle", "unknown") and _vcall(self.v, "team_wounded", False, image, slot):
-                        marker = {**marker, "state": "wounded", "label": state_label("wounded"), "reason": "头像重伤文字"}
+                    marker = self._marker_with_wound(image, slot, reader.read_slot(image, slot))
                     # 防抖（2026-11-13 实机）：空闲=无角标，但“到点/开战”的一瞬角标也会消失。
                     # 上一状态还是行军/调动/撤退/战斗/忙碌，这一帧却“无角标”时，再截一帧确认；
                     # 只有连续两帧都无角标才认空闲，不能拿一帧的瞬时缺失当成回主城。
                     # 不设时间窗：上次读到的状态就是最近一次现场，确认过一次空闲后
                     # marker_last 会变成 idle，后续不会再补读。
                     previous = self.marker_last.get(slot)
-                    if (marker and marker["state"] == "idle" and previous
+                    if (marker["state"] == "idle" and previous
                             and previous[0] not in ("idle", "training")):
                         self.d.control.sleep(.6)
                         again = self.capture()
                         if _vcall(self.v, "frame_clear", True, again) and reader.avatars_visible(again):
-                            second = reader.read_slot(again, slot)
-                            if second and second["state"] != "idle":
-                                self.marker_frame = again
-                                marker = second
+                            image = again
+                            marker = self._marker_with_wound(image, slot, reader.read_slot(image, slot))
+                        else:
+                            image = None
+                            marker = {"slot": slot, "state": "unknown", "label": state_label("unknown"),
+                                      "reason": "画面未确认", "confidence": 0.0, "wounded": None}
+                    self.marker_frame = image
                     self.marker_last[slot] = (marker["state"], time.time())
                     return marker
                 if attempt == 0:
@@ -1203,9 +1252,7 @@ class Game:
                 marker = markers.get(slot)
                 if not marker:
                     continue
-                if marker["state"] in ("idle", "unknown") and _vcall(self.v, "team_wounded", False, image, slot):
-                    marker = {**marker, "state": "wounded", "label": state_label("wounded"), "reason": "头像重伤文字"}
-                states[slot] = marker
+                states[slot] = self._marker_with_wound(image, slot, marker)
             return states
         except (Stopped, TransportUnavailable):
             # 停止/暂停检查与设备断连穿过整帧读取时必须原样抛出：
@@ -1987,6 +2034,10 @@ class Game:
                 tapped = True  # 从发送提交命令开始，失败均保留为未知，不能推定未提交。
                 self.d.tap(submit_x, submit_y, 1.8)
                 after = self.capture_clear(f"pave-result-{attempt+1}", True)
+                # 铺路地块的体力提示会挡在结果页前面：先按用户口径勾选“今日不再提示”
+                # 并确认，再看角标/页面；否则这一帧会被当成未知页，铺路原地卡住。
+                if self.clear_dispatch_prompt(after):
+                    after = self.capture_clear("pave-dispatch-prompt-answer", True)
                 after_marker = self.read_team_marker(after, policy.slot)
                 if (after_marker and before_state and after_marker["state"] != "unknown"
                         and after_marker["state"] != before_state):

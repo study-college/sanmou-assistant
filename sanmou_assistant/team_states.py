@@ -12,6 +12,7 @@ STATES = {
     "idle": "空闲",
     "training": "练兵（可出击）",
     "transfer": "调动",
+    "siege_transfer": "攻城调动",
     "transfer_stay": "调动停留",
     "march": "行军",
     "guard": "驻守",
@@ -31,9 +32,9 @@ RULES = {
         "主队头像没有角标。"
     ),
     "training": (
-        "用户 2026-11-08 确认：智能练兵。部队中武将体力均满且空闲在主城时自动进入练兵，"
-        "武将可持续获得经验；体力未满自动取消。绿色持枪人影角标，仍可正常行动，"
-        "调度上等同空闲，可派出。"
+        "智能练兵为绿色持枪人影，武将可持续获得经验，体力未满自动取消。"
+        "用户 2026-11-16 确认：主城显示在右下，按空闲的派兵规则；"
+        "出城后显示在左下，右下仍显示行动状态。"
     ),
     "transfer_stay": (
         "部队被调动进城外建筑（营帐、城池等）后停留在建筑里的状态，用户称“调动停留”。"
@@ -42,6 +43,10 @@ RULES = {
     "transfer": (
         "用户明确：指调动这个过程本身——正在被调动、还没在建筑里停留下来。"
         "角标是蓝色右箭头，与“调动停留”的旗形不同。"
+    ),
+    "siege_transfer": (
+        "用户 2026-11-16 确认：向攻城大营移动，角标为蓝色旗和右箭头。"
+        "与普通调动共用移动期间的等待规则。"
     ),
     "retreat": (
         "部队在返回出发点的过程中处于撤退状态；撤退状态下不会发生战斗。"
@@ -59,7 +64,7 @@ RULES = {
         "部队在大世界土地上不执行其他指令时的状态；停留中可以发生战斗。"
     ),
     "wounded": (
-        "用户 2026-11-02 实机确认：重伤不以角标表示，头像正中间压白色“重伤”字样。"
+        "重伤在头像正中显示白字，可与撤退、调动停留同时出现；回主城仍显示重伤。"
         "重伤队伍不派出；倒计时从详情页或出征页读一次后本地倒数。"
     ),
     "queued_battle": (
@@ -83,6 +88,7 @@ LEGACY_STATE = {
     "idle": "home",
     "training": "home",
     "transfer": "marching",
+    "siege_transfer": "marching",
     "transfer_stay": "outside",
     "march": "marching",
     "guard": "guarding",
@@ -100,11 +106,11 @@ LEGACY_STATE = {
 # 忙碌（占领、建筑内自然征兵等）不派；在路上、驻守、撤退、战斗、排队、未识别都不派。
 DISPATCHABLE = ("idle", "training", "stationary", "transfer_stay")
 ENGAGED = ("queued_battle", "fighting", "guard")
-MOVING = ("march", "transfer", "retreat")
+MOVING = ("march", "transfer", "siege_transfer", "retreat")
 
 
 def marker_with_home_evidence(marker, home: bool):
-    """空闲/练兵只存在于主城；与位置矛盾时不得作为可派证据。"""
+    """右下角的空闲/练兵表示在主城；用已读到的位置排除矛盾。"""
     if marker and marker.get("state") in ("idle", "training") and not home:
         return {**marker, "state": "unknown", "label": label("unknown"),
                 "reason": "主城状态与位置矛盾"}

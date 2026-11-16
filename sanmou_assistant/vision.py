@@ -10,7 +10,7 @@ import cv2
 import numpy as np
 
 from .models import Observation
-from .team_markers import HUD_OFFSETS
+from .team_markers import HUD_OFFSETS, SLOT_Y
 
 
 @dataclass
@@ -607,6 +607,10 @@ class Vision:
             return "enemy_warning"
         if self.confirm_dialog(image) is not None:
             return "dispatch_confirm"
+        # 铺路地块出征的体力提示（2026-11-15 真帧）：也是「提示+确定」模态，必须先于
+        # 底栏/标题判定；否则会被当未知页，程序在“等待画面恢复”上原地打转。
+        if self.pave_stamina_prompt(image) is not None:
+            return "pave_stamina_prompt"
         # 聊天面板的“前往好友”不是地图前往；先核对两个专有控件。
         if self.chat_close_point(image) is not None:
             return "chat"
@@ -922,6 +926,31 @@ class Vision:
         confirm = self.find(image, ["确定"], (1020, 610, 1355, 707), exact=True)
         return (cancel, confirm) if cancel and confirm else None
 
+    def pave_stamina_prompt(self, image):
+        """出征弹窗「本次出征中铺路地块将消耗体力，是否确认出征？」。
+
+        2026-11-15 用户现场真帧（二号账号指定铺路地块，点出征后弹出；同一晚的
+        `_evidence/faults/**/*unknown-page.png` 里连续 11 帧都是它，程序把它当未知页卡住）。
+        判据：标题「提示」+ 正文同时含「铺路地块」「消耗体力」「是否确认出征」
+        + 左侧「取消」+ 右侧「确定」；左下「今日登录不再提示」有则一并返回。
+        任一项读不齐就返回 None，调用方不得据此点击（这是会消耗体力的确认框）。
+        """
+        # 复用 confirm_dialog 同一条标题区域（帧内共享识别，热路径几乎不增加 OCR 成本）。
+        if self.find(image, ["提示"], (820, 345, 1110, 445), exact=True) is None:
+            return None
+        body = self.joined(image, (560, 470, 1350, 545)).replace(" ", "")
+        if not all(word in body for word in ("铺路地块", "消耗体力", "是否确认出征")):
+            return None
+        cancel = self.find(image, ["取消"], (650, 655, 810, 730), exact=True)
+        confirm = self.find(image, ["确定"], (1100, 655, 1280, 730), exact=True)
+        if cancel is None or confirm is None:
+            return None
+        remember = self.find(image, ["今日登录不再提示"], (850, 585, 1130, 645), exact=True)
+        return {"kind": "pave_stamina", "body": body,
+                "confirm_point": (round(confirm.x), round(confirm.y)),
+                "cancel_point": (round(cancel.x), round(cancel.y)),
+                "remember_label": remember}
+
     def confirm_dialog(self, image):
         """出征前的二次确认弹窗：未加点武将 / 未携带满战法。
 
@@ -1186,21 +1215,15 @@ class Vision:
         return not washed
 
     def team_wounded(self, image, slot):
-        """头像正中间是否压着“重伤”白字。
-
-        只有没有角标的队伍才需要查（重伤队在主城，角标区为空）；一次小区域 OCR，
-        文字必须正好是“重伤”，地图上的单个“伤”字或白色撤退箭头不会被当成重伤。
-        2026-11-13：选中建筑物时，驻扎在该建筑里的队伍整行左移 ~25px，固定 x 会漏读；
-        按所有已知布局各读一次，读到即算重伤。
-        """
-        if not 1 <= slot <= 5:
+        """头像上的重伤白字可与撤退、调动停留等角标同屏。"""
+        if not 1 <= slot <= len(SLOT_Y):
             return False
-        y = (245, 383, 520, 660, 785)[slot - 1]
-        for dx in HUD_OFFSETS:
-            text = self.joined(image, (1808 + dx, y - 19, 1880 + dx, y + 19)).replace(" ", "")
-            if "重伤" in text:
-                return True
-        return False
+        y = SLOT_Y[slot - 1]
+        left = 1808 + min(HUD_OFFSETS)
+        right = 1880 + max(HUD_OFFSETS)
+        portrait = cv2.resize(image[y - 30:y + 30, left:right], None, fx=2, fy=2)
+        text = self.read_line(portrait, minimum=.50)
+        return text is not None and "重伤" in re.sub(r"[\s|｜]+", "", text)
 
     def deploy_button_enabled(self, image):
         """出征按钮是否可点：按钮底色为黄色才算可用（灰色＝条件不满足）。"""

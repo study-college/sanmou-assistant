@@ -54,8 +54,10 @@ class BatchReader:
 
     def read_slots(self, image, slots):
         self.calls.append((image, tuple(slots)))
-        return [{"slot": slot, "state": "idle", "label": "空闲", "confidence": .9}
-                for slot in slots]
+        return [{**self.markers[slot], "slot": slot, "confidence": .9} for slot in slots]
+
+    markers = {1: {"state": "idle", "label": "空闲"},
+               2: {"state": "transfer_stay", "label": "调动停留"}}
 
 
 def test_marker_batch_prefers_read_slots_and_keeps_wounded_overlay():
@@ -63,8 +65,7 @@ def test_marker_batch_prefers_read_slots_and_keeps_wounded_overlay():
     states = marker_game(reader).read_all_marker_states()
     assert reader.calls == [(FRAME, (1, 2))], "批量可用时应一次读出全部槽位"
     assert states[1]["state"] == "idle"
-    # 同帧重伤覆盖保留：第 2 队头像有重伤文字，空闲角标要改成 wounded。
-    assert states[2]["state"] == "wounded"
+    assert states[2]["state"] == "wounded" and states[2]["wounded"] is True
 
 
 def test_marker_batch_falls_back_to_per_slot_reader():

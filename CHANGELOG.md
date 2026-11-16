@@ -1,8 +1,16 @@
 # 更新记录
 
+## 0.11.4 — 2026-11-16
+
+- 修正头像亮块误报角标、撤退角标偏位和重伤漏读。批量及单队使用同帧头像文字，铺路和拉线复用该结果。
+- 新增独立的「攻城调动」模板和状态，移动期间按现有规则等待。新增常规图样沿用模板清单与状态定义。
+- 处理铺路出征的「消耗体力」提示，并识别「今日登录不再提示」。
+- 完整 ZIP 的源码目录包含 Windows 构建所用的应用图标。
+- 详见 [RELEASE-0.11.4](docs/RELEASE-0.11.4.md)。
+
 ## 0.11.3 — 2026-11-15
 
-正式公开发行（[v0.11.3](https://github.com/study-college/sanmou-assistant/releases/tag/v0.11.3)）：以执行策略与交互为主的小版本，来自用户 2026-11-15 按通俗流程图审阅行为后提出的整修需求，并由原代理额度中断后的接手者收尾；刷武勋、讨贼、自动铺路、拉线与日常的既有执行主流程未重做。详见 [RELEASE-0.11.3](docs/RELEASE-0.11.3.md) 与 `artifacts/release-0.11.3/receipt.json`，实现记录见 `docs/79-ux-0.11.3-2026-11-15.md`，会话交接摘要见 `artifacts/handoff-session-2026-11-15/SUMMARY.md`。
+正式公开发行（[v0.11.3](https://github.com/study-college/sanmou-assistant/releases/tag/v0.11.3)）：以执行策略与交互为主的小版本，来自用户 2026-11-15 按通俗流程图审阅行为后提出的整修需求，并由原代理额度中断后的接手者收尾；刷武勋、讨贼、自动铺路、拉线与日常的既有执行主流程未重做。详见 [v0.11.3](https://github.com/study-college/sanmou-assistant/releases/tag/v0.11.3) 与 `artifacts/release-0.11.3/receipt.json`，实现记录见 `docs/79-ux-0.11.3-2026-11-15.md`，会话交接摘要见 `artifacts/handoff-session-2026-11-15/SUMMARY.md`。
 
 - **粮食恢复只约束刷武勋**：`food_recovery` 不再拦铺路、拉线、讨贼与日常；`process_pave`/`process_line` 去掉该形参，`check_bandits` 不再因低粮只读列表。`team_decision` 仍只拦刷武勋新出征（merit）与备用调动（transfer），回城、讨贼、铺路、拉线照常。
 - **自动屯田独立入口**：手动“检查 / 执行屯田”不再要求存在刷武勋队，直接执行；run 循环里的自动触发仍只跟随刷武勋，恢复期仍用 `force=True` 屯到恢复线。以后接入其他功能只需调用同一入口。

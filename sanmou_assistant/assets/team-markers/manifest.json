@@ -243,6 +243,12 @@
       "source": "artifacts/team-marker-calibration/frame-04",
       "slot": 1,
       "captured_at": "2026-11-02T17:1"
+    },
+    {
+      "state": "siege_transfer",
+      "file": "siege_transfer-1.png",
+      "source": "artifacts/team-marker-calibration/2026-11-16-siege-transfer",
+      "slot": 3
     }
   ]
 }

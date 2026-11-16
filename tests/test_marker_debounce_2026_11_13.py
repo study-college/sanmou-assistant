@@ -57,3 +57,22 @@ def test_two_consecutive_idle_reads_are_accepted():
     assert marker["state"] == "idle"
     assert reader.calls == 2
     assert game.marker_last[1][0] == "idle"
+
+
+def test_idle_recheck_reads_wounded_text_from_second_frame():
+    game, reader = make_game(["idle", "idle"])
+    latest = np.ones((1080, 1920, 3), np.uint8)
+    game.capture = lambda: latest
+    game.v.team_wounded = lambda image, slot: image is latest
+    marker = game.read_team_marker(np.zeros_like(latest), 1)
+    assert marker["state"] == "wounded" and marker["wounded"] is True
+    assert reader.calls == 2 and game.marker_frame is latest
+
+
+def test_unusable_idle_recheck_keeps_the_team_unknown():
+    game, reader = make_game(["idle"])
+    initial = np.zeros((1080, 1920, 3), np.uint8)
+    game.v.frame_clear = lambda image: image is initial
+    marker = game.read_team_marker(initial, 1)
+    assert marker["state"] == "unknown" and marker["wounded"] is None
+    assert reader.calls == 1 and game.marker_frame is None

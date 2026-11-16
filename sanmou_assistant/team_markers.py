@@ -5,8 +5,8 @@
 
 1. 用已标注样本生成的字形模板做遮罩归一化相关，认出是哪个状态（含平移搜索，
    所以同一状态出现在不同槽位、不同头像上也能认）；
-2. 认不出时，判断"这一格到底有没有角标"：角标是黑色菱形底板上的紧凑亮色字形，
-   有底板但不认识 => unknown；没有底板 => 空闲（用户确认：空闲无角标），
+2. 认不出时，在已定位的队伍行上区分紧凑字形与头像背景：
+   有字形或模板近失 => unknown；确认没有角标 => 空闲（用户确认：空闲无角标），
    但空闲还以整帧通过 `hud_frame_confirmed` 为前提：全黑（切页动画/黑屏）、
    随机噪声（采集花屏）等无法确认有效 HUD 的帧一律 unknown，绝不报空闲；
 3. 绝不把没学过的角标降级成空闲。
@@ -284,7 +284,7 @@ class TeamMarkerReader:
         return found
 
     def plaque_score(self, image, slot, dx=0):
-        """诊断用：完整菱形区域的近黑像素占比，不单独作为角标证据。"""
+        """完整菱形区域的近黑占比，用于区分大块亮脸与字形。"""
         window = self._window(image, slot, dx)
         value = cv2.cvtColor(window, cv2.COLOR_BGR2HSV)[:, :, 2]
         return float((value[_diamond(PLAQUE_RADIUS)] < 40).mean())
@@ -345,21 +345,25 @@ class TeamMarkerReader:
             }
         scores = self._scores(image, slot, dx)
         ranked = sorted(scores.items(), key=lambda kv: kv[1][0], reverse=True)
+        # 建筑边缘可能把血条测偏。本行窗口漏掉原位时，只额外接受原位的强匹配。
+        if offset is None and abs(dx) > SEARCH_DX and ranked[0][1][0] < MATCH_MIN:
+            nominal = sorted(self._scores(image, slot).items(), key=lambda kv: kv[1][0], reverse=True)
+            if nominal[0][1][0] >= MATCH_MIN:
+                dx, ranked = 0, nominal
         best_state, (best_score, local_dx, local_dy) = ranked[0]
         second_state, (second_score, *_rest) = ranked[1] if len(ranked) > 1 else ("unknown", (-2.0, 0, 0))
         glyphs = self.glyph_candidates(image, slot, dx)
         plaque = self.plaque_score(image, slot, dx)
         if best_score >= MATCH_MIN:
             state, reason = best_state, "模板匹配"
-        elif glyphs:
-            state, reason = "unknown", "角标未识别"
-        elif best_score < BEST_IDLE_MAX and ctx.hud_frame_confirmed():
-            # 空闲是正向结论：本队血条已定位、整帧 HUD 有效、本格没有角标。
-            state, reason = "idle", "无角标"
-        elif best_score < BEST_IDLE_MAX:
+        elif not ctx.hud_frame_confirmed():
             state, reason = "unknown", "画面未确认"
-        else:
+        # 横纵几乎填满窗口、底板很弱的是头像亮块。较小的未知字形仍保留。
+        elif best_score >= BEST_IDLE_MAX or any(
+                min(glyph["box"]) < BADGE_SIZE * .8 or plaque >= .10 for glyph in glyphs):
             state, reason = "unknown", "角标未识别"
+        else:
+            state, reason = "idle", "无角标"
         idle = state == "idle"
         return {
             "slot": slot,

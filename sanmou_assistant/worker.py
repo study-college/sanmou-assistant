@@ -29,6 +29,8 @@ def marker_of(obs):
 
 
 def _can_dispatch(obs):
+    if obs.wounded is True:
+        return False
     marker = marker_of(obs)
     return can_dispatch(marker) if marker is not None else obs.state in ("home", "outside", "recruiting")
 
@@ -692,6 +694,8 @@ class Worker(QThread):
                 obs.marker_label = marker_hint["label"]
                 obs.marker_confidence = marker_hint["confidence"]
                 obs.marker_at = time.time()
+                if marker_hint["state"] == "wounded":
+                    obs.wounded = True
                 obs.identity = game.remembered_identity(policy.key)
             self.publish("observation", obs.__dict__)
         if obs.state == "unknown":
@@ -905,11 +909,13 @@ class Worker(QThread):
         def marker_observation(policy, marker, at):
             # 整帧角标不重新读倒计时，但保留详情页已经读到的重伤剩余时间。
             until = self.wounded_until.get(policy.key)
-            remaining = max(0, math.ceil(until - at)) if marker["state"] == "wounded" and until else None
+            wounded = marker["state"] == "wounded"
+            remaining = max(0, math.ceil(until - at)) if wounded and until else None
+            note = marker.get("reason", "角标未识别") if marker["state"] == "unknown" else "仅按单帧角标判定，未读详情"
             return Observation(policy.key, state=LEGACY_STATE.get(marker["state"], "unknown"),
-                               wounded=(marker["state"] == "wounded") if marker["state"] == "wounded" else None,
+                               wounded=True if wounded else None,
                                injury_seconds=remaining,
-                               note="仅按单帧角标判定，未读详情",
+                               note=note,
                                marker_state=marker["state"], marker_label=marker["label"],
                                marker_confidence=marker["confidence"], marker_at=at,
                                identity=game.remembered_identity(policy.key),

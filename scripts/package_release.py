@@ -92,7 +92,7 @@ def assemble(app, output, anonymize=None):
         if name in ("LICENSE", "THIRD_PARTY_NOTICES.md", "CHANGELOG.md"):
             copy_file(ROOT / name, stage / name)
     for path in (ROOT / "sanmou_assistant").rglob("*"):
-        if path.is_file() and (path.suffix == ".py" or "assets" in path.relative_to(ROOT / "sanmou_assistant").parts[:-1] and path.suffix in (".png", ".json")):
+        if path.is_file() and (path.suffix == ".py" or "assets" in path.relative_to(ROOT / "sanmou_assistant").parts[:-1] and path.suffix in (".png", ".json", ".ico")):
             copy_file(path, source / path.relative_to(ROOT))
     for name in ("pyproject.toml", "run_assistant.py", "requirements-runtime.txt", "requirements-build.txt", "requirements-lock.txt", "启动助手.cmd"):
         copy_file(ROOT / name, source / name)
