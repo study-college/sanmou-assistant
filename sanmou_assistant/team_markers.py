@@ -5,11 +5,13 @@
 
 1. 用已标注样本生成的字形模板做遮罩归一化相关，认出是哪个状态（含平移搜索，
    所以同一状态出现在不同槽位、不同头像上也能认）；
-2. 认不出时，在已定位的队伍行上区分紧凑字形与头像背景：
-   有字形或模板近失 => unknown；确认没有角标 => 空闲（用户确认：空闲无角标），
-   但空闲还以整帧通过 `hud_frame_confirmed` 为前提：全黑（切页动画/黑屏）、
+2. 认不出时，在已定位的队伍行上区分真角标与头像背景：模板近失，或“窗口里有底板
+   且底板上有字形” => unknown；确认没有角标 => 空闲（用户确认：空闲无角标）。
+   底板是角标自己的画面：黑色菱形底板（近黑占比）或金色时钟那种整块亮色底板；
+   头像内部的亮块没有底板，只是人物画面，不能据此把队伍卡成 unknown；
+   空闲还以整帧通过 `hud_frame_confirmed` 为前提：全黑（切页动画/黑屏）、
    随机噪声（采集花屏）等无法确认有效 HUD 的帧一律 unknown，绝不报空闲；
-3. 绝不把没学过的角标降级成空闲。
+3. 绝不把没学过的角标降级成空闲：认不出的角标一定带底板，底板缺失才按空闲处理。
 
 `read()`、`read_slots()` 与 `read_slot()` 是同一契约：`read()` 委托
 `read_slots(image, range(1, 6))`。批量读取共享同一帧级上下文（HUD 有效性确认、
@@ -45,6 +47,18 @@ SEARCH_DY = 10
 # 已标注角标相关度 0.89~1.00；空闲槽位 ≤0.60；未学角标（白色左箭头）0.44。
 MATCH_MIN = .85
 BEST_IDLE_MAX = .80
+
+# 2026-11-18 实机：一队（周泰/邓艾/太史慈）在主城空闲，头像左下的披膊+浅色背景
+# 是“紧凑亮块+暗环”，被当成字形后整局读成“待识别”，既不派兵也不复核。
+# 亮块本身分不出角标与人物，能分的是角标底板：
+# - 黑色菱形底板（`plaque_score`）：除金色时钟外 13 个已学状态实测 0.12~0.59，
+#   个别没有亮字形的帧低到 0.084（那些帧本来就靠模板命中，不走这条分支）；
+# - 金色时钟的亮色底板（`plate_bright_score`）：实测 0.41~0.51，没有黑底板；
+# - 同一语料里空闲头像区：近黑占比 0.00~0.098、亮色底板 0.00~0.244。
+# 因此“有底板 + 有字形”才是未学角标，没有底板就按无角标读空闲。
+# 分布与逐帧对照见 artifacts/diag-2026-11-18-team1-marker/。
+PLAQUE_MIN = .12
+PLATE_BRIGHT_MIN = .30
 
 # 帧级“有效 HUD”门槛（2026-11-14 实测，报空闲前必须整帧通过）：
 # 右侧 HUD 整列（x1695..1920, y180..900）真实帧灰度标准差 33~55、相邻像素平均差
@@ -289,6 +303,17 @@ class TeamMarkerReader:
         value = cv2.cvtColor(window, cv2.COLOR_BGR2HSV)[:, :, 2]
         return float((value[_diamond(PLAQUE_RADIUS)] < 40).mean())
 
+    def plate_bright_score(self, image, slot, dx=0):
+        """菱形区域里高亮高饱和像素的占比：金色时钟那种亮色底板的证据。
+
+        金色时钟没有黑色底板（`plaque_score` 只有 0.00~0.15），整块亮黄压满窗口；
+        空闲头像区的暖色高光远达不到这个面积，所以两者用同一个阈值就能分开。
+        """
+        window = self._window(image, slot, dx)
+        hsv = cv2.cvtColor(window, cv2.COLOR_BGR2HSV)
+        bright = (hsv[:, :, 2] >= 200) & (hsv[:, :, 1] >= 120)
+        return float(bright[_diamond(PLAQUE_RADIUS)].mean())
+
     def _scores(self, image, slot, dx=0):
         mask = _match_mask()
         roi, ox0, oy0 = self._search_roi(image, slot, dx)
@@ -338,7 +363,7 @@ class TeamMarkerReader:
             reason = "队伍行未确认" if ctx.hud_frame_confirmed() else "画面未确认"
             return {
                 "slot": slot, "state": "unknown", "label": label("unknown"),
-                "reason": reason, "confidence": 0.0, "plaque": 0.0,
+                "reason": reason, "confidence": 0.0, "plaque": 0.0, "plate_bright": 0.0,
                 "glyph": None, "matched": None, "matched_label": None,
                 "matched_score": None, "second": None, "second_score": None,
                 "hud_dx": None, "shift": None,
@@ -354,13 +379,16 @@ class TeamMarkerReader:
         second_state, (second_score, *_rest) = ranked[1] if len(ranked) > 1 else ("unknown", (-2.0, 0, 0))
         glyphs = self.glyph_candidates(image, slot, dx)
         plaque = self.plaque_score(image, slot, dx)
+        plate_bright = self.plate_bright_score(image, slot, dx)
+        # 底板是角标自己的画面；头像里的亮块没有底板。见文件顶部 2026-11-18 的说明。
+        has_plate = plaque >= PLAQUE_MIN or plate_bright >= PLATE_BRIGHT_MIN
         if best_score >= MATCH_MIN:
             state, reason = best_state, "模板匹配"
         elif not ctx.hud_frame_confirmed():
             state, reason = "unknown", "画面未确认"
-        # 横纵几乎填满窗口、底板很弱的是头像亮块。较小的未知字形仍保留。
-        elif best_score >= BEST_IDLE_MAX or any(
-                min(glyph["box"]) < BADGE_SIZE * .8 or plaque >= .10 for glyph in glyphs):
+        # 有底板且底板上有字形 => 没学过的角标，保持 unknown；
+        # 没有底板 => 窗口里的亮块只是头像画面，按无角标读空闲，不能把队伍卡死。
+        elif best_score >= BEST_IDLE_MAX or (has_plate and glyphs):
             state, reason = "unknown", "角标未识别"
         else:
             state, reason = "idle", "无角标"
@@ -372,6 +400,7 @@ class TeamMarkerReader:
             "reason": reason,
             "confidence": round(1 - min(best_score, .99), 3) if idle else round(best_score, 3),
             "plaque": round(plaque, 3),
+            "plate_bright": round(plate_bright, 3),
             "glyph": glyphs[0] if glyphs else None,
             "matched": None if idle else best_state,
             "matched_label": None if idle else label(best_state),

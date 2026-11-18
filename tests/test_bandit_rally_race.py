@@ -208,6 +208,24 @@ def test_join_success_text_is_accepted(joiner):
     assert any(kind == "dispatch" for kind, _ in events)
 
 
+def test_join_resolves_consecutive_shared_dispatch_prompts(joiner):
+    build, policy, obs, rally, journal, events = joiner
+    frames = join_sequence()[:-1] + [
+        Frame("supply_prompt"), Frame("dispatch_confirm"), affairs_frame("加入成功"),
+    ]
+    game = build(frames, {"detail": ("reward", 2)})
+    game.save_image = lambda *args: None
+    game.v.supply_prompt = lambda image: {"body": "当前补给少于80，是否确认出征？",
+                                         "confirm_point": (1188, 686)}
+    game.v.confirm_dialog = lambda image: {"kind": "unfull_skill", "continue_point": (800, 655)}
+    taps = []
+    game.d.tap = lambda x, y, *args, **kwargs: taps.append((x, y))
+    game.join_bandits(policy, obs, rally)
+    assert taps[-2:] == [(1188, 686), (800, 655)]
+    assert status_of(journal, policy) == "accepted"
+    assert any(kind == "supply_prompt" and value["team"] == policy.key for kind, value in events)
+
+
 def bandits_game(build, availability, rallies):
     game = build([], availability)
     game.scan_team = lambda p: Observation(p.key, state="home", strength=33000, maximum=33000,

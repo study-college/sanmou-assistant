@@ -80,9 +80,23 @@ def export(output: Path, *, allow_no_anonymization: bool = False) -> dict:
             continue
         copy(path, Path("tests") / path.name)
     from sanmou_assistant import __version__
-    docs = ("09-user-guide.md", "AGENT-GUIDE.md", "ROADMAP.md", "RELEASE-0.8.1.md", "RELEASE-0.8.2.md", "RELEASE-0.8.3.md", "RELEASE-0.9.0.md", "RELEASE-0.9.2.md", "RELEASE-0.9.3.md", "RELEASE-0.9.4.md", "RELEASE-0.9.5.md", "RELEASE-0.9.6.md", "RELEASE-0.9.9.md", f"RELEASE-{__version__}.md", "guide.css")
+    docs = ("09-user-guide.md", "AGENT-GUIDE.md", "ROADMAP.md", "guide.css")
     for name in dict.fromkeys(docs):
         copy(ROOT / "docs" / name)
+    # 公开仓库保留 0.8.1（公开仓库起点）以后的全部发行说明：
+    # 只列到当前版本会在下次发布时把上一版说明删掉；更早的版本没有公开过，不导入。
+    def version_key(path: Path) -> tuple[int, ...]:
+        try:
+            return tuple(int(part) for part in path.stem.split("-", 1)[1].split("."))
+        except (IndexError, ValueError):
+            return ()
+
+    releases = [path for path in sorted((ROOT / "docs").glob("RELEASE-*.md"))
+                if version_key(path) >= (0, 8, 1)]
+    if not any(path.name == f"RELEASE-{__version__}.md" for path in releases):
+        raise RuntimeError(f"Missing release notes for {__version__}: docs/RELEASE-{__version__}.md")
+    for path in releases:
+        copy(path)
     for path in sorted((ROOT / "docs/guide-assets").glob("*.png")):
         copy(path)
     copy(ROOT / "docs/AGENT-GUIDE.md", "AGENTS.md")

@@ -118,6 +118,7 @@ class RallyJoinRejected(GameError):
 # 提交未读到受理证据时，同一出征页最多连续提交几次。重复派出只多一次行军，
 # 漏派才会让整队空转，所以宁可重试。
 DISPATCH_ATTEMPTS = 3
+DISPATCH_PROMPT_PAGES = ("dispatch_confirm", "enemy_warning", "pave_stamina_prompt", "supply_prompt")
 
 
 class ActionUnavailable(GameError):
@@ -361,12 +362,8 @@ class Game:
         self.save_image(image, "enemy-warning-continue", True)
         self.d.tap(*info["continue_point"], 1.0)
 
-    def clear_dispatch_prompt(self, image):
-        """出征提交后的模态弹窗：二次确认→继续出征；强敌预警→勾选并等倒计时继续进攻。
-
-        返回处理过的页型名；没有弹窗时返回 None。弹窗是全屏模态，不处理就会被当成
-        未知页暂停，表现为“一直等不到受理证据”。
-        """
+    def clear_dispatch_prompt(self, image, policy=None, target=""):
+        """按识别到的出征提醒处理一层，并返回页型。"""
         page = self.v.page(image)
         if page == "dispatch_confirm":
             info = self.v.confirm_dialog(image)
@@ -382,7 +379,18 @@ class Game:
             return page
         if page == "pave_stamina_prompt":
             return page if self.resolve_pave_stamina_prompt(image) else None
+        if page == "supply_prompt":
+            return page if self.handle_supply_prompt(image, policy, target) else None
         return None
+
+    def _settle_dispatch_prompts(self, image, policy, target):
+        # 一次出征可以接连出现体力、补给、加点、战法和强敌提醒。每次处理完重新截图。
+        for _ in range(5):
+            page = self.clear_dispatch_prompt(image, policy, target)
+            if page is None:
+                break
+            image = self.capture_clear(f"dispatch-{page}-answer", True)
+        return image
 
     def resolve_pave_stamina_prompt(self, image):
         """「本次出征中铺路地块将消耗体力，是否确认出征？」：勾选今日不再提示→确定。
@@ -396,26 +404,26 @@ class Game:
             return False
         self.save_image(image, "pave-stamina-prompt", True)
         self.emit("status", "出征提示 · 勾选“今日登录不再提示”并继续出征")
-        label = info.get("remember_label")
-        if label is None:
-            self.log("铺路体力提示：未读到“今日登录不再提示”，本次只确认", "WARN")
-        else:
-            box = _vcall(self.v, "checkbox_before", None, image, label)
-            if box is None:
-                self.log(f"铺路体力提示：未定位“{label.text}”前的复选框，本次只确认", "WARN")
-            else:
-                state = _vcall(self.v, "checked", None, image, *box)
-                if state is False:
-                    self.d.tap(*box, .35)
-                    image = self.capture()
-                    state = _vcall(self.v, "checked", None, image, *box)
-                if state:
-                    self.log(f"铺路体力提示：已勾选“{label.text}”", "INFO")
-                else:
-                    self.log(f"铺路体力提示：未能确认“{label.text}”已勾选，本次只确认", "WARN")
-        self.d.tap(*info["confirm_point"], 1.2)
+        self._confirm_dispatch_reminder(image, info, "铺路体力提示")
         self.log("铺路体力提示：已确认出征，继续核对出发", "INFO")
         return True
+
+    def _confirm_dispatch_reminder(self, image, info, description):
+        label = info.get("remember_label")
+        box = _vcall(self.v, "checkbox_before", None, image, label) if label is not None else None
+        if box is None:
+            self.log(f"{description}：未定位不再提示复选框，本次只确认", "WARN")
+        else:
+            state = _vcall(self.v, "checked", None, image, *box)
+            if state is False:
+                self.d.tap(*box, .35)
+                image = self.capture()
+                state = _vcall(self.v, "checked", None, image, *box)
+            if state:
+                self.log(f"{description}：已勾选“{label.text}”", "INFO")
+            else:
+                self.log(f"{description}：未能确认“{label.text}”已勾选，本次只确认", "WARN")
+        self.d.tap(*info["confirm_point"], 1.2)
 
     def clear_map_selection(self, image=None, expected_page="sandbox"):
         image = self.ensure_sandbox(refresh_grain=False) if image is None else image
@@ -555,17 +563,9 @@ class Game:
                     raise RecognitionUnavailable("协助讨贼确认框暂未读清，等待重读")
                 self.emit("status", "取消奖励次数耗尽后的协助确认 · 不自动协助")
                 self.d.tap(buttons[0].x, buttons[0].y, .7)
-            elif page == "dispatch_confirm":
-                info = self.v.confirm_dialog(image)
-                if info is None:
-                    raise RecognitionUnavailable("出征确认弹窗暂未读清，等待重读")
-                self.emit("status", "出征二次确认 · 选择继续出征")
-                self.d.tap(*info["continue_point"], .9)
-            elif page == "pave_stamina_prompt":
-                # 铺路体力提示若残留到巡检阶段，同样按用户口径勾选并确认，不当作未知页。
-                self.resolve_pave_stamina_prompt(image)
-            elif page == "enemy_warning":
-                self.resolve_enemy_warning(image)
+            elif page in DISPATCH_PROMPT_PAGES:
+                if self.clear_dispatch_prompt(image) is None:
+                    raise RecognitionUnavailable("出征提醒暂未读清，等待重读")
             elif page == "monthly_claimed":
                 # 关闭已核对的月卡结果面板，不再领取，也不进入购买入口。
                 self.close_panel(image)
@@ -1734,9 +1734,7 @@ class Game:
                     self.d.tap(card_x, self.CARD_Y, .35)
                 self.d.tap(submit_x, submit_y, 1.6)
                 after = self.capture_clear("dispatch-result" if attempts == 1 else f"dispatch-result-{attempts}", True)
-                prompt = self.clear_dispatch_prompt(after)
-                if prompt:
-                    after = self.capture_clear(f"dispatch-{prompt}-answer", True)
+                after = self._settle_dispatch_prompts(after, policy, point.name)
                 marker_after = self.read_team_marker(after, policy.slot)
                 changed = bool(marker_after and obs.marker_state and marker_after["state"] != "unknown"
                                and marker_after["state"] != obs.marker_state)
@@ -1765,6 +1763,7 @@ class Game:
                 # 角标更新可能慢一帧：再确认一次，避免把已生效的命令误判成失败。
                 self.d.control.sleep(1.0)
                 late = self.capture("dispatch-late-check")
+                late = self._settle_dispatch_prompts(late, policy, point.name)
                 marker_late = self.read_team_marker(late, policy.slot)
                 if (marker_late and obs.marker_state and marker_late["state"] != "unknown"
                         and marker_late["state"] != obs.marker_state):
@@ -1839,44 +1838,18 @@ class Game:
             return accepted, state, f"结果页 sandbox / {activity}"
         return False, "confirmed", f"结果页 {page}"
 
-    def handle_supply_prompt(self, image, policy, target):
-        """出征后的补给提醒：勾选“本次不再提示”并确认，再继续核对出发。
-
-        2026-11-10 用户说明：补给下降到阶段阈值后，点出征会弹提醒，需要确认并
-        勾选“本次游戏不触发”，且不同阶段会各弹一次。脚本此前没有这条路径；
-        这里只在同时读到“补给”和确认按钮时处理，读不清只留证，不改点其他位置。
-        """
-        text = self.v.joined(image, (480, 180, 1440, 900)).replace(" ", "")
-        if "补给" not in text:
+    def handle_supply_prompt(self, image, policy=None, target=""):
+        """已确认的补给提醒沿用今天不再提示的出征口径。"""
+        info = _vcall(self.v, "supply_prompt", None, image)
+        if info is None:
             return False
-        confirm = self.v.find(image, ["确认", "确定"], (560, 500, 1360, 920), exact=True)
-        if confirm is None:
-            confirm = self.v.find(image, ["确认出征", "继续出征"], (560, 500, 1360, 920), exact=False)
-        if confirm is None:
-            return False
-        self.save_image(image, "pave-supply-prompt", True)
-        self.emit("supply_prompt", {"team": policy.key, "target": target, "text": text[:400]})
-        options = [t for t in self.v.read(image, (480, 360, 1440, 920), minimum=.75)
-                   if any(k in t.text.replace(" ", "") for k in ("不再提示", "不再提醒", "不触发", "本次"))]
-        if options:
-            label = options[0]
-            box = self.v.checkbox_before(image, label)
-            if box:
-                state = self.v.checked(image, *box)
-                if state is False:
-                    self.d.tap(*box, .35)
-                    image = self.capture()
-                    state = self.v.checked(image, *box)
-                if state:
-                    self.log(f"补给提醒：已勾选“{label.text}”", "INFO")
-                else:
-                    self.log(f"补给提醒：未能确认“{label.text}”已勾选，本次只确认", "WARN")
-            else:
-                self.log(f"补给提醒：未定位“{label.text}”前的复选框，本次只确认", "WARN")
-        else:
-            self.log("补给提醒：未读到本次不再提示选项，本次只确认", "WARN")
-        self.d.tap(confirm.x, confirm.y, 1.2)
-        self.log(f"{policy.display} 铺路：已确认补给提醒，继续核对出发", "INFO")
+        self.save_image(image, "dispatch-supply-prompt", True)
+        event = {"text": info["body"]}
+        if policy is not None:
+            event.update(team=policy.key, target=target)
+        self.emit("supply_prompt", event)
+        self._confirm_dispatch_reminder(image, info, "补给提醒")
+        self.log("补给提醒：已确认出征，继续核对出发", "INFO")
         return True
 
     def read_auto_refill(self, image, policy):
@@ -2034,24 +2007,13 @@ class Game:
                 tapped = True  # 从发送提交命令开始，失败均保留为未知，不能推定未提交。
                 self.d.tap(submit_x, submit_y, 1.8)
                 after = self.capture_clear(f"pave-result-{attempt+1}", True)
-                # 铺路地块的体力提示会挡在结果页前面：先按用户口径勾选“今日不再提示”
-                # 并确认，再看角标/页面；否则这一帧会被当成未知页，铺路原地卡住。
-                if self.clear_dispatch_prompt(after):
-                    after = self.capture_clear("pave-dispatch-prompt-answer", True)
+                after = self._settle_dispatch_prompts(after, policy, name)
                 after_marker = self.read_team_marker(after, policy.slot)
                 if (after_marker and before_state and after_marker["state"] != "unknown"
                         and after_marker["state"] != before_state):
                     accepted = True
                     reason = f"角标状态 {before_state}→{after_marker['state']}"
                     break
-                if self.handle_supply_prompt(after, policy, name):
-                    after = self.capture_clear("pave-supply-confirmed", True)
-                    after_marker = self.read_team_marker(after, policy.slot)
-                    if (after_marker and before_state and after_marker["state"] != "unknown"
-                            and after_marker["state"] != before_state):
-                        accepted = True
-                        reason = f"补给提醒确认后角标 {before_state}→{after_marker['state']}"
-                        break
                 page = self.v.page(after)
                 reason = f"结果页 {page}，角标状态仍为 {before_state or '未知'}"
                 if page == "deployment" and not _vcall(self.v, "deploy_button_enabled", True, after):
@@ -2375,7 +2337,10 @@ class Game:
             self.d.control.sleep(1.1)
             after = self.capture("bandit-join-result",True)
             page = self.v.page(after)
-            if page != "bandit_assist_confirm" and self.v.page(toast) == "bandit_assist_confirm":
+            if page in DISPATCH_PROMPT_PAGES:
+                after = self._settle_dispatch_prompts(after, policy, rally["text"])
+                page = self.v.page(after)
+            elif page != "bandit_assist_confirm" and self.v.page(toast) == "bandit_assist_confirm":
                 # 协助确认框可能先出现在提示帧。
                 after, page = toast, "bandit_assist_confirm"
             if page == "bandit_assist_confirm":
@@ -2390,6 +2355,7 @@ class Game:
                     raise GameError("已取消奖励耗尽后的协助；协助未开启或本次时效不足")
                 self.d.tap(buttons[1].x, buttons[1].y, 1.6)
                 after = self.capture("bandit-assist-result", True)
+                after = self._settle_dispatch_prompts(after, policy, rally["text"])
                 page = self.v.page(after)
             if page == "rally":
                 self.ensure_sandbox()

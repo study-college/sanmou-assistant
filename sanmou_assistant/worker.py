@@ -805,7 +805,8 @@ class Worker(QThread):
         既不猜“忙碌=征兵/占领/铺路”，也不读征兵剩余时间。
         """
         state = (marker or {}).get("state")
-        if not state or state == "unknown" or can_dispatch(state):
+        # 委托给城主的队伍不归我方管理（用户 2026-11-18）：不为它开详情复核。
+        if not state or state in ("unknown", "entrust") or can_dispatch(state):
             return False
         now = time.time()
         until = self.wounded_until.get(key)
@@ -1444,8 +1445,7 @@ class Worker(QThread):
             cached = self.line_snapshot.get(policy.key)
             # 缓存太久、而这一刻的决策要看兵力（忙/可派）时完整读一次；其他状态不值当导航。
             stale = bool(cached) and time.time() - cached[2] > self.LINE_STRENGTH_TTL
-            need_strength = bool(marker) and marker.get("state") in (
-                "busy", "idle", "training", "stationary", "transfer_stay")
+            need_strength = bool(marker) and (marker["state"] == "busy" or can_dispatch(marker["state"]))
             # 有补兵点时，忙也要完整读一次：确认是“在主城（先转补兵点）”还是建筑里。
             force_home_check = has_backup and bool(marker) and marker.get("state") == "busy"
             if (marker and marker.get("state") != "unknown" and cached

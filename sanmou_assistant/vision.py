@@ -607,10 +607,11 @@ class Vision:
             return "enemy_warning"
         if self.confirm_dialog(image) is not None:
             return "dispatch_confirm"
-        # 铺路地块出征的体力提示（2026-11-15 真帧）：也是「提示+确定」模态，必须先于
-        # 底栏/标题判定；否则会被当未知页，程序在“等待画面恢复”上原地打转。
+        # 体力和补给提示都盖在结果页上，先识别模态再看底层页面。
         if self.pave_stamina_prompt(image) is not None:
             return "pave_stamina_prompt"
+        if self.supply_prompt(image) is not None:
+            return "supply_prompt"
         # 聊天面板的“前往好友”不是地图前往；先核对两个专有控件。
         if self.chat_close_point(image) is not None:
             return "chat"
@@ -926,30 +927,33 @@ class Vision:
         confirm = self.find(image, ["确定"], (1020, 610, 1355, 707), exact=True)
         return (cancel, confirm) if cancel and confirm else None
 
-    def pave_stamina_prompt(self, image):
-        """出征弹窗「本次出征中铺路地块将消耗体力，是否确认出征？」。
-
-        2026-11-15 用户现场真帧（二号账号指定铺路地块，点出征后弹出；同一晚的
-        `_evidence/faults/**/*unknown-page.png` 里连续 11 帧都是它，程序把它当未知页卡住）。
-        判据：标题「提示」+ 正文同时含「铺路地块」「消耗体力」「是否确认出征」
-        + 左侧「取消」+ 右侧「确定」；左下「今日登录不再提示」有则一并返回。
-        任一项读不齐就返回 None，调用方不得据此点击（这是会消耗体力的确认框）。
-        """
+    def _dispatch_resource_prompt(self, image, kind, terms):
+        """识别出征时的体力或补给提醒，返回同一帧的确认控件。"""
         # 复用 confirm_dialog 同一条标题区域（帧内共享识别，热路径几乎不增加 OCR 成本）。
         if self.find(image, ["提示"], (820, 345, 1110, 445), exact=True) is None:
             return None
         body = self.joined(image, (560, 470, 1350, 545)).replace(" ", "")
-        if not all(word in body for word in ("铺路地块", "消耗体力", "是否确认出征")):
+        if "是否确认出征" not in body or not all(word in body for word in terms):
             return None
         cancel = self.find(image, ["取消"], (650, 655, 810, 730), exact=True)
-        confirm = self.find(image, ["确定"], (1100, 655, 1280, 730), exact=True)
+        confirm = self.find(image, ["确定", "确认", "确认出征", "继续出征"],
+                            (1100, 655, 1280, 730), exact=True)
         if cancel is None or confirm is None:
             return None
-        remember = self.find(image, ["今日登录不再提示"], (850, 585, 1130, 645), exact=True)
-        return {"kind": "pave_stamina", "body": body,
+        remember = self.find(image, ["今日登录不再提示", "不再提示", "不再提醒", "不触发"],
+                             (770, 540, 1210, 677))
+        return {"kind": kind, "body": body,
                 "confirm_point": (round(confirm.x), round(confirm.y)),
                 "cancel_point": (round(cancel.x), round(cancel.y)),
                 "remember_label": remember}
+
+    def pave_stamina_prompt(self, image):
+        """派往铺路地块时出现的体力消耗提示。"""
+        return self._dispatch_resource_prompt(image, "pave_stamina", ("铺路地块", "消耗体力"))
+
+    def supply_prompt(self, image):
+        """补给降低战斗伤害时的出征确认。"""
+        return self._dispatch_resource_prompt(image, "supply", ("补给",))
 
     def confirm_dialog(self, image):
         """出征前的二次确认弹窗：未加点武将 / 未携带满战法。

@@ -13,6 +13,7 @@ STATES = {
     "training": "练兵（可出击）",
     "transfer": "调动",
     "siege_transfer": "攻城调动",
+    "siege_transfer_stay": "攻城调动停留",
     "transfer_stay": "调动停留",
     "march": "行军",
     "guard": "驻守",
@@ -22,6 +23,7 @@ STATES = {
     "queued_battle": "排队进入战斗",
     "fighting": "战斗",
     "busy": "忙碌",
+    "entrust": "委托",
     "unknown": "待识别",
 }
 
@@ -47,6 +49,10 @@ RULES = {
     "siege_transfer": (
         "用户 2026-11-16 确认：向攻城大营移动，角标为蓝色旗和右箭头。"
         "与普通调动共用移动期间的等待规则。"
+    ),
+    "siege_transfer_stay": (
+        "用户 2026-11-16 确认：攻城调动到位后，部队停留在攻城大营。"
+        "按城外建筑的调动停留处理，出征仍走该队原任务条件。"
     ),
     "retreat": (
         "部队在返回出发点的过程中处于撤退状态；撤退状态下不会发生战斗。"
@@ -80,6 +86,14 @@ RULES = {
         "结束时连接地消失则占领失败）和建筑内自然征兵（2026-11-02 17:43 在营帐征兵实机确认）。"
         "角标无法区分具体是哪一种，需要结合任务记录或所在建筑判断。时钟静止，指针不走。"
     ),
+    "entrust": (
+        "【委托】指令：点击我方同盟已任命城主的城池，可对其使用委托指令。执行委托指令的部队"
+        "将行军至目标城池，到达后该部队将委托给城主管理，城主可将其编入军团并出征作战；"
+        "委托至城池时的行军速度是普通行军的 2 倍。"
+        "用户 2026-11-18 确认：角标是浅蓝色拳套（护手），压在黑色菱形底板上；"
+        "委托期间队伍交给他人管理，除非离开委托，我方无法派出和管理。"
+        "用户同次明确：不需要考虑离开委托，识别到委托就当作“不管这队”，不派兵、不回城、不补兵。"
+    ),
 }
 
 # 与旧 Observation.state 的临时对应，仅用于显示兼容；生产决策接入前需逐条核对。
@@ -89,6 +103,7 @@ LEGACY_STATE = {
     "training": "home",
     "transfer": "marching",
     "siege_transfer": "marching",
+    "siege_transfer_stay": "outside",
     "transfer_stay": "outside",
     "march": "marching",
     "guard": "guarding",
@@ -98,13 +113,18 @@ LEGACY_STATE = {
     "queued_battle": "fighting",
     "fighting": "fighting",
     "busy": "active",
+    # 委托期间队伍在别人手里（先是 2 倍速度行军到目标城池，到达后由城主管理）。
+    # 旧词表没有“委托”，按行军显示会让总览只剩角标标签；这里仍用 marching 表达
+    # “不在我方手上、不能把它当空闲派兵”，实际展示优先用 marker_label=委托。
+    "entrust": "marching",
     "unknown": "unknown",
 }
 
 # 用户 2026-11-02 明确的出兵口径：
 # 停留（城外任意地上）、空闲（主城）、调动停留（营帐/城池里）都可以拉出去；
 # 忙碌（占领、建筑内自然征兵等）不派；在路上、驻守、撤退、战斗、排队、未识别都不派。
-DISPATCHABLE = ("idle", "training", "stationary", "transfer_stay")
+# 委托（2026-11-18）是队伍交给城主管理：用户明确不考虑离开委托，所以不派、不回城、不补兵。
+DISPATCHABLE = ("idle", "training", "stationary", "transfer_stay", "siege_transfer_stay")
 ENGAGED = ("queued_battle", "fighting", "guard")
 MOVING = ("march", "transfer", "siege_transfer", "retreat")
 
@@ -131,6 +151,14 @@ def is_in_battle(state: str) -> bool:
 
 def is_moving(state: str) -> bool:
     return state in MOVING
+
+
+def is_entrusted(state: str) -> bool:
+    """委托给城主的队伍：我方不派兵、不回城、不补兵，也不用开详情复核。
+
+    用户 2026-11-18：不考虑离开委托，识别到委托就当作“不管这队”。
+    """
+    return state == "entrust"
 
 
 def label(state: str) -> str:

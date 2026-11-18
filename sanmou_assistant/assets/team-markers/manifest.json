@@ -249,6 +249,27 @@
       "file": "siege_transfer-1.png",
       "source": "artifacts/team-marker-calibration/2026-11-16-siege-transfer",
       "slot": 3
+    },
+    {
+      "state": "siege_transfer_stay",
+      "file": "siege_transfer_stay-1.png",
+      "source": "artifacts/team-marker-calibration/2026-11-16-siege-transfer-stay",
+      "slot": 2,
+      "captured_at": "2026-11-16T11:34:51.177716+08:00"
+    },
+    {
+      "state": "entrust",
+      "file": "entrust-1.png",
+      "source": "artifacts/analysis-2026-11-18-marker-unknown-cases",
+      "slot": 2,
+      "captured_at": "2026-11-18T15:04:45+08:00"
+    },
+    {
+      "state": "entrust",
+      "file": "entrust-2.png",
+      "source": "artifacts/analysis-2026-11-18-marker-unknown-cases",
+      "slot": 3,
+      "captured_at": "2026-11-18T14:38:28+08:00"
     }
   ]
 }
