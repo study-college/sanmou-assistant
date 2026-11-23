@@ -24,8 +24,8 @@ class FakeGame:
             raise GameError("队伍读数未识别")
         return self.observations.get(policy.key,Observation(policy.key,observed_at=time.time(),state="home",strength=33000,maximum=33000,wounded=False,stamina=100,supply=100,auto_refill=True))
 
-    def dispatch(self, policy, obs, point, kind, reuse_target=False):
-        self.calls.append(("dispatch",policy.key,point.name,reuse_target))
+    def dispatch(self, policy, obs, point, kind):
+        self.calls.append(("dispatch",policy.key,point.name))
         ident = self.worker.journal.prepare(policy.key,kind,point.name)
         if policy.key in self.uncertain:
             self.worker.journal.finish(ident,"uncertain")
@@ -94,8 +94,10 @@ def batch(tmp_path):
 def test_three_teams_are_all_read_before_continuous_dispatch(batch):
     worker,game,teams = batch
     assert not worker.process_team_batch(game,teams)
+    # 2026-11-18：批次只负责“先读完再连续派”，不再传“镜头还在不在目标上”的布尔值；
+    # 同一目标的快/慢路径由 Game 按现场状态自己决定（见 test_view_state.py）。
     assert game.calls == [("scan","main:1"),("scan","main:2"),("scan","main:3"),
-        ("dispatch","main:1","战场",False),("dispatch","main:2","战场",True),("dispatch","main:3","战场",True)]
+        ("dispatch","main:1","战场"),("dispatch","main:2","战场"),("dispatch","main:3","战场")]
     assert worker.orders == 3
 
 
@@ -165,7 +167,7 @@ def test_repeated_unconfirmed_dispatch_keeps_retrying_instead_of_stopping_the_te
     worker.retry_at['main:1'] = 0
     game.dispatch = FakeGame.dispatch.__get__(game)
     worker.process_team_batch(game,teams[:1])
-    assert ('dispatch','main:1','战场',False) in game.calls
+    assert ('dispatch','main:1','战场') in game.calls
 
 
 @pytest.mark.skip(reason="0.7.4 起派兵/批次契约重写（角标闭环、卡位直提交、无颜色计数），旧断言作废；真机验证见 docs/50 与 docs/52")
@@ -185,13 +187,13 @@ def test_expiry_mid_dispatch_stops_target_fallback_then_refreshes_after_other_te
     game.scan_team = timed_scan
     original = game.dispatch
     failed = []
-    def dispatch(policy,obs,point,kind,reuse_target=False):
+    def dispatch(policy,obs,point,kind):
         if policy.key == 'main:2' and not failed:
             failed.append(obs.observed_at)
             game.calls.append(('expired',policy.key,point.name))
             clock[0] = 1122
             raise ObservationExpired('观测已过期')
-        original(policy,obs,point,kind,reuse_target)
+        original(policy,obs,point,kind)
     game.dispatch = dispatch
     worker.process_team_batch(game,teams)
     calls = game.calls
@@ -368,13 +370,12 @@ def test_recovered_read_resets_stall_counter_and_partial_failure_keeps_other_tea
     assert worker.unreadable_batches == 2
 
 
-def test_uncertain_member_locks_only_itself_and_cancels_target_reuse(batch):
+def test_uncertain_member_locks_only_itself(batch):
     worker,game,teams = batch
     game.uncertain.add("main:1")
     worker.process_team_batch(game,teams)
     dispatches = [c for c in game.calls if c[0] == "dispatch"]
     assert [c[1] for c in dispatches] == ["main:1","main:2","main:3"]
-    assert dispatches[1][3] is False
     assert worker.journal.pending("main:1")
     assert not worker.journal.pending("main:2")
     before = worker.orders
@@ -606,10 +607,10 @@ def test_run_coexists_with_periodic_bandits_without_interrupting_battle_batch(tm
     worker.run()
     substantive = [c for c in game.calls if c[0] in ("scan","dispatch","bandits")]
     assert substantive[:7] == [("scan","main:1"),("scan","main:2"),("scan","main:3"),
-        ("dispatch","main:1","战场",False),("dispatch","main:2","战场",True),("dispatch","main:3","战场",True),("bandits",True)]
+        ("dispatch","main:1","战场"),("dispatch","main:2","战场"),("dispatch","main:3","战场"),("bandits",True)]
     assert sum(c[0] == "bandits" for c in substantive) == 1
     assert worker.orders == 3
-    assert game.calls.index(("dailies",1)) > game.calls.index(("dispatch","main:3","战场",True))
+    assert game.calls.index(("dailies",1)) > game.calls.index(("dispatch","main:3","战场"))
 
 
 @pytest.mark.parametrize("actual,expected",[((120,200),"城池"),((999,999),"山道")])
@@ -624,8 +625,12 @@ def test_reused_target_requires_current_coordinate_and_name(actual,expected):
     game.v,game.d = Vision(),Device()
     game.ensure_sandbox = lambda:None
     game.capture = lambda *args:None
+    game.save_image = lambda *args, **kwargs: None
     calls = []
     game.go_to = lambda point:calls.append((point.x,point.y)) or "重新定位"
+    # 2026-11-18：快路只在“镜头确实还停在这个坐标上”时才允许走；
+    # 这里显式建立现场，验证快路本身仍然要核对坐标和名称。
+    game.view_point = (120,200)
     point = Point(name="目标",x=120,y=200,expected_name=expected)
     if actual == (120,200):
         with pytest.raises(GameError,match="目标名称不符"):
@@ -634,6 +639,7 @@ def test_reused_target_requires_current_coordinate_and_name(actual,expected):
     else:
         assert game.reopen_target(point) == "重新定位"
         assert calls == [(120,200)]
+        assert game.view_point is None, "坐标不符必须作废现场，不能留着下次接着用"
 
 
 def test_backup_cycle_survives_restart_and_returns_at_threshold(batch,monkeypatch):
@@ -647,8 +653,8 @@ def test_backup_cycle_survives_restart_and_returns_at_threshold(batch,monkeypatc
     # 0.11.2 重构：decide 用 merit_backup；normalize 派生旧读取方（Worker）用的 backups 视图。
     worker.profile.normalize()
     dispatch = game.dispatch
-    def accepted_dispatch(policy,obs,point,kind,reuse_target=False):
-        dispatch(policy,obs,point,kind,reuse_target)
+    def accepted_dispatch(policy,obs,point,kind):
+        dispatch(policy,obs,point,kind)
         worker.journal.set_phase(policy.key,'backup' if kind == 'transfer' else 'merit')
     game.dispatch = accepted_dispatch
     def recall(policy,obs,manual=False,minimum=None):

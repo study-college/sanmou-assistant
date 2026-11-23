@@ -122,6 +122,31 @@ class Journal:
                         (int(idx), route_status, note, time.time(), self.scope, route))
         self.db.commit()
 
+    def route_of_intent(self, ident: str) -> str:
+        """铺路订单所属路线名；路线被改名/重置后仍按遗留指针回查。"""
+        row = self.db.execute("SELECT route FROM pave WHERE scope=? AND intent=?",
+                              (self.scope, ident)).fetchone()
+        return row[0] if row else ""
+
+    def settle_orphan_pave(self, ident: str, status: str, note: str) -> str:
+        """结清没有可用路线归属的铺路订单，并复位它的遗留进度指针。
+
+        普通的 ``settle_pave`` 假定路线仍然存在且仍由本队使用；路线取消、改给别队
+        或队伍被删除后，只剩订单和一条 dispatching 记录，必须单独清掉，否则队伍会
+        被所有模块永久跳过（2026-11-20 实机：铺路 1 取消后 main:1 一直只读队不派兵）。
+        """
+        if status not in ("accepted", "rejected", "reviewed"):
+            raise ValueError(status)
+        route = self.route_of_intent(ident)
+        with self.db:
+            self.db.execute("UPDATE intents SET status=?,note=? WHERE id=? AND scope=?",
+                            (status, note, ident, self.scope))
+            if route:
+                self.db.execute(
+                    "UPDATE pave SET status='idle', note=?, intent='', updated=? "
+                    "WHERE scope=? AND route=?", (note, time.time(), self.scope, route))
+        return route
+
     def failure_streak(self, team: str) -> int:
         rows = self.db.execute("SELECT status FROM intents WHERE scope=? AND team=? AND status IN ('accepted','rejected','reviewed') ORDER BY created DESC LIMIT 10", (self.scope,team)).fetchall()
         count = 0
@@ -184,6 +209,23 @@ class Journal:
             self.db.execute("INSERT OR REPLACE INTO daily VALUES(?,?,?,?,?)",
                             (self.scope, task, cycle, 'pending', count))
         return cycle
+
+    def reject_daily(self, task: str, cycle: str, evidence: dict) -> bool:
+        """撤销待核对记录为 rejected：提交未生效或核对失败的**幂等**领取允许重试。
+
+        2026-11-21 林：签到这类免费幂等操作，待核对不得锁死全天。
+        rejected 既不被 pending_daily 取出，也不满足 prepare_daily 的重复提交拦截。
+        """
+        if self.daily(task, cycle)[0] != 'pending':
+            return False
+        data = self.daily_context(task, cycle) or {}
+        data.update(evidence, rejected=time.time())
+        with self.db:
+            self.db.execute("INSERT OR REPLACE INTO task_context VALUES(?,?,?,?)",
+                            (self.scope, task, cycle, json.dumps(data, ensure_ascii=False)))
+            self.db.execute("UPDATE daily SET status='rejected' WHERE scope=? AND task=? AND cycle=?",
+                            (self.scope, task, cycle))
+        return True
 
     def finish_daily(self, task: str, cycle: str, evidence: dict) -> bool:
         if self.daily(task, cycle)[0] != 'pending':

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import math
@@ -13,11 +14,12 @@ from PySide6.QtCore import QThread, Signal
 
 from .game import (DispatchUnconfirmed, Game, GameError, LineRefillUnavailable, NavigationRecovered,
                    NetworkRecovered, ObservationExpired, PavePointUnavailable, PaveUnknown,
-                   RecognitionUnavailable, TeamAbsent)
+                   RecognitionUnavailable, TargetNotSelectable, TeamAbsent)
 from .evidence import EvidenceStore
 from .journal import Journal
 from .models import (Decision, Observation, Point, Profile, decide, line_decision, line_target,
-                     observation_expired, point_label)
+                     line_target_candidates, observation_expired, point_label)
+from .target_ops import format_targets_brief, merge_live_target_fields, summarize_targets
 from .team_states import LEGACY_STATE, can_dispatch
 from .transport import Control, Device, Stopped, TransportUnavailable, discover_cli, instances
 from .vision import Vision
@@ -71,6 +73,9 @@ class Worker(QThread):
     MERIT_INTERVAL = 1800
     # 拉线兵力缓存的刷新间隔：忙/可派且要按出击线判断时，超过这个秒数就完整读一次。
     LINE_STRENGTH_TTL = 180
+    # 同一个拉线目标连续点不中多少次后判定该格不可用（被建筑/部队盖住或坐标失效）。
+    # 2026-11-19 实机：无界重试每 3 分钟一次，整晚空转；三次足够区分“偶发识别抖动”。
+    LINE_TARGET_MAX_FAILURES = 3
     EVENT_HISTORY_LIMIT = 2000
 
     def __init__(self, profile: Profile, folder: Path, command="scan", dry_run=True, max_orders=0, duration=0):
@@ -106,12 +111,19 @@ class Worker(QThread):
         self.pave_strength = {}
         # 拉线队的兵力缓存（完整读数，含读取时间；之后快照复用，必要时刷新）。
         self.line_snapshot = {}
+        # 拉线目标连续点不中的计数：key -> {count, target, at}；目标变化自动重新计数。
+        self.line_failures = {}
+        # 上一轮整帧角标状态：用于识别“刚回主城”并强制完整读一次兵力。
+        self.line_last_marker = {}
         # 拉线补不动回城后，等待下一轮调动到补兵点（营帐）。
         self.line_backup = set()
         # 已回到主城、做过一次完整兵力复核的拉线队（避免整帧缓存把回城补兵误判成没补）。
         self.line_home_seen = set()
         # 已完成“最后一次调动”的拉线队；全部完成后只结束拉线模块，其他任务继续（用户 2026-11-15）。
         self.line_finished = set()
+        self.line_finished_reasons = {}
+        self.line_recheck_at = {}
+        self.line_target_blocked = {}
         self.merit_prev = None       # 上一次读数，用于单次增量
         self.next_merit_at = 0.0
         self.merit_failures = 0
@@ -125,9 +137,76 @@ class Worker(QThread):
         # 本次是否有实际刷武勋队；粮食恢复标记与 food_gate 只跟随它，
         # 讨贼/铺路/拉线不受粮食恢复约束（用户 2026-11-15）。
         self.merit_active = False
+        # 运行时热更新（武勋/拉线目标与备用征兵点）及立即唤醒机制。
+        self._update_lock = threading.Lock()
+        self._pending_update = None
+        self.wake_requested = threading.Event()
 
     def request_refresh(self):
         self.refresh_requested.set()
+
+    def wake(self):
+        """跳过当前巡检等待，立即开始下一轮读取与调度。"""
+        self.wake_requested.set()
+
+    def queue_target_update(self, profile: Profile, changed: set[str] | None = None, source: str = "ui"):
+        """线程安全提交运行中目标/征兵点热更新，并立即唤醒等待中的巡检循环。"""
+        active = self.command == "run" and not self.dry_run
+        with self._update_lock:
+            base = self._pending_update[0] if self._pending_update is not None else self.profile
+            merged, detected = merge_live_target_fields(base, profile, active=active)
+            prior_changed = self._pending_update[1] if self._pending_update is not None else set()
+            effective_changed = set(prior_changed) | set(detected) | (set(changed) if changed else set())
+            self._pending_update = (merged, effective_changed, source)
+        self.wake()
+        return copy.deepcopy(merged), effective_changed
+
+    def apply_pending_updates(self, game=None) -> bool:
+        """在安全轮次边界原子生效待处理的目标热更新；不中断单次点击/导航，不重走冷启动检查。"""
+        with self._update_lock:
+            pending = self._pending_update
+            self._pending_update = None
+        if pending is None:
+            return False
+        new_profile, changed, source = pending
+        self.profile = new_profile
+        if game is not None:
+            game.p = self.profile
+        if "merit" in changed:
+            for policy in self.profile.teams:
+                if policy.role == "merit":
+                    self.retry_at.pop(policy.key, None)
+                    self.retry_reason.pop(policy.key, None)
+        if "line" in changed:
+            self.line_target_blocked.clear()
+            self.line_failures.clear()
+            for key in [k for k in list(self.retry_at) if k.startswith("line:")]:
+                self.retry_at.pop(key, None)
+                self.retry_reason.pop(key, None)
+            for key in list(self.line_finished):
+                if self.line_finished_reasons.get(key) == "target":
+                    self.line_finished.discard(key)
+                    self.line_finished_reasons.pop(key, None)
+                else:
+                    # 缺兵收尾的队伍不强制解封，只清复核倒计时便于及时核查兵力。
+                    self.line_recheck_at.pop(key, None)
+            for key in [k for k in list(self.wait_log_at)
+                        if k.startswith(("line-target:", "line-targets-blocked:", "line-backup:"))]:
+                self.wait_log_at.pop(key, None)
+        brief = format_targets_brief(self.profile)
+        source_label = {"ui": "界面", "agent": "Agent", "api": "接口"}.get(source, source)
+        message = f"【热更新/{source_label}】目标已生效：{brief}；无需重启，立即按新坐标执行"
+        if game is not None and hasattr(game, "log"):
+            game.log(message, "INFO")
+        else:
+            self.publish("log", {"time": datetime.now().strftime("%H:%M:%S"), "level": "INFO", "message": message})
+        self.publish("profile_updated", {
+            "changed": sorted(changed),
+            "source": source,
+            "brief": brief,
+            "targets": summarize_targets(self.profile),
+        })
+        return True
 
     def publish(self, kind, value):
         if kind == "dispatch":
@@ -145,6 +224,7 @@ class Worker(QThread):
             self.control.pause.set()
         else:
             self.control.pause.clear()
+            self.wake()
 
     def stop(self):
         self.control.stop.set()
@@ -481,6 +561,7 @@ class Worker(QThread):
             started = time.monotonic()
             while True:
                 self.control.checkpoint()
+                self.apply_pending_updates(game)
                 if (not hide_checked and self.command == "run" and not self.dry_run
                         and self.profile.hide_before_run):
                     try:
@@ -547,15 +628,22 @@ class Worker(QThread):
                             food_recovery = fresh_recovery
                             if self.command == "run" and not self.dry_run:
                                 self.journal.set_flag("food_recovery", food_recovery)
+                    if self.command == "run" and not self.dry_run:
+                        # 用户 2026-11-20：路线取消后残留的铺路订单没有任何模块会核对，
+                        # 会把整支队伍永久变成“每轮只读队、从不派兵”。每轮先按现场结清
+                        # 无主铺路订单；现场读不清就保持待核对，不猜、不重发。
+                        self.settle_orphan_pave_orders(game)
                     pave_keys = self.pave_team_keys() if self.command == "run" and not self.dry_run else set()
                     batch_policies = policies if self.command == "scan" or self.dry_run else [t for t in policies if (t.role == "merit" or self.journal.pending(t.key)) and t.key not in pave_keys]
                     if not limited:
+                        self.apply_pending_updates(game)
                         limited = self.process_team_batch(game, batch_policies, food_recovery)
                     if self.command == "run" and not self.dry_run:
                         # 铺路路线独立推进：到达当前段才派下一段，不占武勋批次。
                         # 粮食恢复不约束铺路和拉线（用户 2026-11-15）。
                         self.process_pave(game)
                         # 拉线独立推进：单坐标反复拉，独立于刷武勋与铺路。
+                        self.apply_pending_updates(game)
                         self.process_line(game)
                     if self.command == "run" and self.bandits_due():
                         # 验收达到出征上限以后仍可只读列表，绝不再提交新出征；粮食恢复不影响讨贼。
@@ -596,11 +684,18 @@ class Worker(QThread):
                     try:
                         game.ensure_sandbox(recover_navigation=True)
                         game.log(f"{exc}；已关闭已识别弹层并继续监控", "INFO")
-                    except (RecognitionUnavailable, NavigationRecovered) as recover_exc:
+                    except NetworkRecovered as recover_exc:
+                        # 含子类 NavigationRecovered：断线重连或意外页面已返回沙盘，直接重读现场。
+                        game.log(str(recover_exc), "WARN")
+                        continue
+                    except RecognitionUnavailable as recover_exc:
                         # 用户 2026-11-13：战斗/攻城特效把建筑详情留在屏幕上时，页面会判未知；
                         # 左右滑动取消选中后就能回到沙盘，不必干等到特效结束。
                         try:
                             recovered = game.deselect_unknown_page()
+                        except NetworkRecovered as net_exc:
+                            game.log(str(net_exc), "WARN")
+                            continue
                         except GameError:
                             raise
                         if recovered:
@@ -654,6 +749,9 @@ class Worker(QThread):
         end = time.monotonic() + self.profile.poll_seconds
         while time.monotonic() < end:
             self.control.checkpoint()
+            if self.wake_requested.is_set():
+                self.wake_requested.clear()
+                break
             game.passive_refresh()
             self.control.sleep(min(.2, max(0, end-time.monotonic())))
 
@@ -677,7 +775,9 @@ class Worker(QThread):
         try:
             obs = game.scan_team(policy)
         except TeamAbsent as exc:
-            # 本赛季尚未拥有的槽位不是故障：不读详情、不派兵、不写 WARN。
+            # 2026-11-21：读取中断也必须复位现场（关部队页/回沙盘）。
+            # 否则选中态残留，下一轮拿到同一份坏证据，形成自锁。
+            game.ensure_sandbox()
             self.publish("observation", Observation(policy.key, note=str(exc)).__dict__)
             return None
         except NetworkRecovered:
@@ -975,7 +1075,6 @@ class Worker(QThread):
         count = sum(d.action == "merit" for p,o,d in plans)
         if count and self.command == "run" and not self.dry_run:
             self.publish("status",f"本批 {count} 队可尝试出击 · 正在连续处理")
-        previous_target = None
         dispatched = set()
         for policy, obs, planned in plans:
             self.control.checkpoint()
@@ -998,10 +1097,10 @@ class Worker(QThread):
                     else:
                         points = [self.profile.merit_backup] if self.profile.merit_backup is not None else []
                     for point in points:
-                        key = (point.x,point.y,point.name,tuple(point.actions),point.expected_name,decision.action)
                         try:
-                            game.dispatch(policy,obs,point,decision.action,reuse_target=previous_target == key)
-                            previous_target = key
+                            # 目标怎么选中由 Game 按“镜头是否还在这个坐标上”自己决定：
+                            # 调用方不再用“上一个目标相同”替它猜镜头位置（2026-11-18 实机根因）。
+                            game.dispatch(policy, obs, point, decision.action)
                             failure = None
                             dispatched.add(policy.key)
                             self.last_progress[policy.key] = time.time()
@@ -1009,20 +1108,17 @@ class Worker(QThread):
                         except NetworkRecovered:
                             raise
                         except DispatchUnconfirmed as exc:
-                            previous_target = None
                             game.log(f"{policy.display} / {point.name}：{exc}","INFO")
                             game.ensure_sandbox()
                             failure = exc
                             break
                         except GameError as exc:
                             failure = exc
-                            previous_target = None
                             game.log(f"{policy.display} / {point.name}：{exc}","WARN")
                             game.ensure_sandbox()
                             if self.journal.pending(policy.key):
                                 break
                 elif decision.action == "return":
-                    previous_target = None
                     if obs.location is None:
                         # 坐标没读到就不点回城：宁可下一轮重读，也不在不确定位置点箭头。
                         self.log_once(policy.key + ":return",
@@ -1041,12 +1137,10 @@ class Worker(QThread):
             except NetworkRecovered:
                 raise
             except DispatchUnconfirmed as exc:
-                previous_target = None
                 game.log(f"{policy.display}：{exc}","INFO")
                 game.ensure_sandbox()
                 self.defer_team(policy.key, exc)
             except GameError as exc:
-                previous_target = None
                 game.log(f"{policy.display}：{exc}","WARN")
                 self.defer_team(policy.key, exc)
                 game.ensure_sandbox()
@@ -1065,7 +1159,8 @@ class Worker(QThread):
         """
         if self.command != "run" or self.dry_run or not plans:
             return
-        if not any(policy.role == "merit" for policy, _obs, _planned in plans):
+        # 2026-11-21：自检覆盖所有可派角色。原实现只看 merit，拉线队闲死三小时无告警。
+        if not any(policy.role in ("merit", "line", "bandits") for policy, _obs, _planned in plans):
             return
         labels = {"home": "主城", "outside": "城外停留", "guarding": "驻守", "wounded": "重伤恢复",
                   "marching": "行军", "returning": "返回", "fighting": "战斗", "recruiting": "征兵"}
@@ -1073,14 +1168,14 @@ class Worker(QThread):
         for policy, obs, planned in plans:
             label = obs.marker_label or labels.get(obs.state, obs.state or "未知")
             states.append(f"{policy.key}={label}")
-            if policy.role != "merit" or policy.key in dispatched or not _can_dispatch(obs):
+            if policy.role not in ("merit", "line", "bandits") or policy.key in dispatched or not _can_dispatch(obs):
                 self.idle_rounds.pop(policy.key, None)
                 continue
             rounds = self.idle_rounds.get(policy.key, 0) + 1
             self.idle_rounds[policy.key] = rounds
             idle.append(f"{policy.key}（{planned.reason}）")
             if rounds >= 2:
-                if planned.action in ("merit", "transfer", "bandits"):
+                if planned.action in ("merit", "transfer", "bandits", "line"):
                     # 想派却没派出去：解除冷却，下一轮一定重新尝试；不停止该队。
                     self.retry_at.pop(policy.key, None)
                     self.retry_reason.pop(policy.key, None)
@@ -1185,6 +1280,51 @@ class Worker(QThread):
                 game.log(f"{policy.display} 铺路订单核对为未出发，下一轮重试", "INFO")
         # 其余情况保持待核对，不自动重发。
 
+    def settle_changed_route_pending(self, game, policy, route, progress):
+        """路线被改过时，按现场结清旧铺路订单；返回是否可以把进度重置到新路线。
+
+        原逻辑“有未确认命令就保持暂停”在路线被改后永远等不到核对（进度还是旧
+        指纹、旧段号），队伍会被这条路线一直占住。这里只结清铺路订单；其他类型
+        的未结清命令仍交给通用核对，读不清现场就继续暂停，不猜、不重发。
+        """
+        pending = [(row[0], row[1]) for row in self.journal.pending(policy.key)]
+        if any(kind != "pave" for _ident, kind in pending):
+            return False
+        seen = {ident for ident, _kind in pending}
+        old_intent = progress.get("intent")
+        if old_intent and old_intent not in seen:
+            row = self.journal.db.execute(
+                "SELECT team,status FROM intents WHERE scope=? AND id=?",
+                (self.journal.scope, old_intent)).fetchone()
+            if row and row[1] in ("prepared", "uncertain"):
+                if row[0] != policy.key:
+                    # 旧订单属于别的队伍：交给无主订单核对，绝不用本队现场替它结清。
+                    return False
+                pending.append((old_intent, "pave"))
+        if not pending:
+            return True
+        try:
+            obs = self.observe_team(game, policy)
+        except TeamAbsent:
+            obs = None
+        if obs is None or obs.state in ("", "unknown"):
+            return False
+        if obs.state == "home" and obs.strength is not None and obs.wounded is False:
+            status = "rejected"
+            note = "路线已修改，现场确认队伍在主城，旧订单判定未出发"
+        elif obs.state == "home":
+            return False  # 主城读数不完整：不足以判定未出发，保持暂停等下一轮
+        else:
+            status = "accepted"
+            note = "路线已修改，现场确认队伍已离开主城，旧订单按已出发结清"
+        for ident, _kind in pending:
+            self.journal.settle_orphan_pave(ident, status, note)
+        if (self.journal.phase(policy.key) == "pave"
+                and policy.key not in self.pave_team_keys()):
+            self.journal.set_phase(policy.key, "")
+        game.log(f"{policy.display} 路线 {route.name} 已修改：{note}", "WARN")
+        return True
+
     def process_pave(self, game):
         """游标可连续跳过无攻占点；每轮每条路线最多成功派出一段。
 
@@ -1209,11 +1349,9 @@ class Worker(QThread):
             progress = self.journal.pave_progress(route.name)
             fingerprint = self.pave_fingerprint(route)
             if progress["fingerprint"] and progress["fingerprint"] != fingerprint:
-                old_intent = progress.get("intent")
-                old_pending = self.journal.db.execute(
-                    "SELECT 1 FROM intents WHERE scope=? AND id=? AND status IN ('prepared','uncertain')",
-                    (self.journal.scope, old_intent)).fetchone() if old_intent else None
-                if self.journal.pending(policy.key) or old_pending:
+                # 用户 2026-11-20：路线改过且旧订单没结果时不能永久“保持暂停”，
+                # 先按现场把旧订单结清（读不清就继续暂停），再重置到新路线。
+                if not self.settle_changed_route_pending(game, policy, route, progress):
                     game.log(f"铺路路线 {route.name} 已修改，但该队有未确认命令；保持暂停", "WARN")
                     continue
                 self.journal.set_pave(route.name, 0, "idle", "路线已修改，进度重置",
@@ -1314,6 +1452,13 @@ class Worker(QThread):
                                                 origin, fingerprint)
                 try:
                     game.pave_dispatch(policy, obs, target, ident)
+                except Stopped:
+                    # 用户在派兵过程中停止：订单已经落盘（prepared），但没有任何模块会
+                    # 再核对 prepared 的铺路订单。留成“结果未知”交给下一轮优先现场核对；
+                    # 路线随后被取消时由 settle_orphan_pave_orders 结清（2026-11-20 实机）。
+                    self.journal.mark_pave_unknown(ident, route.name, idx,
+                                                   "停止时命令已落盘，结果未知")
+                    raise
                 except PaveUnknown as exc:
                     self.journal.mark_pave_unknown(ident, route.name, idx, str(exc))
                     self.retry_at[f"pave:{route.name}"] = time.time() + self.profile.retry_seconds
@@ -1352,21 +1497,108 @@ class Worker(QThread):
                                           "reason": f"铺路路线 {route.name} 第 {idx+1} 段 → ({target[0]},{target[1]})"})
                 break
 
+    def orphan_pave_orders(self):
+        """铺路模块再也不会核对到的铺路订单。
+
+        订单由 begin_pave 落盘（prepared/uncertain），只有 process_pave 结合路线进度
+        能结清。路线被删除、取消分配（team 空）、改给别队或改到亲卫槽位以后，
+        这条订单就没有任何模块会再看一眼；它留在 pending 里会让 process_line 和
+        team_decision 永久跳过整支队伍（2026-11-20 实机：铺路 1 取消后 main:1
+        每轮只读队、从不派兵）。这里只列出，不改现场。
+        """
+        if self.journal is None:
+            return []
+        rows = self.journal.db.execute(
+            "SELECT id,team,target,status,created FROM intents "
+            "WHERE scope=? AND kind='pave' AND status IN ('prepared','uncertain') "
+            "ORDER BY created", (self.journal.scope,)).fetchall()
+        routes = {route.name: route for route in self.profile.pave_routes}
+        teams = {policy.key: policy for policy in self.profile.teams}
+        orphans = []
+        for ident, team, target, status, created in rows:
+            name = self.journal.route_of_intent(ident)
+            route = routes.get(name) if name else None
+            policy = teams.get(team)
+            if (route is not None and route.points and route.team == team
+                    and policy is not None and policy.group == "main"):
+                continue  # 路线仍归本队：交给 process_pave 按现场核对
+            orphans.append({"id": ident, "team": team, "target": target,
+                            "status": status, "created": created,
+                            "route_name": name, "route": route})
+        return orphans
+
+    def settle_orphan_pave_orders(self, game):
+        """按现场结清无主铺路订单，避免整支队伍被永久跳过。
+
+        用户 2026-11-20：这是严重故障，必须彻底解决。规则与 _recover_pave 一致：
+        主城读到兵力且未重伤 → 判定未出发（rejected）；已离开主城或以重伤返回 →
+        判定已出发（accepted）；读不清 → 保持待核对，绝不把未知当未出发、也不重发。
+        """
+        if self.journal is None or self.command != "run" or self.dry_run:
+            return
+        for order in self.orphan_pave_orders():
+            policy = next((t for t in self.profile.teams
+                           if t.key == order["team"] and t.group == "main"), None)
+            if policy is None or not self.team_present(policy.key):
+                note = "队伍不在本次部队列表，残留铺路订单作废"
+                self.journal.settle_orphan_pave(order["id"], "rejected", note)
+                game.log(f"{order['team']} 的残留铺路订单（{order['target']}）：{note}", "WARN")
+                continue
+            try:
+                obs = self.observe_team(game, policy)
+            except TeamAbsent:
+                obs = None
+            if obs is None or obs.state in ("", "unknown"):
+                self.log_once(f"orphan-pave:{order['id']}",
+                              f"{policy.display} 有残留铺路订单（{order['target']}），"
+                              f"现场暂未读清，该队本轮不派兵，下一轮继续核对",
+                              "WARN", every=600)
+                continue
+            if obs.state == "home" and obs.strength is not None and obs.wounded is False:
+                status = "rejected"
+                note = "路线已取消/未分配给本队，现场确认队伍在主城，判定未出发"
+            elif obs.state == "home":
+                # 在主城但兵力/伤情没读全：不足以证明“没出发”，保持待核对。
+                self.log_once(f"orphan-pave:{order['id']}",
+                              f"{policy.display} 有残留铺路订单（{order['target']}），"
+                              f"主城读数不完整，暂不结清，下一轮继续核对",
+                              "WARN", every=600)
+                continue
+            else:
+                status = "accepted"
+                note = "路线已取消/未分配给本队；现场确认队伍已离开主城或以重伤返回，按已出发结清"
+            self.journal.settle_orphan_pave(order["id"], status, note)
+            if (self.journal.phase(policy.key) == "pave"
+                    and policy.key not in self.pave_team_keys()):
+                self.journal.set_phase(policy.key, "")
+            game.log(f"{policy.display} 的残留铺路订单（{order['target']}）已结清：{note}；本队恢复原任务", "WARN")
+
     def line_team_keys(self):
         return {t.key for t in self.profile.teams
                 if t.role == "line" and t.group == "main" and self.team_present(t.key)}
 
-    def observe_line_team(self, game, policy):
-        """拉线读队：轻量快照（坐标/角标/重伤），不走刷武勋那套主城核对重扫描。
+    def observe_line_team(self, game, policy, force=False):
+        """拉线读队：轻量快照（坐标/角标/重伤），需要时强制完整读一次兵力。
 
         用户 2026-11-13：一队在城外时旧的重读取会反复失败。第一轮顺手读一次完整数据
         缓存兵力；之后只用快照，读不到完整数据也不拦派兵（能拉就拉）。
+
+        2026-11-19 实机：缓存一旦写入就再也不刷新——队伍回主城补满后仍拿 13591/30000
+        的旧读数做“低于出击下限”判断，且每次都去点一个被建筑盖住的坐标，形成无限循环。
+        所以 force/过期时必须在**这里**完整读一次，不能因为 key 已存在就退回快照。
         """
-        if policy.key not in self.line_snapshot:
+        cached = self.line_snapshot.get(policy.key)
+        stale = bool(cached) and time.time() - cached[2] > self.LINE_STRENGTH_TTL
+        if force or policy.key not in self.line_snapshot or stale:
             full = self.observe_team(game, policy)
-            if full is not None and full.strength is not None and full.maximum is not None:
+            if full is None:
+                return None
+            if full.strength is not None and full.maximum is not None:
                 self.line_snapshot[policy.key] = (full.strength, full.maximum, time.time())
-            if full is not None and full.marker_state is not None:
+            elif full is not None:
+                # 完整读没拿到兵力：作废旧缓存，避免拿更早的读数做出击线判断。
+                self.line_snapshot.pop(policy.key, None)
+            if full.marker_state is not None or force or stale:
                 return full
         scanner = getattr(game, "scan_pave_team", None)
         if not callable(scanner):
@@ -1380,6 +1612,49 @@ class Worker(QThread):
     def line_backup_point(self, policy):
         """拉线只使用本队在拉线目标区域配置的征兵点，不与武勋共用。"""
         return self.profile.line_backups.get(policy.key)
+
+    def _line_idle(self, game, policy, reason):
+        """拉线队防闲死（2026-11-21：原自检只覆盖 merit，拉线队闲死数小时无告警）。
+        可派却连续 2 轮未动作：解除冷却下轮强制重试，永远不停队、不加黑名单。"""
+        key = f"line:{policy.key}"
+        rounds = self.idle_rounds.get(key, 0) + 1
+        self.idle_rounds[key] = rounds
+        if rounds < 2:
+            return
+        self.idle_rounds[key] = 0
+        self.retry_at.pop(f"line:{policy.key}", None)
+        self.retry_reason.pop(f"line:{policy.key}", None)
+        game.log(f"{policy.display} 拉线可派但连续 {rounds} 轮未动作：{reason}；已解除冷却，下一轮强制重试", "WARN")
+        self.publish("diagnostic", {"stage": "liveness", "team": policy.key, "rounds": rounds, "reason": reason})
+
+    def _line_alive(self, policy):
+        self.idle_rounds.pop(f"line:{policy.key}", None)
+
+    # 目标级不可用（换目标继续干），与账号/命令级故障（不换）分开。
+    LINE_TARGET_UNAVAILABLE = ("没有连接地", "保护状态", "没有允许的动作",
+                               "出征按钮不可用", "动作文字未核对", "没有调动指令")
+
+    def _line_target_unavailable(self, exc):
+        return any(s in str(exc) for s in self.LINE_TARGET_UNAVAILABLE)
+
+    def _line_target_failed(self, game, policy, target, exc):
+        """目标不可用：冷却该目标、按顺序试下一个，不结束队伍、不原地空转。
+
+        2026-11-21：民港「被攻击的建筑物没有连接地」连续 14 轮空转的根因修复。
+        点不中（TargetNotSelectable）同样冷却；连续点不中拉黑更久，代替旧的
+        「结束该队拉线」——结束与复拉来回跳没有意义，冷却即可。"""
+        cooldown = 600
+        if isinstance(exc, TargetNotSelectable):
+            state = self.line_failures.get(policy.key)
+            count = (state.get("count", 0) + 1) if state and state.get("target") == (target.x, target.y) else 1
+            self.line_failures[policy.key] = {"count": count, "target": (target.x, target.y),
+                                              "at": time.time()}
+            if count >= self.LINE_TARGET_MAX_FAILURES:
+                cooldown = 1800  # 坐标可能已被建筑覆盖，拉黑更久等待现场变化
+        self.line_target_blocked[(policy.key, target.x, target.y)] = time.time() + cooldown
+        game.log(f"{policy.display} / {point_label(target)}：{exc}；"
+                 f"该目标冷却 {cooldown // 60} 分钟，按顺序试下一个拉线目标", "WARN")
+        game.ensure_sandbox()
 
     def process_line(self, game):
         """拉线模块（用户 2026-11-13 MVP 口径）。
@@ -1409,20 +1684,50 @@ class Worker(QThread):
             self.control.checkpoint()
             if policy.group != "main" or not self.team_present(policy.key):
                 continue
-            if self.journal.pending(policy.key):
+            pending = self.journal.pending(policy.key)
+            if pending:
                 # 有未结清订单先按真实现场结清（observe_team 是通用结清入口）；
                 # 拉线的整帧角标/轻量快照会绕过它，不能直接跳过把订单永久锁住。
                 # 这一步放在“无目标/已完成/冷却跳过”之前：无目标时也必须先恢复 pending。
-                settled = self.observe_team(game, policy)
-                if settled is not None and settled.strength is not None and settled.maximum is not None:
-                    self.line_snapshot[policy.key] = (settled.strength, settled.maximum, time.time())
-                else:
-                    # 没读到新兵力就作废旧缓存，避免拿过期读数做出击线判定。
-                    self.line_snapshot.pop(policy.key, None)
-                if self.journal.pending(policy.key):
+                # 2026-11-20：通用观测明确不结清铺路订单（要核对原地/目标/路线进度），
+                # 无主铺路订单由 settle_orphan_pave_orders 结清；不要为它每轮空读一次队伍。
+                if any(row[1] != "pave" for row in pending):
+                    settled = self.observe_team(game, policy)
+                    if settled is not None and settled.strength is not None and settled.maximum is not None:
+                        self.line_snapshot[policy.key] = (settled.strength, settled.maximum, time.time())
+                    else:
+                        # 没读到新兵力就作废旧缓存，避免拿过期读数做出击线判定。
+                        self.line_snapshot.pop(policy.key, None)
+                    pending = self.journal.pending(policy.key)
+                if pending:
+                    kinds = "、".join(sorted({row[1] for row in pending}))
+                    self.log_once(f"line-pending:{policy.key}",
+                                  f"{policy.display} 有未结清命令（{kinds}），本轮先不派兵；"
+                                  f"铺路订单需要路线核对，路线取消后会按现场自动结清",
+                                  every=600)
                     continue
             if policy.key in self.line_finished:
-                continue
+                # 2026-11-21：结束≠永久停工。每 5 分钟复核一次兵力，
+                # 恢复到出击线就清结束标记、回到正常拉线流程（原实现只能重启恢复，
+                # 与日志「等待兵力恢复后再启动」的承诺不符）。
+                if time.time() < self.line_recheck_at.get(policy.key, 0):
+                    continue
+                self.line_recheck_at[policy.key] = time.time() + 300
+                try:
+                    recheck = self.observe_line_team(game, policy, force=True)
+                except TeamAbsent:
+                    continue
+                if recheck is None or recheck.strength is None or not recheck.maximum:
+                    continue
+                if recheck.strength < policy.threshold(recheck.maximum):
+                    continue
+                self.line_finished.discard(policy.key)
+                self.line_finished_reasons.pop(policy.key, None)
+                self.line_home_seen.discard(policy.key)
+                self.line_snapshot.pop(policy.key, None)
+                game.log(f"{policy.display} 兵力已恢复 {recheck.strength}/{recheck.maximum}，重新启动拉线", "INFO")
+                # 落到正常流程：用复核读数更新现场，城外满编会判回城，到家后下一轮自动再拉。
+                obs = recheck
             target = line_target(self.profile, policy)
             if target is None:
                 self.log_once(f"line-target:{policy.key}",
@@ -1442,14 +1747,25 @@ class Worker(QThread):
             obs = None
             has_backup = self.line_backup_point(policy) is not None
             marker = hud.get(policy.slot)
+            prior_marker = self.line_last_marker.get(policy.key)
+            if marker and marker.get("state") not in (None, "unknown"):
+                self.line_last_marker[policy.key] = marker["state"]
             cached = self.line_snapshot.get(policy.key)
             # 缓存太久、而这一刻的决策要看兵力（忙/可派）时完整读一次；其他状态不值当导航。
             stale = bool(cached) and time.time() - cached[2] > self.LINE_STRENGTH_TTL
             need_strength = bool(marker) and (marker["state"] == "busy" or can_dispatch(marker["state"]))
-            # 有补兵点时，忙也要完整读一次：确认是“在主城（先转补兵点）”还是建筑里。
-            force_home_check = has_backup and bool(marker) and marker.get("state") == "busy"
-            if (marker and marker.get("state") != "unknown" and cached
-                    and not (stale and need_strength) and not force_home_check):
+            # 有补兵点时，刚进入“忙碌”要完整读一次：确认是在主城（先转补兵点）还是建筑里。
+            # 但忙碌可能持续很久（占领/自然征兵），不能每 15 秒都导航读队；
+            # 只在进入忙碌的那一轮、或缓存过期后再读一次。
+            force_home_check = (has_backup and bool(marker)
+                                and marker.get("state") == "busy"
+                                and (prior_marker != "busy" or stale))
+            # 刚回主城（空闲/练兵）：角标缓存里的兵力可能是路上/受伤时的旧值，
+            # 必须完整读一次，否则会把“回城已经补满”当成“仍低于出击下限”（2026-11-19 实机）。
+            home_transition = (bool(marker) and marker.get("state") in ("idle", "training")
+                               and prior_marker not in (None, "idle", "training", "unknown"))
+            force_full = bool(stale and need_strength) or force_home_check or home_transition
+            if (marker and marker.get("state") != "unknown" and cached and not force_full):
                 obs = Observation(
                     policy.key,
                     state=LEGACY_STATE.get(marker["state"], "unknown"),
@@ -1461,11 +1777,13 @@ class Worker(QThread):
                 self.publish("observation", obs.__dict__)
             if obs is None:
                 try:
-                    obs = self.observe_line_team(game, policy)
+                    obs = self.observe_line_team(game, policy, force=force_full)
                 except TeamAbsent as exc:
-                    self.log_once(f"line-absent:{policy.key}", f"{policy.display} 拉线：{exc}", every=1800)
+                    self.log_once(f"line-absent:{policy.key}", f"{policy.display} 拉线：{exc}", every=300)
+                    self._line_idle(game, policy, f"读取判定缺席：{exc}")
                     continue
             if obs is None:
+                self._line_idle(game, policy, "本轮读取未完成")
                 continue
             if obs.strength is not None and obs.maximum is not None:
                 self.line_snapshot[policy.key] = (obs.strength, obs.maximum, time.time())
@@ -1492,6 +1810,9 @@ class Worker(QThread):
                                       every=600)
                         continue
                     obs = full
+                    if obs.strength is not None and obs.maximum is not None:
+                        # 回城后的完整读数才是补兵是否生效的证据；同步刷新缓存。
+                        self.line_snapshot[policy.key] = (obs.strength, obs.maximum, time.time())
                     self.line_home_seen.add(policy.key)
                 need = policy.threshold(obs.maximum) if obs.maximum else None
                 if obs.strength is None:
@@ -1504,36 +1825,66 @@ class Worker(QThread):
                     continue
                 self._line_transfer_backup(game, policy, obs)
                 continue
-            decision = line_decision(policy, obs, target=target,
-                                     stopped=self.control.stop.is_set())
-            self.publish("decision", {"team": policy.key, "action": decision.action, "reason": decision.reason})
-            if decision.action not in ("line", "refill"):
+            # 2026-11-21 多目标退让：当前目标不可派（保护中/无连接地/点不中）时
+            # 按优先级试下一个；全部冷却才暂停，冷却到期自动从头重试。
+            targets = [t for t in line_target_candidates(self.profile, policy)
+                       if time.time() >= self.line_target_blocked.get((policy.key, t.x, t.y), 0)]
+            if not targets:
+                self.log_once(f"line-targets-blocked:{policy.key}",
+                              f"{policy.display} 拉线目标全部暂不可用（冷却中），到期自动恢复重试",
+                              every=300)
                 continue
-            # 动作顺序完全按目标自己的配置（和刷武勋目标一样），不再写死攻占/行军。
-            point = replace(target, expected_name="")
-            try:
-                game.dispatch(policy, obs, point, "line", reuse_target=True)
-            except LineRefillUnavailable as exc:
-                game.log(f"{policy.display} 拉线：{exc}；按兜底处理", "WARN")
-                self.retry_at[f"line:{policy.key}"] = time.time() + self.profile.retry_seconds
-                game.ensure_sandbox()
-                self._line_fallback(game, policy, obs)
-            except DispatchUnconfirmed as exc:
-                self.retry_at[f"line:{policy.key}"] = time.time() + self.unconfirmed_delay(policy.key)
-                game.log(f"{policy.display} / 拉线：{exc}", "INFO")
-                game.ensure_sandbox()
-            except NetworkRecovered:
-                raise
-            except GameError as exc:
-                game.log(f"{policy.display} / 拉线：{exc}", "WARN")
-                self.retry_at[f"line:{policy.key}"] = time.time() + self.profile.retry_seconds
-                game.ensure_sandbox()
-            else:
-                self.retry_at.pop(f"line:{policy.key}", None)
-                # 状态即将变化：清一次缓存，下一轮重新读完整数据。
-                self.line_snapshot.pop(policy.key, None)
-                self.publish("decision", {"team": policy.key, "action": "line",
-                                          "reason": f"拉线已提交 {point_label(target)}"})
+            for target in targets:
+                decision = line_decision(policy, obs, target=target,
+                                         stopped=self.control.stop.is_set())
+                self.publish("decision", {"team": policy.key, "action": decision.action, "reason": decision.reason})
+                if decision.action not in ("line", "refill"):
+                    # 等待由队伍状态决定（重伤/行军/驻守），换目标无意义，退出目标循环。
+                    if _can_dispatch(obs):
+                        self._line_idle(game, policy, decision.reason)
+                    else:
+                        self._line_alive(policy)
+                    break
+                # 动作顺序完全按目标自己的配置（和刷武勋目标一样），不再写死攻占/行军。
+                point = replace(target, expected_name="")
+                try:
+                    # 目标选中不再由调用方传“镜头还在不在目标上”的布尔值：Game 自己按现场状态决定，
+                    # 证明不了镜头位置就老老实实坐标导航（2026-11-18 实机根因）。
+                    game.dispatch(policy, obs, point, "line")
+                except LineRefillUnavailable as exc:
+                    game.log(f"{policy.display} 拉线：{exc}；按兜底处理", "WARN")
+                    self.retry_at[f"line:{policy.key}"] = time.time() + self.profile.retry_seconds
+                    game.ensure_sandbox()
+                    self._line_fallback(game, policy, obs)
+                    break
+                except DispatchUnconfirmed as exc:
+                    # 命令可能已提交：不换目标，保留给下轮核对。
+                    self.retry_at[f"line:{policy.key}"] = time.time() + self.unconfirmed_delay(policy.key)
+                    game.log(f"{policy.display} / 拉线：{exc}", "INFO")
+                    game.ensure_sandbox()
+                    break
+                except NetworkRecovered:
+                    raise
+                except TargetNotSelectable as exc:
+                    self._line_target_failed(game, policy, target, exc)
+                    continue
+                except GameError as exc:
+                    if self._line_target_unavailable(exc):
+                        self._line_target_failed(game, policy, target, exc)
+                        continue
+                    game.log(f"{policy.display} / 拉线：{exc}", "WARN")
+                    self.retry_at[f"line:{policy.key}"] = time.time() + self.profile.retry_seconds
+                    game.ensure_sandbox()
+                    break
+                else:
+                    self.retry_at.pop(f"line:{policy.key}", None)
+                    self.line_failures.pop(policy.key, None)
+                    self._line_alive(policy)
+                    # 状态即将变化：清一次缓存，下一轮重新读完整数据。
+                    self.line_snapshot.pop(policy.key, None)
+                    self.publish("decision", {"team": policy.key, "action": "line",
+                                              "reason": f"拉线已提交 {point_label(target)}"})
+                    break
 
     def _line_finish(self, game, policy, obs):
         """主城也补不上兵：最后一次调动到补兵点；全部完成后只结束拉线模块。
@@ -1551,10 +1902,18 @@ class Worker(QThread):
             try:
                 game.dispatch(policy, obs, point, "transfer")
                 submitted = True
+            except NetworkRecovered:
+                raise
             except GameError as exc:
-                game.log(f"{policy.display} 拉线任务结束前调动未提交：{exc}", "WARN")
+                # 调动未确认提交：不清完成标记，保留给下一轮重读现场后再尝试调动。
+                self.line_snapshot.pop(policy.key, None)
+                game.log(f"{policy.display} 拉线任务结束前调动未提交，下轮重试：{exc}", "WARN")
+                return
         self.line_backup.discard(policy.key)
+        self.line_failures.pop(policy.key, None)
+        self.line_snapshot.pop(policy.key, None)
         self.line_finished.add(policy.key)
+        self.line_finished_reasons[policy.key] = "troops"
         if submitted:
             game.log(f"{policy.display} 已进入调动（{point.name}）；该队拉线任务结束，"
                      f"等待兵力恢复后再启动", "WARN")
@@ -1572,6 +1931,53 @@ class Worker(QThread):
         if submitted:
             game.log("所有拉线队伍都已发出调动令（补兵点）；拉线模块已结束，其他任务继续", "WARN")
         # 不停 worker：刷武勋、讨贼、铺路、日常等其他模块继续运行。
+
+    def _line_target_unselectable(self, game, policy, target, exc):
+        """目标格子连续点不中：有界退避，超过上限只结束该队拉线，绝不无限重试。
+
+        2026-11-19 实机：空地(740,683) 被太虚民港(741,683) 的建筑模型盖住，
+        go_to 每轮都选中港口并报坐标不符；旧代码每 180 秒重来一次，整晚空转。
+        用户同日确认改成港口(741,683)；这里保留兜底，换回被覆盖的坐标时不再死循环。
+        """
+        selected = getattr(exc, "selected", None)
+        state = self.line_failures.get(policy.key)
+        if state and state.get("target") == (target.x, target.y):
+            count = state.get("count", 0) + 1
+        else:
+            count = 1
+        self.line_failures[policy.key] = {"count": count, "target": (target.x, target.y),
+                                          "at": time.time()}
+        hint = f"点中的是 {selected}" if selected else "没有选中任何格子"
+        if count >= self.LINE_TARGET_MAX_FAILURES:
+            self.line_finished.add(policy.key)
+            self.line_finished_reasons[policy.key] = "target"
+            self.retry_at.pop(f"line:{policy.key}", None)
+            self.line_snapshot.pop(policy.key, None)
+            game.log(
+                f"{policy.display} 拉线：目标 {point_label(target)} 连续 {count} 次点不中"
+                f"（{hint}），判定该格被建筑/部队覆盖或坐标已失效；本队拉线结束。"
+                f"请到「目标与铺路 → 拉线目标」改成可选中坐标后再启动", "ERROR")
+            self.publish("decision", {"team": policy.key, "action": "finish",
+                                      "reason": f"拉线目标连续 {count} 次不可选中，结束本队"})
+            remaining = [p.display for p in self.profile.teams
+                         if p.role == "line" and p.group == "main"
+                         and self.team_present(p.key) and p.key not in self.line_finished]
+            if remaining:
+                self.publish("status", f"{policy.display} 拉线因目标不可选中结束；继续 {'、'.join(remaining)}")
+            else:
+                self.publish("status", "拉线模块已结束（目标不可选中），其他任务继续")
+            game.ensure_sandbox()
+            return
+        # 有界退避：第 1 次 2 分钟、第 2 次 4 分钟；第三次直接结束，不会无限循环。
+        backoff = min(self.profile.retry_seconds * (2 ** (count - 1)), 600)
+        self.retry_at[f"line:{policy.key}"] = time.time() + backoff
+        game.log(f"{policy.display} 拉线：目标 {point_label(target)} 点不中（{hint}；"
+                 f"{count}/{self.LINE_TARGET_MAX_FAILURES}），{int(backoff)} 秒后再试；"
+                 f"若连续失败请改用可选中坐标", "WARN")
+        self.publish("decision", {"team": policy.key, "action": "wait",
+                                  "reason": f"拉线目标点不中（{count}/{self.LINE_TARGET_MAX_FAILURES}），"
+                                            f"退避 {int(backoff)} 秒"})
+        game.ensure_sandbox()
 
     def _line_transfer_backup(self, game, policy, obs):
         """回城后按补兵点调动到营帐；到达营帐后再按状态继续拉。"""
@@ -1596,6 +2002,8 @@ class Worker(QThread):
         else:
             self.line_backup.discard(policy.key)
             self.retry_at.pop(f"line:{policy.key}", None)
+            # 路上/到营帐后的兵力会变；作废旧缓存，到达后重新完整读一次。
+            self.line_snapshot.pop(policy.key, None)
             game.log(f"{policy.display} 已回主城，按补兵点调动到 {point.name}；到达后继续拉线", "INFO")
             self.publish("decision", {"team": policy.key, "action": "transfer",
                                       "reason": f"拉线：回城后调动到 {point.name}"})

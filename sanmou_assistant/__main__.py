@@ -44,10 +44,13 @@ def profile_location(data: Path, explicit: Path | None = None, account_id: str =
 
 
 def main():
+    if len(sys.argv) > 1 and sys.argv[1] == "ctl":
+        from .control_server import run_ctl
+        return run_ctl(sys.argv[2:])
     parser = argparse.ArgumentParser(description="三谋桌面助手")
     parser.add_argument("--data-dir", type=Path)
     parser.add_argument("--scan", action="store_true", help="只读扫描后退出，结果保存到指定数据目录")
-    parser.add_argument("--command", choices=["scan","calibrate","preview","rates","farming","dailies","run","launch","discover","packages","review","return","runtime","pave-reset","diagnostics"])
+    parser.add_argument("--command", choices=["scan","calibrate","preview","rates","farming","dailies","run","launch","discover","packages","review","return","runtime","pave-reset","diagnostics","serve"])
     parser.add_argument("--output", type=Path, help="diagnostics 诊断压缩包输出路径")
     parser.add_argument("--include-private", action="store_true", help="diagnostics 导出完整诊断包（含配置、原始日志和截图）；默认导出不含隐私内容的安全诊断包")
     parser.add_argument("--profile", type=Path)
@@ -58,6 +61,8 @@ def main():
     parser.add_argument("--ui-proof", type=Path, help="生成全部桌面页面截图后退出，不连接游戏")
     parser.add_argument("--read-on-open", action="store_true", help="打开桌面后读取全部队伍，不运行战斗循环")
     parser.add_argument("--start-on-open", action="store_true", help="打开完整界面后按保存配置开始执行")
+    parser.add_argument("--control-port", type=int, default=0, help="本地 Agent 控制服务监听端口（仅 127.0.0.1；默认 0 自动分配）")
+    parser.add_argument("--no-control-server", action="store_true", help="桌面模式下不启动本地 Agent 控制服务")
     args = parser.parse_args()
     from .models import Profile, data_directory
     data = args.data_dir or data_directory()
@@ -71,6 +76,52 @@ def main():
         if sys.stdout is not None:
             print(str(output.resolve()))
         return 0
+    if args.command == "serve":
+        import signal
+        from PySide6.QtCore import QCoreApplication, QTimer
+        from .control_server import ControlServer
+        from .controller import HeadlessHubBackend, RuntimeHub
+
+        app = QCoreApplication(sys.argv[:1])
+        app.setApplicationName("三谋助手")
+        backend = HeadlessHubBackend(data)
+        hub = RuntimeHub(backend, mode="headless", parent=app)
+        server = ControlServer(hub, data, port=args.control_port, mode="headless")
+        info = server.start()
+        if sys.stdout is not None:
+            print(json.dumps({
+                "event": "control_server_ready",
+                "value": {
+                    "host": info["host"],
+                    "port": info["port"],
+                    "pid": info["pid"],
+                    "mode": info["mode"],
+                    "control_file": str(server.info_path),
+                },
+            }, ensure_ascii=False), flush=True)
+
+        stopping = {"flag": False}
+
+        def request_shutdown(*_a):
+            if stopping["flag"]:
+                return
+            stopping["flag"] = True
+            app.quit()
+
+        signal.signal(signal.SIGINT, request_shutdown)
+        if hasattr(signal, "SIGTERM"):
+            signal.signal(signal.SIGTERM, request_shutdown)
+        # Windows 下让 Qt 事件循环定期回到 Python 处理 Ctrl+C 信号。
+        pulse = QTimer(app)
+        pulse.setInterval(200)
+        pulse.timeout.connect(lambda: None)
+        pulse.start()
+        try:
+            return app.exec()
+        finally:
+            pulse.stop()
+            server.stop()
+            backend.stop_all()
     from PySide6.QtWidgets import QApplication
     from PySide6.QtCore import QTimer
     app = QApplication(sys.argv[:1])
@@ -105,7 +156,8 @@ def main():
         # result.json 由 Worker 在退出时统一写（含界面手动停止的情况），这里不再重复写。
         return 1 if any(r["event"]=="error" for r in results) else 0
     from .ui import AccountManagerWindow
-    window = AccountManagerWindow(data)
+    enable_server = (not args.no_control_server) and (args.ui_proof is None)
+    window = AccountManagerWindow(data, enable_control_server=enable_server, control_port=args.control_port)
     app.main_window = window
     window.show()
     if args.start_on_open:

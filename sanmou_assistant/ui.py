@@ -21,6 +21,8 @@ from .models import (Profile, Point, TeamPolicy, PaveRoute, pave_label, pave_sum
                      team_label, STATES, ACTION_NAMES, atomic_json, data_directory)
 from .team_states import display_label
 from .locations import SharedAddress, parse_addresses, single_address
+from .target_ops import (DEFAULT_LINE_ACTIONS, DEFAULT_MERIT_ACTIONS, format_targets_brief,
+                         merge_live_target_fields, switch_primary_target)
 from .worker import Worker
 
 
@@ -248,6 +250,125 @@ class PasteLineEdit(QLineEdit):
     """
 
     pass
+
+
+class QuickTargetDialog(QDialog):
+    """运行中/待启动均可使用的一键换坐标弹窗（无需停机重启）。"""
+
+    def __init__(self, profile: Profile, *, running: bool = False, parent=None):
+        super().__init__(parent)
+        self.profile = profile
+        self.setWindowTitle("切换目标坐标（无需重启）" if running else "快捷切换目标坐标")
+        self.resize(520, 310)
+        layout = QVBoxLayout(self)
+        tip = QLabel(
+            "确认后将立即保存并热注入运行中任务，跳过连接与初始化检查，下一轮直接按新坐标出击。"
+            if running else
+            "输入或从剪贴板识别游戏分享地址（例如 涪县(300,300)），一键设为首选启用目标。"
+        )
+        tip.setWordWrap(True)
+        tip.setObjectName("notice" if running else "muted")
+        layout.addWidget(tip)
+
+        form = QFormLayout()
+        self.mode_combo = QComboBox()
+        self.mode_combo.addItem("拉线目标（反复拉线/驻守/攻城）", "line")
+        self.mode_combo.addItem("武勋目标（刷武勋战场）", "merit")
+        has_line = any(t.group == "main" and t.role == "line" for t in profile.teams)
+        has_merit = any(t.group == "main" and t.role == "merit" for t in profile.teams)
+        default_mode = "line" if has_line or not has_merit else "merit"
+        self.mode_combo.setCurrentIndex(0 if default_mode == "line" else 1)
+        form.addRow("目标类型", self.mode_combo)
+
+        addr_row = QHBoxLayout()
+        self.address_edit = PasteLineEdit()
+        self.address_edit.setPlaceholderText("粘贴或输入游戏地址，例如 涪县(300,300)")
+        addr_row.addWidget(self.address_edit, 1)
+        self.paste_button = button("从剪贴板识别", self.paste_from_clipboard)
+        addr_row.addWidget(self.paste_button)
+        form.addRow("新坐标地址", addr_row)
+
+        action_row = QHBoxLayout()
+        self._actions = self._default_actions(default_mode)
+        self.actions_button = QPushButton(actions_label(self._actions) + "  ✎")
+        self.actions_button.clicked.connect(self.edit_actions)
+        action_row.addWidget(self.actions_button, 1)
+        action_row.addWidget(button("驻守优先", lambda: self.set_actions(["guard", "attack", "march"])))
+        action_row.addWidget(button("攻城优先", lambda: self.set_actions(["attack", "occupy", "guard"])))
+        form.addRow("指令顺序", action_row)
+
+        self.replace_only = QCheckBox("设为唯一启用目标（停用其余旧目标，历史坐标保留在列表中）")
+        self.replace_only.setChecked(True)
+        form.addRow("", self.replace_only)
+        layout.addLayout(form)
+
+        self.hint_label = QLabel("")
+        self.hint_label.setObjectName("muted")
+        self.hint_label.setWordWrap(True)
+        layout.addWidget(self.hint_label)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("立即生效" if running else "保存并切换")
+        buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("取消")
+        buttons.accepted.connect(self._validate_and_accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+        self.mode_combo.currentIndexChanged.connect(self._on_mode_changed)
+
+    def _default_actions(self, mode: str) -> list[str]:
+        points = self.profile.line_targets if mode == "line" else self.profile.targets
+        enabled = sorted([p for p in points if p.enabled], key=lambda p: p.priority)
+        if enabled and enabled[0].actions:
+            return list(enabled[0].actions)
+        return list(DEFAULT_LINE_ACTIONS if mode == "line" else DEFAULT_MERIT_ACTIONS)
+
+    def _on_mode_changed(self) -> None:
+        self.set_actions(self._default_actions(self.mode_combo.currentData()))
+
+    def set_actions(self, actions: list[str]) -> None:
+        self._actions = list(actions)
+        self.actions_button.setText(actions_label(self._actions) + "  ✎")
+
+    def edit_actions(self) -> None:
+        dialog = ActionOrderDialog(self._actions, self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            chosen = dialog.actions()
+            if chosen:
+                self.set_actions(chosen)
+
+    def paste_from_clipboard(self) -> None:
+        text = (clipboard_text() or "").strip()
+        if not text:
+            self.hint_label.setText("剪贴板为空，请先复制游戏坐标或手动输入")
+            return
+        try:
+            addr = single_address(text)
+        except ValueError as exc:
+            self.hint_label.setText(f"剪贴板内容未识别：{exc}")
+            return
+        self.address_edit.setText(addr.text())
+        self.hint_label.setText(f"已识别坐标：{addr.text()}")
+
+    def _validate_and_accept(self) -> None:
+        text = self.address_edit.text().strip()
+        try:
+            single_address(text)
+        except ValueError as exc:
+            self.hint_label.setText(str(exc))
+            return
+        if not self._actions:
+            self.hint_label.setText("请至少选择一条指令")
+            return
+        self.accept()
+
+    def values(self) -> dict:
+        return {
+            "mode": str(self.mode_combo.currentData()),
+            "address": self.address_edit.text().strip(),
+            "actions": list(self._actions),
+            "keep_others": not self.replace_only.isChecked(),
+        }
 
 
 class PaveRouteDialog(QDialog):
@@ -688,6 +809,13 @@ class Window(QMainWindow):
             row.addWidget(chip)
         layout.addLayout(row)
         controls = QHBoxLayout()
+        self.quick_target_button = button("切换目标坐标", self.open_quick_target_dialog, True)
+        self.quick_target_button.setToolTip("运行中也可直接切换拉线/武勋坐标，立即唤醒下一轮，无需重启")
+        controls.addWidget(self.quick_target_button)
+        self.pause_button = button("暂停任务", self.toggle_pause)
+        self.pause_button.setEnabled(False)
+        self.pause_button.setToolTip("临时暂停派兵并保持连接与初始化状态，可随时继续")
+        controls.addWidget(self.pause_button)
         self.scan_button = button("读取全部队伍", lambda:self.start("scan"))
         self.scan_button.setToolTip("读取队伍并确认本次游戏里实际有几队；没有的槽位随后会在设置里锁住")
         controls.addWidget(self.scan_button)
@@ -699,6 +827,10 @@ class Window(QMainWindow):
         self.last_scan.setObjectName("muted")
         controls.addWidget(self.last_scan)
         layout.addLayout(controls)
+        self.targets_banner = QLabel("当前目标 · " + format_targets_brief(self.profile))
+        self.targets_banner.setObjectName("notice")
+        self.targets_banner.setWordWrap(True)
+        layout.addWidget(self.targets_banner)
         self.live = table(["显示", "队伍 / 阵容", "状态", "兵力", "体力 / 补给", "预备兵池", "下一步 / 等待原因"])
         self.live.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         header = self.live.horizontalHeader()
@@ -1245,7 +1377,7 @@ class Window(QMainWindow):
 
     def paste_recognize_merit_backup(self):
         """“粘贴识别并添加”：优先系统剪贴板；剪贴板不是单个地址时用输入框现有文字。"""
-        if not self.can_apply_addresses():
+        if not self.can_apply_addresses(live_allowed=True):
             return False
         text = (clipboard_text() or "").strip()
         if text:
@@ -1273,7 +1405,7 @@ class Window(QMainWindow):
 
     def paste_recognize_line_backup(self, editor):
         """“粘贴识别并添加”：优先系统剪贴板；剪贴板不是单个地址时用输入框现有文字。"""
-        if not self.can_apply_addresses():
+        if not self.can_apply_addresses(live_allowed=True):
             return False
         text = (clipboard_text() or "").strip()
         if text:
@@ -1417,12 +1549,13 @@ class Window(QMainWindow):
             layout = self.page("屯田与粮食", "低粮自动屯田补粮；征兵点设置已移到「目标与铺路」。不会把预计主城预备兵加进城外兵力提前撤回。")
         elif section:
             self.page_section(layout, "屯田与粮食", "备用征兵点在「目标与铺路」按模块填写；粮食低于触发值才屯田。")
-        f, inner = card("游戏隐藏显示", "开始任务前确保游戏内隐藏已开启（小眼睛带斜杠），全程保持。")
-        self.hide_before_run = QCheckBox("开始任务前打开游戏隐藏显示（小眼睛斜杠）")
+        f, inner = card("游戏隐藏显示", "开始任务前打开游戏隐藏，并自动勾选全部七项（部队模型/名字、行军线、建筑名字、战术指令、同盟计划、最低视角自动触发），全程保持。")
+        self.hide_before_run = QCheckBox("开始任务前打开游戏隐藏显示，并勾选全部选项")
         self.hide_before_run.setChecked(self.profile.hide_before_run)
         inner.addWidget(self.hide_before_run)
         self.collapsible(inner, "为什么要打开隐藏显示",
-                         "地图上没有部队模型、名字和建筑名，点坐标不会误选到别的队伍，也更快。任务结束不恢复。")
+                         "地图上没有部队模型、名字、行军线、战术指令和同盟计划，点坐标不会误选到别的队伍，"
+                         "也不会被战术指令遮挡判断。脚本会逐项核对七个复选框，未勾选的自动补勾；任务结束不恢复。")
         layout.addWidget(f)
         f, inner = card("低粮补给", "低于触发库存开始屯田，回到恢复库存才恢复出击。")
         self.food_enabled = QCheckBox("粮食不足时自动屯田补粮")
@@ -1507,17 +1640,22 @@ class Window(QMainWindow):
         return area, layout
 
     def make_targets_pave(self):
-        layout = self.page("目标与铺路", "武勋目标与拉线目标都按坐标和目标组选择；铺路路线按顺序逐段推进，到点停留后再派下一段。", scroll=False)
+        layout = self.page("目标与铺路", "武勋目标与拉线目标支持运行中热更新；铺路路线按顺序逐段推进，到点停留后再派下一段。", scroll=False)
         tabs = QTabWidget()
+        self.target_tabs = tabs
         page, inner = self.tab_layout()
+        self.merit_target_tab = page
         self.make_targets(inner, section=False)
         tabs.addTab(page, "武勋目标")
         page, inner = self.tab_layout()
+        self.line_target_tab = page
         self.make_line_targets(inner, section=False)
         tabs.addTab(page, "拉线目标")
         page, inner = self.tab_layout()
+        self.pave_tab = page
         self.make_pave(inner, section=False)
         tabs.addTab(page, "铺路路线")
+        self.targets_page_index = 2
         layout.addWidget(tabs, 1)
 
     def make_supply_daily(self):
@@ -1707,6 +1845,7 @@ class Window(QMainWindow):
         for route in self.profile.pave_routes:
             self.insert_pave_route(route)
         self.update_hidden_hint()
+        self.refresh_targets_banner()
 
     def insert_point(self,t,p):
         r = t.rowCount()
@@ -1780,7 +1919,7 @@ class Window(QMainWindow):
         return buttons
 
     def move_points(self, t, direction):
-        if not self.can_apply_addresses():
+        if not self.can_apply_addresses(live_allowed=self.is_target_like(t)):
             return
         selected = {i.row() for i in t.selectedIndexes()}
         if not selected:
@@ -1841,7 +1980,7 @@ class Window(QMainWindow):
 
     def add_from_clipboard(self, target):
         """“粘贴识别并添加”：优先系统剪贴板；剪贴板识别不出地址时用输入框现有文字。"""
-        if not self.can_apply_addresses():
+        if not self.can_apply_addresses(live_allowed=self.is_target_like(target)):
             return False
         text = (clipboard_text() or "").strip()
         if text:
@@ -1857,14 +1996,19 @@ class Window(QMainWindow):
             return False
         return self.add_shared_points(target, text)
 
-    def can_apply_addresses(self):
+    def is_live_run(self):
+        return bool(self.worker and self.worker.isRunning() and self.worker.command == "run")
+
+    def can_apply_addresses(self, live_allowed=False):
         if self.worker and self.worker.isRunning():
-            self.status.setText("请先停止当前任务，再应用地点设置")
+            if live_allowed and self.is_live_run():
+                return True
+            self.status.setText("请先停止当前任务，再应用该项设置")
             return False
         return True
 
     def add_shared_points(self, target, text=None, strict=False):
-        if not self.can_apply_addresses():
+        if not self.can_apply_addresses(live_allowed=self.is_target_like(target)):
             return False
         editor = (self.target_address if target is self.target_table else self.line_address)
         text = editor.text() if text is None else text
@@ -1943,7 +2087,7 @@ class Window(QMainWindow):
             self.status.setText(str(exc))
 
     def remove_row(self,t):
-        if not self.can_apply_addresses():
+        if not self.can_apply_addresses(live_allowed=self.is_target_like(t)):
             return
         rows = sorted({i.row() for i in t.selectedIndexes()},reverse=True)
         for r in rows:
@@ -1976,7 +2120,7 @@ class Window(QMainWindow):
             address = single_address(backup_text)
             existing = p.merit_backup
             if (existing is not None and existing.x == address.x and existing.y == address.y
-                    and (not address.name or existing.name == address.name)):
+                    and (not address.name or address.name in (existing.name, existing.expected_name))):
                 # 地址没变：保留优先级、指令等既有设置。
                 p.merit_backup = existing
             else:
@@ -1985,6 +2129,7 @@ class Window(QMainWindow):
         else:
             p.merit_backup = None
         # 拉线征兵点按队收集：编辑器里留空的队删除条目；地址没变则保留既有设置。
+        previous_line_backups = dict(p.line_backups)
         p.line_backups = {key: point for key, point in p.line_backups.items()
                           if key not in self.line_backup_edits}
         for key, editor in self.line_backup_edits.items():
@@ -1992,9 +2137,10 @@ class Window(QMainWindow):
             if not text:
                 continue
             address = single_address(text)
-            existing = p.line_backups.get(key)
+            existing = previous_line_backups.get(key)
             if (existing is not None and existing.x == address.x and existing.y == address.y
-                    and (not address.name or existing.name == address.name)):
+                    and (not address.name or address.name in (existing.name, existing.expected_name))):
+                p.line_backups[key] = existing
                 continue
             name = address.name or f"拉线征兵点 ({address.x},{address.y})"
             p.line_backups[key] = Point(name=name, x=address.x, y=address.y, expected_name=address.name, enabled=True)
@@ -2028,8 +2174,155 @@ class Window(QMainWindow):
         p.normalize()
         return p
 
+    def refresh_targets_banner(self):
+        if hasattr(self, "targets_banner"):
+            self.targets_banner.setText("当前目标 · " + format_targets_brief(self.profile))
+
+    def collect_live_targets(self):
+        """运行中仅收集目标与备用征兵点，绝不触碰已锁定的实例/队伍/铺路页签。"""
+        for target, editor in ((self.target_table, self.target_address), (self.line_table, self.line_address)):
+            if editor.text().strip():
+                self.add_shared_points(target, strict=True)
+        p = copy.deepcopy(self.profile)
+        p.backup_enabled = self.backup_enabled.isChecked()
+        backup_text = self.merit_backup_address.text().strip()
+        if backup_text:
+            address = single_address(backup_text)
+            existing = p.merit_backup
+            if (existing is not None and existing.x == address.x and existing.y == address.y
+                    and (not address.name or address.name in (existing.name, existing.expected_name))):
+                p.merit_backup = existing
+            else:
+                name = address.name or f"备用征兵点 ({address.x},{address.y})"
+                p.merit_backup = Point(name=name, x=address.x, y=address.y, expected_name=address.name, enabled=True)
+        else:
+            p.merit_backup = None
+        previous_line_backups = dict(p.line_backups)
+        p.line_backups = {key: point for key, point in p.line_backups.items()
+                          if key not in self.line_backup_edits}
+        for key, editor in self.line_backup_edits.items():
+            text = editor.text().strip()
+            if not text:
+                continue
+            address = single_address(text)
+            existing = previous_line_backups.get(key)
+            if (existing is not None and existing.x == address.x and existing.y == address.y
+                    and (not address.name or address.name in (existing.name, existing.expected_name))):
+                p.line_backups[key] = existing
+                continue
+            name = address.name or f"拉线征兵点 ({address.x},{address.y})"
+            p.line_backups[key] = Point(name=name, x=address.x, y=address.y, expected_name=address.name, enabled=True)
+        p.targets, p.line_targets = [], []
+        for table_, points in ((self.target_table, p.targets), (self.line_table, p.line_targets)):
+            for r in range(table_.rowCount()):
+                points.append(self.read_point(table_, r))
+        p.normalize()
+        return p
+
+    def sync_targets_from_profile(self, profile: Profile, *, source: str = "ui", live_applied: bool = False):
+        """将已落盘的目标与征兵点同步回 UI 控件与总览摘要，防止停机保存时覆盖外部热更新。"""
+        merged, _changed = merge_live_target_fields(self.profile, profile, active=False)
+        self.profile = merged
+        for table_, points in ((self.target_table, self.profile.targets), (self.line_table, self.profile.line_targets)):
+            table_.setRowCount(0)
+            for point in sorted(points, key=lambda item_: item_.priority):
+                self.insert_point(table_, point)
+        self.target_address.clear()
+        self.line_address.clear()
+        self.backup_enabled.setChecked(self.profile.backup_enabled)
+        self.merit_backup_address.setText(self.point_address(self.profile.merit_backup))
+        for key, editor in getattr(self, "line_backup_edits", {}).items():
+            editor.setText(self.point_address(self.profile.line_backups.get(key)))
+        self.refresh_targets_banner()
+        source_label = {"ui": "界面", "agent": "Agent", "api": "接口"}.get(source, source)
+        if live_applied:
+            self.saved_label.setText(f"目标已热更新（{source_label}）· {datetime.now():%H:%M:%S}")
+        else:
+            self.saved_label.setText(f"已保存（{source_label}）· {datetime.now():%H:%M:%S}")
+
+    def open_quick_target_dialog(self):
+        if self.worker and self.worker.isRunning() and not self.is_live_run():
+            self.status.setText("当前正在执行短期任务，请等待完成后再切换目标坐标")
+            return
+        dialog = QuickTargetDialog(self.profile, running=self.is_live_run(), parent=self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        vals = dialog.values()
+        self.apply_quick_target_switch(
+            mode=vals["mode"],
+            address=vals["address"],
+            actions=vals["actions"],
+            keep_others=vals["keep_others"],
+        )
+
+    def apply_quick_target_switch(self, *, mode: str, address: str, actions=None, keep_others: bool = False) -> bool:
+        try:
+            hub = getattr(self.manager, "hub", None) if self.manager else None
+            if hub is not None and self.account:
+                result = hub.switch_target(
+                    self.account_id,
+                    mode=mode,
+                    address=address,
+                    actions=actions,
+                    keep_others=keep_others,
+                    source="ui",
+                )
+                brief = result["targets_brief"]
+                live = bool(result.get("live_applied"))
+            else:
+                active = bool(self.is_live_run() and not self.worker.dry_run)
+                updated, _chosen = switch_primary_target(
+                    self.profile,
+                    mode=mode,
+                    address=address,
+                    actions=actions,
+                    keep_others=keep_others,
+                    active=active,
+                )
+                merged, changed = merge_live_target_fields(self.profile, updated, active=active)
+                if self.account and self.manager:
+                    self.manager.store.save_profile(self.account_id, merged)
+                else:
+                    atomic_json(self.config_path, merged.to_dict())
+                live = self.is_live_run()
+                if live:
+                    self.worker.queue_target_update(merged, changed=changed or {mode}, source="ui")
+                self.sync_targets_from_profile(merged, source="ui", live_applied=live)
+                brief = format_targets_brief(merged)
+            self.status.setText(("目标已热切换，立即唤醒下一轮 · " if live else "目标已保存 · ") + brief)
+            return True
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.warning(self, "目标未切换", str(exc))
+            return False
+
+    def apply_live_targets_from_ui(self) -> bool:
+        try:
+            candidate = self.collect_live_targets()
+            hub = getattr(self.manager, "hub", None) if self.manager else None
+            if hub is not None and self.account:
+                result = hub.apply_live_profile(self.account_id, candidate, source="ui")
+                brief = result["targets_brief"]
+            else:
+                active = bool(self.is_live_run() and not self.worker.dry_run)
+                merged, changed = merge_live_target_fields(self.profile, candidate, active=active)
+                if self.account and self.manager:
+                    self.manager.store.save_profile(self.account_id, merged)
+                else:
+                    atomic_json(self.config_path, merged.to_dict())
+                if self.is_live_run():
+                    self.worker.queue_target_update(merged, changed=changed or {"merit", "line"}, source="ui")
+                self.sync_targets_from_profile(merged, source="ui", live_applied=True)
+                brief = format_targets_brief(merged)
+            self.status.setText("目标已热应用到运行中任务 · " + brief)
+            return True
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.warning(self, "目标热应用失败", str(exc))
+            return False
+
     def save(self):
         if self.worker and self.worker.isRunning():
+            if self.is_live_run():
+                return self.apply_live_targets_from_ui()
             self.status.setText("请停止当前账号的任务后保存并应用设置")
             return False
         try:
@@ -2042,6 +2335,7 @@ class Window(QMainWindow):
             else:
                 atomic_json(self.config_path,p.to_dict())
             self.profile = p
+            self.refresh_targets_banner()
             self.saved_label.setText(f"已保存 · {datetime.now():%H:%M:%S}")
             if self.manager:
                 self.manager.update_account(self)
@@ -2049,6 +2343,71 @@ class Window(QMainWindow):
         except (OSError, ValueError) as exc:
             QMessageBox.warning(self,"设置未保存",str(exc))
             return False
+
+    def _launch_worker(self, p: Profile, command: str, *, dry_run: bool, max_orders: int = 0, duration: int = 0) -> Path:
+        folder = self.session_root / datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+        self.clear_logs()
+        self.status.setText("正在启动本次任务")
+        if max_orders or duration:
+            self.worker = Worker(p, folder, command, dry_run, max_orders, duration)
+        else:
+            self.worker = Worker(p, folder, command, dry_run)
+        self.worker.event.connect(self.handle_event)
+        self.worker.finished.connect(self.finished)
+        if self.manager:
+            self.worker.finished.connect(self.manager.worker_finished)
+            hub = getattr(self.manager, "hub", None)
+            if hub is not None and self.account:
+                hub.bind_worker(self.account_id, self.worker, command=command, dry_run=dry_run, session_dir=folder)
+        self.paused = False
+        self.start_button.setText("停止任务")
+        self.start_button.setObjectName("danger")
+        self.start_button.style().unpolish(self.start_button)
+        self.start_button.style().polish(self.start_button)
+        self.monitor_button.setEnabled(False)
+        self.profile_name.setEnabled(False)
+        live_run = command == "run"
+        self.save_button.setEnabled(live_run)
+        self.save_button.setText("热应用目标设置" if live_run else "保存设置")
+        self.pause_button.setEnabled(live_run)
+        self.pause_button.setText("暂停任务")
+        for page in range(1, max(1, self.stack.count() - 1)):
+            if live_run and page == getattr(self, "targets_page_index", -1):
+                self.stack.widget(page).setEnabled(True)
+                self.merit_target_tab.setEnabled(True)
+                self.line_target_tab.setEnabled(True)
+                self.pave_tab.setEnabled(False)
+            else:
+                self.stack.widget(page).setEnabled(False)
+        self.set_visibility_enabled(False)
+        if command in ("run", "scan"):
+            self.observations.clear()
+            self.decisions.clear()
+            self.team_activity.clear()
+            self.pave_progress.clear()
+            self.metrics["本次出征"].setText("0")
+            self.metrics["本次武勋"].setText("待读取")
+            self.last_scan.setText("正在读取本次状态")
+            self.refresh_live()
+        self.run_state.setText("● 只监控" if (command == "run" and dry_run) else "● 执行中" if command == "run" else "● 读取中" if command == "scan" else "● 处理中")
+        self.run_state.setStyleSheet("color:#248565; font-weight:600;")
+        self.worker.start()
+        if self.manager:
+            self.manager.update_account(self)
+        return folder
+
+    def start_from_controller(self, command: str, *, dry_run: bool, max_orders: int = 0, duration: int = 0) -> Path:
+        """由 RuntimeHub / Agent 控制服务触发启动；校验失败抛 ControlError，不弹出模态阻塞框。"""
+        from .controller import ControlError
+        if self.worker and self.worker.isRunning():
+            raise ControlError("当前账号的任务仍在运行，请先停止后再启动", code="already_running", http_status=409)
+        p = copy.deepcopy(self.profile)
+        errors = p.validate(active=(command == "run" and not dry_run))
+        if errors:
+            raise ControlError("；".join(errors), code="validation_error", http_status=400)
+        if self.manager and not self.manager.can_start(self, p, command):
+            raise ControlError(self.status.text() or "目标实例正被其他账号占用", code="instance_conflict", http_status=409)
+        return self._launch_worker(p, command, dry_run=dry_run, max_orders=max_orders, duration=duration)
 
     def start(self, command):
         if self.worker and self.worker.isRunning():
@@ -2067,39 +2426,30 @@ class Window(QMainWindow):
             return
         if not self.save():
             return
-        folder = self.session_root / datetime.now().strftime("%Y%m%d-%H%M%S-%f")
-        self.clear_logs()
-        self.status.setText("正在启动本次任务")
-        self.worker = Worker(p,folder,command,command not in ("run", "return", "dailies", "farming"))
-        self.worker.event.connect(self.handle_event)
-        self.worker.finished.connect(self.finished)
-        if self.manager:
-            self.worker.finished.connect(self.manager.worker_finished)
-        self.paused = False
-        self.start_button.setText("停止任务")
-        self.start_button.setObjectName("danger")
-        self.start_button.style().unpolish(self.start_button)
-        self.start_button.style().polish(self.start_button)
-        self.monitor_button.setEnabled(False)
-        self.save_button.setEnabled(False)
-        self.profile_name.setEnabled(False)
-        for page in range(1, max(1, self.stack.count() - 1)):
-            self.stack.widget(page).setEnabled(False)
-        self.set_visibility_enabled(False)
-        if command in ("run", "scan"):
-            self.observations.clear()
-            self.decisions.clear()
-            self.team_activity.clear()
-            self.pave_progress.clear()
-            self.metrics["本次出征"].setText("0")
-            self.metrics["本次武勋"].setText("待读取")
-            self.last_scan.setText("正在读取本次状态")
-            self.refresh_live()
-        self.run_state.setText("● 执行中" if command == "run" else "● 读取中" if command == "scan" else "● 处理中")
-        self.run_state.setStyleSheet("color:#248565; font-weight:600;")
-        self.worker.start()
-        if self.manager:
-            self.manager.update_account(self)
+        dry_run = command not in ("run", "return", "dailies", "farming")
+        self._launch_worker(p, command, dry_run=dry_run)
+
+    def set_paused(self, value: bool):
+        if not (self.worker and self.worker.isRunning()):
+            return
+        self.paused = bool(value)
+        self.worker.pause(self.paused)
+        self.pause_button.setText("继续任务" if self.paused else "暂停任务")
+        if self.paused:
+            self.run_state.setText("● 已暂停")
+            self.run_state.setStyleSheet("color:#c47a1b; font-weight:600;")
+            self.status.setText("任务已暂停（保持连接与初始化状态，可随时继续或换坐标）")
+        else:
+            self.run_state.setText("● 执行中" if not self.worker.dry_run else "● 只监控")
+            self.run_state.setStyleSheet("color:#248565; font-weight:600;")
+            self.status.setText("任务已恢复，立即进入下一轮")
+        hub = getattr(self.manager, "hub", None) if self.manager else None
+        if hub is not None and self.account:
+            hub.snapshot(self.account_id).mark_paused(self.paused)
+
+    def toggle_pause(self):
+        if self.worker and self.worker.isRunning():
+            self.set_paused(not self.paused)
 
     def toggle_start(self):
         if self.worker and self.worker.isRunning():
@@ -2125,15 +2475,21 @@ class Window(QMainWindow):
             self.status.setText("正在停止新动作，等待当前读数结束")
 
     def finished(self):
+        self.paused = False
         self.start_button.setText("开始执行")
         self.start_button.setObjectName("primary")
         self.start_button.style().unpolish(self.start_button)
         self.start_button.style().polish(self.start_button)
         self.monitor_button.setEnabled(True)
+        self.save_button.setText("保存设置")
         self.save_button.setEnabled(True)
+        self.pause_button.setText("暂停任务")
+        self.pause_button.setEnabled(False)
         self.profile_name.setEnabled(True)
         for page in range(1, max(1, self.stack.count() - 1)):
             self.stack.widget(page).setEnabled(True)
+        if hasattr(self, "pave_tab"):
+            self.pave_tab.setEnabled(True)
         self.set_visibility_enabled(True)
         self.run_state.setText("● 待启动")
         self.run_state.setStyleSheet("color:#79869a; font-weight:600;")
@@ -2278,6 +2634,10 @@ class Window(QMainWindow):
                              "message":f"铺路路线 {value.get('route','')}：{done}/{total} 段，"
                                        f"状态 {value.get('status','')}"})
             self.refresh_live()
+        elif kind == "profile_updated":
+            self.refresh_targets_banner()
+            brief = value.get("brief") if isinstance(value, dict) else format_targets_brief(self.profile)
+            self.status.setText(f"热更新已生效 · {brief}")
         elif kind == "error":
             # 故障跳到日志页。Worker 停止时已经发布过同一条 ERROR 日志，
             # 用最近记录去重：已有对应 ERROR 时只切页、不重复追加；
@@ -2438,16 +2798,19 @@ class Window(QMainWindow):
                 QMessageBox.warning(self,"导入失败",str(exc))
 
     def export_config(self):
-        p = self.collect()
-        errors = p.validate()
-        if errors:
-            QMessageBox.warning(self,"配置无效","\n".join(errors))
-            return
-        path,_ = QFileDialog.getSaveFileName(self,"导出账号配置",p.name+".json","配置 (*.json)")
-        if path:
-            data = p.to_dict()
-            data["cli_path"] = ""
-            atomic_json(Path(path),data)
+        try:
+            p = self.collect()
+            errors = p.validate()
+            if errors:
+                QMessageBox.warning(self,"配置无效","\n".join(errors))
+                return
+            path,_ = QFileDialog.getSaveFileName(self,"导出账号配置",p.name+".json","配置 (*.json)")
+            if path:
+                data = p.to_dict()
+                data["cli_path"] = ""
+                atomic_json(Path(path),data)
+        except (ValueError,OSError) as exc:
+            QMessageBox.warning(self,"导出失败",str(exc))
 
     def new_config(self):
         if self.manager:
@@ -2566,14 +2929,19 @@ class AddAccountDialog(QDialog):
 
 
 class AccountManagerWindow(QMainWindow):
-    def __init__(self, data_dir: Path | None = None):
+    def __init__(self, data_dir: Path | None = None, *, enable_control_server: bool | None = None,
+                 control_port: int = 0):
         super().__init__()
         from .accounts import AccountStore
+        from .control_server import ControlServer
+        from .controller import GuiHubBackend, RuntimeHub
 
         self.data_dir = data_dir or data_directory()
         self.store = AccountStore(self.data_dir)
         self.closing = False
         self.windows = []
+        self.control_server = None
+        self.hub = RuntimeHub(GuiHubBackend(self), mode="gui", parent=self)
         self.setWindowTitle(f"三谋助手  {__version__}")
         available = self.screen().availableGeometry() if self.screen() else None
         avail_w = available.width() if available else 1440
@@ -2614,6 +2982,18 @@ class AccountManagerWindow(QMainWindow):
         storage_warnings = ([self.store.migration_error] if self.store.migration_error else []) + self.store.load_errors
         if storage_warnings:
             self.current_window.status.setText("；".join(storage_warnings))
+        should_serve = (os.environ.get("QT_QPA_PLATFORM") != "offscreen") if enable_control_server is None else bool(enable_control_server)
+        if should_serve:
+            try:
+                self.control_server = ControlServer(self.hub, self.data_dir, port=control_port, mode="gui")
+                self.control_server.start()
+            except OSError as exc:
+                self.control_server = None
+                self.current_window.append_log({
+                    "time": datetime.now().strftime("%H:%M:%S"),
+                    "level": "WARN",
+                    "message": f"本地 Agent 控制服务未启动（不影响桌面使用）：{exc}",
+                })
 
     @property
     def current_window(self):
@@ -2716,6 +3096,9 @@ class AccountManagerWindow(QMainWindow):
             self.account_hint.setText(f"正在安全停止 {len(running)} 个账号任务，结束后自动关闭")
             event.ignore()
             return
+        if self.control_server is not None:
+            self.control_server.stop()
+            self.control_server = None
         for window in self.windows:
             window.live_timer.stop()
         event.accept()

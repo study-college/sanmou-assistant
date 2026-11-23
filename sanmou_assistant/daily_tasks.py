@@ -112,10 +112,19 @@ def signin(game, commit=True):
             cards = game.v.signin_cards(image)
             card = cards.get(before.get('day'))
             scrolled_pending = True
-        if count == before.get('count', -2) + 1 and card and card_claimed(game,image,card):
+        if count >= before.get('count', -2) + 1 and card and card_claimed(game,image,card):
             game.j.finish_daily('signin_day', cycle, {'count_after':count, 'card':'已领取'})
         elif cycle == started_cycle:
-            raise GameError('签到上次提交待核对；只读取，不重复领取')
+            # 2026-11-21 林：签到是免费幂等操作，「待核对」不得锁死全天。
+            if count == before.get('count'):
+                # 提交未生效（累计天数没动）：撤销待核对，按现场重新领取。
+                game.j.reject_daily('signin_day', cycle, {'result':'提交未生效，重新领取'})
+            else:
+                # 生效但绿勾读不出：允许幂等重试，当日最多 3 次仍不明则今日跳过。
+                retries = before.get('retries', 0)
+                if retries >= 3:
+                    raise GameError('签到多次提交仍未确认，今日跳过，明日自动重试')
+                game.j.reject_daily('signin_day', cycle, {'result':'核对失败，允许幂等重试','retries':retries+1})
     day_confirmed = game.j.daily('signin_day',started_cycle)[0] == 'done'
     if scrolled_pending and not day_confirmed:
         game.d.swipe(1490,300,1490,735,420)
@@ -182,7 +191,14 @@ def signin(game, commit=True):
             game.j.record_daily(task,'done')
             continue
         if game.j.pending_daily(task):
-            raise GameError(f'{threshold}天进度奖励待核对，不重复点击')
+            # 2026-11-21：里程碑同为免费幂等领取，待核对允许重试（最多 3 次），不锁死。
+            pending_cycles = game.j.pending_daily(task)
+            ctx = game.j.daily_context(task, pending_cycles[0][0]) or {}
+            retries = ctx.get('retries', 0)
+            if retries >= 3:
+                raise GameError(f'{threshold}天进度奖励多次未确认，今日跳过')
+            for (pcycle,) in pending_cycles:
+                game.j.reject_daily(task, pcycle, {'result':'核对失败，允许幂等重试','retries':retries+1})
         cycle = game.j.prepare_daily(task,{'threshold':threshold,'count':count})
         game.d.tap(label.x,label.y-80,.8)
         after = game.capture(f'signin-milestone-{threshold}',True)

@@ -37,7 +37,7 @@ def test_unconfirmed_keeps_the_configured_order_and_tries_the_next_action(tmp_pa
     point = Point(name="山道", x=636, y=286, actions=["attack", "guard", "occupy", "march"])
     seen, observations = [], []
 
-    def fake(policy, obs, target, kind, reuse_target=False):
+    def fake(policy, obs, target, kind):
         seen.append(list(target.actions)[0])
         observations.append(obs.marker_state)
         # 队伍还停在原地：这条没成，允许换下一条
@@ -58,7 +58,7 @@ def test_unconfirmed_stops_immediately_when_the_team_is_already_busy(tmp_path):
     point = Point(name="山道", x=636, y=286, actions=["attack", "guard", "occupy", "march"])
     seen = []
 
-    def fake(policy, obs, target, kind, reuse_target=False):
+    def fake(policy, obs, target, kind):
         seen.append(list(target.actions)[0])
         raise DispatchUnconfirmed("出征未确认受理", action=target.actions[0], busy=True,
                                   marker="fighting", confidence=0.93, page="deployment", status="fighting")
@@ -75,7 +75,7 @@ def test_unconfirmed_refreshes_the_marker_before_the_next_action(tmp_path):
     point = Point(name="山道", x=636, y=286, actions=["attack", "guard"])
     seen = []
 
-    def fake(policy, obs, target, kind, reuse_target=False):
+    def fake(policy, obs, target, kind):
         seen.append((target.actions[0], obs.marker_state, round(obs.marker_confidence or 0, 2)))
         raise DispatchUnconfirmed("未确认", action=target.actions[0], busy=False,
                                   marker="transfer_stay", confidence=0.88, page="sandbox", status="")

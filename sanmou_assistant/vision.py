@@ -178,7 +178,6 @@ class Vision:
                     continue
                 best = {"x": x0+x+w/2, "y": 920+y+h/2, "score": round(score,4), "task": task}
         return best
-        self.checkpoint()
 
     def read(self, image: np.ndarray, rect: tuple = (0, 0, 1920, 1080), minimum: float = .62, scale: float = 1) -> list[Text]:
         self.checkpoint()
@@ -578,13 +577,10 @@ class Vision:
         return result
 
     def selected_sandbox(self, image) -> bool:
-        """地块菜单和完整沙盘底栏同时在场时，确认“沙盘里选中了地块”。
+        """核对“沙盘里选中了地块”的组合证据（寻访徽章 + 地块动作菜单 + 底栏）。
 
-        这种页面不是未知页：菜单把右侧导航/资源栏遮住一部分，页型会一直落到
-        unknown，沙盘恢复就会被反复重试拖慢（2026-11-15 实机约 21 秒降到约 1.7 秒）。
-
-        只作兜底用（其他页型全部识别失败后才采纳）：渠道浮球面板、城内建筑抽屉
-        同样有底栏和动作图标，提前吞成 sandbox 会漏掉它们自己的关闭/处理流程。
+        `_page()` 已通过底栏与寻访徽章直接识别沙盘；此方法保留为独立核对辅助入口，
+        用于校验选中地块帧是否同时具备沙盘底栏与动作菜单证据。
         """
         if not self.sandbox_badge(image):
             return False
@@ -718,10 +714,6 @@ class Vision:
             return "dismissible_overlay"
         if self.navigation_back_point(image) is not None:
             return "navigable_page"
-        # 兜底：底栏 + 地块菜单同时在场就是“沙盘里选中了地块”，不再当未知页反复重试。
-        # 放在最后一步，渠道面板/城内建筑抽屉等有自己证据的页型不会被吞成 sandbox。
-        if self.selected_sandbox(image):
-            return "sandbox"
         return "unknown"
 
     def navigation_back_point(self, image, require_title=True):
@@ -1263,6 +1255,35 @@ class Vision:
             return None, scores
         return ("hidden" if best == "hidden" else "open"), scores
 
+    def hide_panel_visible(self, image) -> bool:
+        """“隐藏”设置面板是否已展开。
+
+        2026-11-19 用户截图：面板固定出现在右上角小眼睛下方，含“隐藏部队模型/
+        隐藏部队名字/隐藏行军线/隐藏建筑名字/隐藏战术指令/隐藏同盟计划/
+        最低视角时自动触发设置”七项。用最靠下的一行做锚点，避免和地图上的
+        “隐藏”字样混淆。
+        """
+        return self.find(image, ["隐藏同盟计划"], (1260, 170, 1780, 920), exact=False) is not None
+
+    @staticmethod
+    def hide_option_checked(image, x, y) -> bool | None:
+        """隐藏设置面板里单个选项是否勾选。
+
+        面板复选框比普通弹窗大（约 64×64 区域），绿色对勾跨在中间，不能用
+        38×38 的 `checked()`：实测勾选时绿色像素约 400，取消后约 0。
+        读不清返回 None，调用方不得据此切换。
+        """
+        roi = image[max(0, y - 32):y + 32, max(0, x - 32):x + 32]
+        if roi.shape[:2] != (64, 64):
+            return None
+        hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+        green = cv2.countNonZero(cv2.inRange(hsv, (35, 65, 90), (95, 255, 255)))
+        if green >= 150:
+            return True
+        if green <= 60 and float(np.mean(roi)) > 20:
+            return False
+        return None
+
     def stationary_return_visible(self, image, slot):
         return self.stationary_return_point(image, slot) is not None
 
@@ -1299,30 +1320,49 @@ class Vision:
     def full_team_rows(self, image):
         # 2026-11-08 新赛季左侧列表整体上移：部队一在 y≈149，五队在 y≈601。
         # 旧赛季在 y≈221..674；取 90..810 的并集，兼容两种布局。
+        # 2026-11-22 林复核：染色归一化实机伤图（金底没涂掉、其他队文字和画像被误伤），撤除。
+        # 不改动原始像素，只做同行碎片合并——出错帧原图即可正确读出「部队四」。
+        spans = list(self.read(image, (0, 90, 430, 810), minimum=.75))
+        # 2026-11-21 实机：选中行（浅金底）会把「部队四」拆成「部队」+「四」两个
+        # 同 y 碎片，逐 span 精确匹配导致选中队被当成不存在（每轮 TeamAbsent 自锁）。
+        # 按 y 聚类合并同行碎片再匹配；武卫标签与队名行距约 28px，阈值 15 不会混入。
+        spans.sort(key=lambda t: (t.y, t.x))
+        lines = []
+        for span in spans:
+            if lines and abs(span.y - lines[-1][0].y) <= 15:
+                lines[-1].append(span)
+            else:
+                lines.append([span])
         rows = {}
-        for text in self.read(image, (0, 90, 430, 810), minimum=.75):
-            match = re.fullmatch(r"部队([一二三四五])", text.text.replace(" ", ""))
+        for line in lines:
+            text = "".join(t.text for t in sorted(line, key=lambda t: t.x)).replace(" ", "")
+            match = re.fullmatch(r"部队([一二三四五])", text)
             if match:
                 slot = "一二三四五".index(match[1]) + 1
                 if slot in rows:
                     return {}
-                rows[slot] = text
+                first = line[0]
+                rows[slot] = Text(text, min(t.score for t in line), first.x,
+                                  sum(t.y for t in line) / len(line), first.box)
         return rows
 
     def home_team_visible(self, image, slot):
         if not 1 <= slot <= 5:
             return False
-        y = (245,383,520,660,785)[slot-1]
-        roi = image[y-40:y+53,1700:1790]
-        if roi.shape[:2] != (93,90):
-            return False
-        gold = cv2.inRange(cv2.cvtColor(roi,cv2.COLOR_BGR2HSV),(10,35,110),(43,255,255))
-        return float(cv2.matchTemplate(gold,self.home_marker,cv2.TM_CCOEFF_NORMED).max()) >= .92
+        y = SLOT_Y[slot - 1]
+        best = 0.0
+        for dx in HUD_OFFSETS:
+            roi = image[y-40:y+53, 1700+dx:1790+dx]
+            if roi.shape[:2] != (93,90):
+                continue
+            gold = cv2.inRange(cv2.cvtColor(roi,cv2.COLOR_BGR2HSV),(10,35,110),(43,255,255))
+            best = max(best, float(cv2.matchTemplate(gold,self.home_marker,cv2.TM_CCOEFF_NORMED).max()))
+        return best >= .92
 
     def returning_team_visible(self, image, slot):
         if not 1 <= slot <= 5:
             return False
-        y = (245,383,520,660,785)[slot-1]
+        y = SLOT_Y[slot - 1]
         best = 0.0
         for dx in HUD_OFFSETS:
             roi = image[y:y+56, 1840+dx:1905+dx]

@@ -83,7 +83,7 @@ class FakeRecoveryGame:
     def ensure_sandbox(self):
         pass
 
-    def dispatch(self, policy, obs, point, kind, reuse_target=False):
+    def dispatch(self, policy, obs, point, kind):
         self.dispatched.append((kind, point))
 
 

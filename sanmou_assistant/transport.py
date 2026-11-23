@@ -44,10 +44,11 @@ class Control:
             if self.stop.wait(.1):
                 raise Stopped()
 
-    def sleep(self, seconds: float):
+    def sleep(self, seconds: float, passive: bool = False):
         end = time.monotonic() + seconds
+        check = self.passive_checkpoint if passive else self.checkpoint
         while time.monotonic() < end:
-            self.checkpoint()
+            check()
             self.stop.wait(min(.1, max(0, end - time.monotonic())))
 
 
@@ -279,7 +280,7 @@ class Device:
             last_error = None
             for attempt in range(3):
                 if attempt:
-                    self.control.sleep(1.0)
+                    self.control.sleep(1.0, passive=passive)
                 try:
                     run([self.adb, "disconnect", self.serial], timeout=5, control=self.control)
                     run([self.adb, "connect", self.serial], timeout=10, control=self.control)

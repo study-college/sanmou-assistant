@@ -658,14 +658,15 @@ def _legacy_line_point(text: str) -> Optional[dict]:
 
 
 def line_target(profile: "Profile", policy: TeamPolicy) -> Optional[Point]:
-    """拉线目标：按顺序第一个启用的拉线目标点（与武勋目标同一套口径，不再有目标组）。
-
-    用户 2026-11-13：拉线目标就是坐标点，和武勋目标一样放在「目标与铺路」里，
-    名称只作备注，定位只认坐标；不再单独造一套只认 "x,y" 的格式。
-    2026-11-15：目标组取消，启用点全表按优先级取第一个。
-    """
-    candidates = sorted([p for p in profile.line_targets if p.enabled], key=lambda p: p.priority)
+    """拉线首选目标：按顺序第一个启用的拉线目标点。多目标退让用 line_target_candidates。"""
+    candidates = line_target_candidates(profile, policy)
     return candidates[0] if candidates else None
+
+
+def line_target_candidates(profile: "Profile", policy: TeamPolicy) -> list:
+    """拉线目标全表（按优先级）。2026-11-21 林：当前目标不可派时按顺序试下一个，
+    不再只取第一个原地空转（雨中血雨 1 队民港不可用时空转 70 分钟的教训）。"""
+    return sorted([p for p in profile.line_targets if p.enabled], key=lambda p: p.priority)
 
 
 def line_backup_point(profile: "Profile", policy: TeamPolicy) -> Optional[Point]:

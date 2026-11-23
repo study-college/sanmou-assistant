@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sanmou-assistant"
-version = "0.11.4"
+version = "0.12.0"
 description = "三谋桌面助手：MuMu 连接、部队监控与可配置调度"
 readme = "README.md"
 license = "MIT"
@@ -25,7 +25,7 @@ sanmou-assistant = "sanmou_assistant.__main__:main"
 include = ["sanmou_assistant*"]
 
 [tool.setuptools.package-data]
-sanmou_assistant = ["assets/*.png", "assets/team-markers/*.png", "assets/team-markers/*.json", "assets/hide-toggle/*.png", "assets/action-icons/*.png"]
+sanmou_assistant = ["assets/*.png", "assets/app.ico", "assets/team-markers/*.png", "assets/team-markers/*.json", "assets/hide-toggle/*.png", "assets/action-icons/*.png"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

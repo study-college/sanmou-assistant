@@ -87,7 +87,7 @@ class FakeLineGame:
     def ensure_sandbox(self):
         self.sandboxed += 1
 
-    def dispatch(self, policy, obs, point, kind, reuse_target=False):
+    def dispatch(self, policy, obs, point, kind):
         self.dispatched.append((kind, point))
         if self.fail_dispatch:
             raise GameError("测试停止：不真正派兵")
@@ -515,7 +515,7 @@ def test_dispatch_does_not_submit_when_card_already_retreat_or_wounded(tmp_path)
         obs = Observation("main:1", marker_state="stationary", state="outside", wounded=False)
         point = Point(name="拉线目标 (800,800)", x=800, y=800, actions=["occupy", "march"])
         with pytest.raises(DispatchUnconfirmed) as raised:
-            game._dispatch(policy, obs, point, "line", reuse_target=True)
+            game._dispatch(policy, obs, point, "line")
         assert raised.value.busy is True
         # 只点了地块指令和队伍卡，没有按“出征”。
         assert game.d.taps and all(tap[:2] != Game.SUBMIT_POINT for tap in game.d.taps)

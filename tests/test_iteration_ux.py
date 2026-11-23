@@ -293,7 +293,7 @@ class MarkerBatchGame:
         self.worker.publish("observation", obs.__dict__)
         return obs
 
-    def dispatch(self, policy, obs, point, kind, reuse_target=False):
+    def dispatch(self, policy, obs, point, kind):
         ident = self.worker.journal.prepare(policy.key, kind, point.name)
         self.worker.journal.finish(ident, "accepted")
         self.dispatched.append(policy.key)

@@ -1,4 +1,4 @@
-# 三谋助手 0.11.2：给 AI Agent 的操作与维护说明
+# 三谋助手 0.12.0：给 AI Agent 的操作与维护说明
 
 本说明适用于收到的分发包。以解压目录为项目根目录，不依赖作者电脑的磁盘、用户名、账号或模拟器编号。
 
@@ -61,9 +61,61 @@ CLI 校验结果通过 `calibrated` 事件输出，**不会自动保存到配置
 ```
 
 `--duration` 在监控循环轮首检查；启动、单轮读取和正在进行的有界操作可能使总耗时长于指定值。
-停止通过 UI“停止任务”或关闭窗口请求；等待“已停止”或进程退出后再接管。
+停止通过 UI“停止任务”、`ctl stop` 或关闭窗口请求；等待“已停止”或进程退出后再接管。
 `--command return --execute`、`dailies --execute`、`farming --execute` 都有真实游戏影响，必须在用户授权范围内使用。
 不带 `--execute` 的 `run` 只监控。不要使用直接 ADB 输入绕过产品 Worker、账号验证或实例互斥。
+
+## 运行时控制与热换坐标（面向 Agent）
+
+三谋助手支持**运行中免重启热换坐标**（拉线目标、武勋目标、备用征兵点）与实时控制接口，统一服务两种挂机模式：
+
+1. **人机同屏协同（推荐）**：用户正常打开桌面 GUI，桌面窗口会自动启动仅限本机环回（`127.0.0.1`）的控制服务并写入 `data/control-server.json`（含每次启动生成的随机 Bearer Token）。Agent 通过 `ctl` 命令即可实时查看状态、热切坐标、暂停/恢复，GUI 表格与总览会同步刷新，无需杀进程或重走连接/主城/部队/隐藏初始化检查。
+2. **无头后台托管**：不开桌面窗口时，可启动常驻控制服务：
+   ```powershell
+   & $exe --data-dir $data --command serve
+   ```
+   随后通过同一套 `ctl` 命令启停多账号、监控状态和热切换坐标。
+
+### `ctl` 常用命令（全部输出单段 JSON，退出码 0 成功 / 1 失败）
+
+```powershell
+# 1. 列出账号与运行态（服务离线时自动只读回退）
+& $exe ctl --data-dir $data accounts
+
+# 2. 查看实时状态（连接、粮食、武勋、各队角标/兵力/决策、当前目标）
+& $exe ctl --data-dir $data status --account-id <账号ID>
+
+# 3. 查看当前武勋/拉线目标与备用征兵点
+& $exe ctl --data-dir $data targets --account-id <账号ID>
+
+# 4. 运行中热切换拉线目标（默认停用旧目标、新目标置顶启用并立即唤醒下一轮）
+& $exe ctl --data-dir $data switch-target --account-id <账号ID> `
+    --mode line --address "前线焦点(300,300)" --actions guard,attack,march
+
+# 5. 运行中热切换武勋目标（--keep-others 可保留其他目标的启用状态）
+& $exe ctl --data-dir $data switch-target --account-id <账号ID> `
+    --mode merit --address "涪县(320,310)" --actions attack,occupy,guard --keep-others
+
+# 6. 热更新备用征兵点（拉线支持 --team main:1 或 --team all；--clear 可清空）
+& $exe ctl --data-dir $data set-backup --account-id <账号ID> --mode line --team all --address "前线营帐(310,305)"
+& $exe ctl --data-dir $data set-backup --account-id <账号ID> --mode merit --address "备用营帐(330,320)" --enable
+
+# 7. 运行控制：启动 / 暂停 / 恢复 / 立即唤醒 / 刷新画面 / 停止 / 查看近期日志
+& $exe ctl --data-dir $data start --account-id <账号ID> --command run --execute
+& $exe ctl --data-dir $data pause --account-id <账号ID>
+& $exe ctl --data-dir $data resume --account-id <账号ID>
+& $exe ctl --data-dir $data wake --account-id <账号ID>
+& $exe ctl --data-dir $data refresh --account-id <账号ID>
+& $exe ctl --data-dir $data logs --account-id <账号ID> --limit 50
+& $exe ctl --data-dir $data stop --account-id <账号ID>
+```
+
+### 热更新与安全约束
+
+- **离线降级**：当 GUI 与 `serve` 均未运行时，`accounts`、`targets`、`switch-target`、`set-backup` 会自动以校验模式读写 `profile.json` 并返回 `"live_applied": false, "source": "offline"`；不需要手改 JSON 文件。
+- **白名单边界**：运行中仅允许热更新武勋目标、拉线目标与备用征兵点；实例编号、包名、账号主城、队伍任务角色与铺路路线仍须停机修改。
+- **不撤军、不丢订单**：换坐标后立即唤醒等待中的巡检循环，空闲/可派队伍马上按新坐标出击，已在旧坐标行军或驻守的队伍自然结束后再转；SQLite 待核对订单保持原状按现场结清。
+- **本机令牌隐私**：`data/control-server.json` 含本机随机访问令牌，仅限本机进程使用，不进入诊断导出包，也不要写入日志或分享给第三方。
 
 ## 产品约束
 

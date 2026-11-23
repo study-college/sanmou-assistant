@@ -10,6 +10,7 @@ from datetime import datetime
 from pathlib import Path
 
 import cv2
+import numpy as np
 
 from .journal import Journal, cycle_key
 from .evidence import EvidenceStore, EvidenceLimitError
@@ -107,6 +108,21 @@ class DispatchUnconfirmed(GameError):
         self.status = status          # 提交后读到的卡状态（出征页）
 
 
+class TargetNotSelectable(GameError):
+    """坐标导航后，屏幕中心选不中要求的格子（常见于目标被建筑/部队模型盖住）。
+
+    2026-11-19 实机：拉线目标 空地(740,683) 被太虚民港(741,683) 的建筑模型盖住，
+    点中心永远选中港口；旧代码只在日志里写“坐标不符”，下一轮又从头再来，
+    形成每 3 分钟一次的无限重试。这里用独立异常让上层做有界重试/结束该队，
+    而不是把“目标不可选中”当成一次普通可重试错误。
+    """
+
+    def __init__(self, message, requested=None, selected=None):
+        super().__init__(message)
+        self.requested = requested
+        self.selected = selected
+
+
 class TeamAbsent(GameError):
     """本赛季该主队槽位尚未拥有；不读取、不派兵，也不是故障。"""
 
@@ -137,6 +153,9 @@ class Game:
     food_gate = True
     # 本次运行是否进过城内/征兵所：游戏会在进出主城后自动关掉隐藏，回沙盘要重核。
     city_visited = False
+    # 地图现场（详见 __init__）：类上也给默认值，__new__ 构造的旧测试/工具不会缺字段。
+    view_point = None
+    view_epoch = 0
     # 只读库存刷新间隔。每次刷新要截图 + 页面识别 + 读数，和派兵抢同一个 OCR 线程；
     # 5 秒一次时等待期间几乎一直在识别，反而拖慢真正的游戏操作。
     RESOURCE_INTERVAL = 10
@@ -152,6 +171,15 @@ class Game:
     SUBMIT_POINT = (1717, 984)
     # 配置动作 -> 菜单图标文件名。
     ICON_FOR_ACTION = {"attack": "siege", "occupy": "occupy", "guard": "guard", "march": "march"}
+    # 右上角小眼睛与“隐藏”设置面板。面板七项固定，勾选后才能避免战术指令/同盟计划
+    # 盖住地图（用户 2026-11-19 截图确认）。最后一项是两行文字，复选框比文字中心低。
+    HIDE_EYE = (1583, 142)
+    HIDE_OPTIONS = (
+        "隐藏部队模型", "隐藏部队名字", "隐藏行军线", "隐藏建筑名字",
+        "隐藏战术指令", "隐藏同盟计划", "最低视角时自动触发设置",
+    )
+    HIDE_OPTION_LAST_Y = 818
+    HIDE_OPTION_X = 1350
 
     def __init__(self, device: Device, vision: Vision, profile: Profile, journal: Journal, folder: Path, emit):
         self.d, self.v, self.p, self.j = device, vision, profile, journal
@@ -171,6 +199,13 @@ class Game:
         self.resource_observed_at = None
         self.network_attempts = []
         self.navigation_attempts = []
+        # 地图现场：镜头此刻居中、并且已经核对通过的地块坐标；None＝不知道镜头在哪。
+        # 规则（2026-11-18 实机根因）：镜头是共享可变状态，读队点头像、缩放、拖图、
+        # 出城都会改它。所以只有“刚把镜头放过去并核对过”才能着手里的结论，
+        # 任何移动镜头的动作都必须 drop_view()。宁可多走一次坐标导航，
+        # 也不能拿旧结论往屏幕正中点——点错会打开整屏弹层，退不出来。
+        self.view_point = None
+        self.view_epoch = 0
         # 本赛季实际拥有的主队槽位；None 表示尚未检测，不能据此过滤配置。
         self.active_slots = None
         # 是否有实际刷武勋队；Worker 每轮写入，讨贼决定据此忽略粮食门槛。
@@ -426,6 +461,8 @@ class Game:
         self.d.tap(*info["confirm_point"], 1.2)
 
     def clear_map_selection(self, image=None, expected_page="sandbox"):
+        # 往返拖动会平移镜头：现场结论立即作废。
+        self.drop_view()
         image = self.ensure_sandbox(refresh_grain=False) if image is None else image
         if self.v.page(image) != expected_page or expected_page not in ("sandbox", "city"):
             raise GameError("未确认游戏地图，不拖动地图")
@@ -442,6 +479,8 @@ class Game:
         （地图往返拖动）后建筑详情关闭、页面恢复 sandbox；特效文字本身还在，不影响读队。
         只在重判为沙盘时返回 True，其他情况返回 False，由调用方继续等待。
         """
+        # 地图往返拖动会平移镜头：现场结论立即作废。
+        self.drop_view()
         self.d.swipe(1580, 575, 1480, 575, 250)
         self.d.control.sleep(.25)
         image = self.capture()
@@ -474,11 +513,92 @@ class Game:
             image = self.capture()
         return image
 
-    def ensure_hide_on(self):
-        """任务开始前打开游戏的“隐藏”显示（右下角小眼睛）。
+    def capture_stable(self, tries=4):
+        """稳定帧：连续两帧关键内容一致才采纳，过渡/动画帧在采集层丢弃。
 
-        眼睛=元素可见，带斜杠=隐藏已开启。隐藏开着地图更干净，点坐标不会误选部队。
-        认不出状态时不动，避免误切换。
+        2026-11-21：页面切换动画中的瞬时帧曾是「部队页未打开」等误判的来源。
+        在输入端等画面静止，而不是让下游去容错坏帧。
+        """
+        prev = self.capture()
+        for _ in range(max(1, tries) - 1):
+            self.d.control.sleep(.35)
+            image = self.capture()
+            a = cv2.resize(prev, (160, 90)).astype(np.int16)
+            b = cv2.resize(image, (160, 90)).astype(np.int16)
+            if float(np.abs(a - b).mean()) < 2.0:
+                return image
+            prev = image
+        return prev
+
+
+    def _hide_option_rows(self, image):
+        """识别隐藏面板七行的复选框中心；面板没开或行读不全返回 None。"""
+        if not self.v.hide_panel_visible(image):
+            return None
+        rows = []
+        for label in self.HIDE_OPTIONS[:-1]:
+            found = self.v.find(image, [label], (1260, 170, 1780, 790), exact=False)
+            if found is None:
+                return None
+            rows.append((label, (self.HIDE_OPTION_X, round(found.y))))
+        # 最后一项是两行文字，复选框中心固定低于文字中心；先确认这一段仍是
+        # “最低视角/触发设置”，避免游戏新增选项后把固定坐标点到别的项上。
+        tail = self.v.joined(image, (1360, 770, 1700, 880)).replace(" ", "")
+        if "视角" not in tail and "触发" not in tail:
+            return None
+        rows.append((self.HIDE_OPTIONS[-1], (self.HIDE_OPTION_X, self.HIDE_OPTION_LAST_Y)))
+        return rows
+
+    def _ensure_hide_options(self, image):
+        """把隐藏面板七项全部勾上；只对明确未勾选的项点击，读不清不动。
+
+        返回 (image, checked, total)；total=0 表示面板/行未读全，未做任何切换。
+        """
+        rows = self._hide_option_rows(image)
+        if not rows:
+            self.log("隐藏设置面板未打开或选项行未读全，本轮不切换选项", "WARN")
+            return image, 0, 0
+        checked = 0
+        for label, (x, y) in rows:
+            state = self.v.hide_option_checked(image, x, y)
+            if state is None:
+                self.log(f"隐藏选项「{label}」勾选状态未读清，保持原样", "WARN")
+                continue
+            if not state:
+                self.d.tap(x, y, .35)
+                self.d.control.sleep(.25)
+                image = self.capture()
+                state = self.v.hide_option_checked(image, x, y)
+                if state is True:
+                    self.log(f"隐藏选项「{label}」已勾选", "INFO")
+                else:
+                    self.log(f"隐藏选项「{label}」点击后仍未确认勾选", "WARN")
+            if state is True:
+                checked += 1
+        if checked == len(rows):
+            self.log(f"隐藏选项已全部勾选（{checked}/{len(rows)}），战术指令/同盟计划不再遮挡地图", "INFO")
+        else:
+            self.log(f"隐藏选项核对 {checked}/{len(rows)}；未读清或未确认的项保持原样", "WARN")
+        return image, checked, len(rows)
+
+    def _restore_hide_on(self):
+        """配置中断时尽力把隐藏重新打开，避免把地图留在全显示状态。"""
+        try:
+            image = self.capture()
+            state, _ = self.v.hide_mode(image)
+            if state == "open":
+                self.d.tap(*self.HIDE_EYE, .6)
+                self.d.control.sleep(.8)
+        except Exception:
+            pass
+
+    def ensure_hide_on(self):
+        """任务开始前打开游戏的“隐藏”显示，并勾选全部七项。
+
+        2026-11-19 用户要求：以后隐藏时把“隐藏部队模型/名字、行军线、建筑名字、
+        战术指令、同盟计划、最低视角自动触发”全部勾上，避免战术指令和同盟计划
+        影响判断。实机流程：小眼睛开着时先点一下关掉隐藏，再长按小眼睛展开面板；
+        逐项核对勾选后左右拖动收起面板，隐藏会自动重新打开。
         """
         try:
             image = self.capture()
@@ -488,19 +608,52 @@ class Game:
                 self.d.control.sleep(.5)
                 image = self.capture()
                 state, _scores = self.v.hide_mode(image)
-            if state != "open":
-                return state
-            self.log("游戏隐藏显示未开启（小眼睛可见），任务开始前先打开", "INFO")
-            self.d.tap(1583, 142, .6)
-            self.d.control.sleep(.8)
-            self.save_image(self.capture(), "hide-panel", True)
+            if state is None:
+                return None
+            # 面板只能在隐藏关闭（小眼睛可见）时长按打开；隐藏开着时先关掉。
+            if state == "hidden":
+                self.d.tap(*self.HIDE_EYE, .6)
+                self.d.control.sleep(.8)
+                image = self.capture()
+                state, _scores = self.v.hide_mode(image)
+                if state != "open":
+                    self.log("为配置隐藏选项而关闭隐藏时未确认小眼睛状态，本轮不切换", "WARN")
+                    self._restore_hide_on()
+                    return state
+            self.log("配置游戏隐藏显示：长按小眼睛展开全部选项", "INFO")
+            self.d.long_press(*self.HIDE_EYE, seconds=1.5)
+            self.d.control.sleep(.6)
+            image = self.capture()
+            self.save_image(image, "hide-panel", True)
+            checked = total = 0
+            if self.v.hide_panel_visible(image):
+                image, checked, total = self._ensure_hide_options(image)
+            else:
+                self.log("隐藏设置面板未打开，跳过选项勾选", "WARN")
+            # 收起面板：实测左右拖动会关闭面板并自动把隐藏打开。
             self.d.swipe(900, 620, 980, 620, 300)
             self.d.control.sleep(.8)
             after = self.capture()
             self.save_image(after, "hide-on-after", True)
             state_after, _ = self.v.hide_mode(after)
+            if self.v.hide_panel_visible(after):
+                # 面板还开着：点小眼睛收起并打开隐藏。
+                self.d.tap(*self.HIDE_EYE, .6)
+                self.d.control.sleep(.8)
+                after = self.capture()
+                state_after, _ = self.v.hide_mode(after)
+            if state_after == "open":
+                self.d.tap(*self.HIDE_EYE, .6)
+                self.d.control.sleep(.8)
+                after = self.capture()
+                state_after, _ = self.v.hide_mode(after)
             if state_after == "hidden":
-                self.log("游戏隐藏显示已开启，继续任务", "INFO")
+                if total and checked == total:
+                    self.log("游戏隐藏显示已开启（全部选项已核对），继续任务", "INFO")
+                elif total:
+                    self.log(f"游戏隐藏显示已开启；隐藏选项核对 {checked}/{total}，未读清项保持原样", "WARN")
+                else:
+                    self.log("游戏隐藏显示已开启；选项面板未核对", "WARN")
             else:
                 self.log(f"打开隐藏后状态为 {state_after}，本轮继续执行", "WARN")
             return state_after
@@ -510,7 +663,8 @@ class Game:
         except GameError:
             raise
         except Exception as exc:
-            self.log(f"关闭游戏隐藏显示失败：{exc}；本轮继续", "WARN")
+            self.log(f"打开游戏隐藏显示失败：{exc}；尝试恢复隐藏", "WARN")
+            self._restore_hide_on()
             return None
 
     def ensure_sandbox(self, refresh_grain=True, recover_navigation=False):
@@ -625,9 +779,11 @@ class Game:
                     self.save_image(image, "city-exit-unconfirmed", True)
                     raise RecognitionUnavailable("出城按钮暂未读清，等待重读")
                 # 旧点位靠近渠道浮球，可能打开福利菜单；只点已读到的出城文字。
+                self.drop_view()
                 self.d.tap(exit_button.x, exit_button.y, 2.5)
             elif page == "city_buildings":
                 # 已核对建筑选择抽屉；拖动其上方地图收起，不点旧建筑坐标。
+                self.drop_view()
                 self.d.swipe(1500, 570, 1380, 570, 250)
                 self.wait_transition(self.capture(), expected=("city",))
             else:
@@ -669,6 +825,7 @@ class Game:
         用户 2026-11-13：双指缩放在实机不稳；连点也可能不生效，长按 1~2 秒就能一路
         缩到最小（地图沙盘）或放到最大，位置固定，只按识别到的按钮。
         """
+        self.drop_view()
         zoom = getattr(self.v, "map_zoom_point", None)
         if zoom is None:
             return False
@@ -684,6 +841,7 @@ class Game:
 
         每次长按后都重新读页型，到了就停；不到就再长按一次，最多 3 次。
         """
+        self.drop_view()
         zoom = getattr(self.v, "map_zoom_point", None)
         for _ in range(attempts):
             image = self.capture()
@@ -704,6 +862,7 @@ class Game:
 
     def zoom_in_to_sandbox(self, attempts: int = 3) -> bool:
         """从“地图沙盘”长按放大按钮回到沙盘；认不出按钮或没到就返回 False。"""
+        self.drop_view()
         zoom = getattr(self.v, "map_zoom_point", None)
         if zoom is None:
             return False
@@ -754,6 +913,8 @@ class Game:
         三队能否读取。这里只做一件事：点本槽位头像，直到进入部队页/总览。
         进入后由部队列表行和选中槽位核对身份；点错队不会变成读错队。
         """
+        # 点头像会把镜头拉到该队，现场结论作废。
+        self.drop_view()
         y = (245, 383, 520, 660, 785)[slot - 1]
         image = self.ensure_sandbox(refresh_grain=False)
         for attempt in range(3):
@@ -843,6 +1004,8 @@ class Game:
     def locate_team(self, slot):
         # 不再先证明“第 1 页”：头像列表只有一页时页码为什么读不到，与队伍读取无关。
         # 定位只负责把镜头带到目标队；读到的数据随后由部队列表行/选中槽位核对。
+        # 镜头被移动后，“镜头还在某个目标上”的结论一律作废（2026-11-18 实机根因）。
+        self.drop_view()
         image = self.ensure_sandbox(refresh_grain=False)
         if self.active_slots is not None and slot not in self.active_slots:
             raise TeamAbsent(f"主城 {slot} 队不在本次部队列表中（当前 {sorted(self.active_slots)} 队）")
@@ -901,6 +1064,8 @@ class Game:
         return bool(self.home_matches_account(image))
 
     def calibrate_home(self):
+        # 回城与点主城中心都会移动镜头：现场结论作废。
+        self.drop_view()
         image = self.ensure_sandbox()
         # 新赛季“回城”可能直接进入城内；先回沙盘，再点主城中心读取坐标和归属。
         self.d.tap(90, 1000, 1.0)
@@ -1308,26 +1473,40 @@ class Game:
                 state = "active"
         return state
 
+    @staticmethod
+    def full_row_position(page, rows, slot):
+        """目标行的点击位置：OCR 实测位置优先；缺行按已识别行的等距几何插值；
+        整页 OCR 失效才用页型几何。紧凑列表下第 N 行永远是第 N 队或空白，
+        插值/几何点击不会点到别队——是否存在由点击后的金底校验回答。"""
+        if slot in rows:
+            return rows[slot].x, rows[slot].y
+        if rows:
+            slots = sorted(rows)
+            nearest = min(slots, key=lambda s: abs(s - slot))
+            gaps = [rows[b].y - rows[a].y for a, b in zip(slots, slots[1:])]
+            gap = sorted(gaps)[len(gaps) // 2] if gaps else (108 if page == "overview" else 113)
+            return rows[nearest].x, rows[nearest].y + gap * (slot - nearest)
+        fallback = (329, 437, 545, 653, 761) if page == "overview" else (222, 335, 448, 561, 674)
+        fallback_x = 264 if page == "overview" else 126
+        return fallback_x, fallback[slot-1]
+
     def select_full_team_slot(self, image, slot):
+        # 2026-11-21 重构：单帧 OCR 缺行不再有「队伍不存在」的判定权。
+        # 缺行按等距几何补位点击，是否真不存在由「连续 3 次点击后仍无选中金底」
+        # 这一确定性证据回答（紧凑列表下该位置是空白），不再单帧误判停摆。
         for attempt in range(3):
             page = self.v.page(image)
             if page not in ("team", "overview"):
                 break
-            fallback = (329, 437, 545, 653, 761) if page == "overview" else (149, 262, 375, 488, 601)
-            fallback_x = 264 if page == "overview" else 126
             rows = self.v.full_team_rows(image)
-            if rows and slot not in rows:
-                raise TeamAbsent(f"当前部队页没有第 {slot} 队（已识别 {sorted(rows)} 队）")
-            row = rows.get(slot)
-            x, y = (row.x, row.y) if row else (fallback_x, fallback[slot-1])
+            x, y = self.full_row_position(page, rows, slot)
             self.d.tap(x, y, .5)
-            image = self.capture()
+            image = self.capture_stable()
             if self.v.page(image) in ("team", "overview"):
-                current = self.v.full_team_rows(image).get(slot)
-                if self.selected_full_slot(image, slot, current.y if current else y):
+                if self.selected_full_slot(image, slot, y):
                     return image
         self.save_image(image, f"main_{slot}-slot-unconfirmed", True)
-        raise GameError("部队槽位选中状态不匹配，停止读取/派兵")
+        raise TeamAbsent(f"第 {slot} 队位置连续 3 次点击仍未选中（按尚未拥有处理）")
 
     @staticmethod
     def selected_full_slot(image, slot, row_y=None):
@@ -1413,6 +1592,45 @@ class Game:
             raise RecognitionUnavailable("个人信息页武勋数值未识别")
         return value, text
 
+    def note_view(self, point):
+        """记下“镜头此刻放在这个坐标上，并且已经核对通过”。
+
+        只允许在两种情况下调用：坐标导航（前往）落地并核对之后，或重新选中目标
+        且坐标核对通过之后。别处不得凭“我记得”写入。
+        """
+        self.view_point = (point.x, point.y)
+        self.view_epoch += 1
+
+    def drop_view(self):
+        """镜头或选中状态可能已经变了：作废现场结论。
+
+        所有会移动镜头/改变比例的动作（点头像定位队伍、长按缩放、地图往返拖动、
+        出城、未知页取消选中）都必须调用。宁可多走一次坐标导航，也不能拿旧结论
+        往屏幕正中点——点错会打开整屏弹层，退不出来。
+        """
+        if self.view_point is not None:
+            self.view_point = None
+        self.view_epoch += 1
+
+    def view_on(self, point) -> bool:
+        """镜头是否确实停在这个坐标上（只有 note_view 之后才为真）。"""
+        return self.view_point is not None and self.view_point == (point.x, point.y)
+
+    def tap_target_center(self, label):
+        """点屏幕正中，选中“镜头中心”的那一格，并读回这一帧。
+
+        这是全游戏唯一能拿到目标动作菜单的办法：前往只移动镜头，必须再选中地块
+        才会弹出 行军/攻占/调动。注意它只负责“选中并读”，不负责保证镜头在哪；
+        调用方要么刚用坐标导航把镜头放过去，要么已经用 view_on 核对过。
+        """
+        self.d.tap(960, 539, .5)
+        image = self.capture(f"target-{label}", True)
+        if self.v.map_coordinates(image) is None and self.v.page(image) == "sandbox":
+            # 目标中心有移动部队时可能先选中队伍；只试下方地块，仍必须核对原坐标。
+            self.d.tap(960, 583, .4)
+            image = self.capture(f"target-ground-{label}", True)
+        return image
+
     def go_to(self, point: Point):
         """定位到地图坐标，以“实际到达的地块坐标”作为唯一放行条件。
 
@@ -1421,6 +1639,8 @@ class Game:
         更稳，也不依赖输入框主题/字体/亮度。输入没生效或坐标不符时有界重输
         一次，仍不对就停，绝不盲点攻占。
         """
+        # 从这里开始镜头会被缩放、拖动、前往反复移动；旧的“镜头在哪”一律作废。
+        self.drop_view()
         last = ""
         for attempt in range(2):
             image = self.ensure_sandbox()
@@ -1455,27 +1675,28 @@ class Game:
                     self.save_image(check, "coordinate-not-taken", True)
                     continue
                 raise
-            self.d.tap(960, 539, .5)
-            image = self.capture(f"target-{point.x}-{point.y}", True)
-            if self.v.map_coordinates(image) is None and self.v.page(image) == "sandbox":
-                # 目标中心有移动部队时可能选中部队；只试下方地块，仍必须核对原坐标。
-                self.d.tap(960,583,.4)
-                image = self.capture(f"target-ground-{point.x}-{point.y}",True)
+            image = self.tap_target_center(f"{point.x}-{point.y}")
             coord = self.v.map_coordinates(image)
             if coord != (point.x, point.y):
                 last = f"目标坐标 {coord}，要求 {(point.x, point.y)}"
                 self.save_image(image, "coordinate-target-mismatch", True)
                 if attempt == 0:
                     continue
-                raise GameError(f"坐标定位两次仍未到达目标：{last}，不提交命令")
+                raise TargetNotSelectable(
+                    f"坐标定位两次仍未到达目标：{last}，不提交命令",
+                    requested=(point.x, point.y), selected=coord)
             self.verify_target(image, point)
+            self.note_view(point)
             return image
-        raise GameError(f"坐标定位失败：{last or '未到达目标'}，不提交命令")
+        raise TargetNotSelectable(f"坐标定位失败：{last or '未到达目标'}，不提交命令",
+                                  requested=(point.x, point.y))
 
     def verify_target(self, image, point):
         coord = self.v.map_coordinates(image)
         if coord != (point.x, point.y):
-            raise GameError(f"目标详情坐标不同：{coord}，不提交命令")
+            raise TargetNotSelectable(
+                f"目标详情坐标不同：{coord}，不提交命令",
+                requested=(point.x, point.y), selected=coord)
         if point.expected_name:
             text = self.v.joined(image, (700, 238, 1180, 414))
             if point.expected_name not in text:
@@ -1488,51 +1709,72 @@ class Game:
                     raise GameError(f"目标名称不符，预期 {point.expected_name}，实际 {text}")
 
     def reopen_target(self, point):
-        # 上一队刚在同一目标提交；锁定视角时可直接重读目标，归属和允许动作仍按现场核对。
+        """重新选中目标地块并返回已核对的目标详情帧（派兵入口）。
+
+        2026-11-18 实机根因：这里以前无条件点屏幕正中，理由是“上一队刚在同一目标
+        提交，镜头还锁在目标上”。但派兵前必然先读队，而读队点头像会把镜头拉到本队；
+        于是这一点经常落在本队/自己的城池上——轻则点出城池菜单，重则点开
+        「请选择撤退的地点」这类整屏弹层，页面识别不了就再也退不出去。
+
+        现在这条快路必须先证明“镜头确实还在这个坐标上”（view_on），证明不了就老老实实
+        用坐标导航（go_to）。快路自己也不猜：点完立刻读坐标核对，对不上就作废现场、
+        重新导航，绝不拿一次没核对上的点击继续往下提交。
+        """
+        if not self.view_on(point):
+            return self.go_to(point)
         self.ensure_sandbox()
-        self.d.tap(960, 539, .5)
-        image = self.capture(f"target-refresh-{point.x}-{point.y}", True)
+        if not self.view_on(point):
+            # 回沙盘过程中如果动过镜头（出城、拖动、缩放），现场同样作废。
+            return self.go_to(point)
+        image = self.tap_target_center(f"refresh-{point.x}-{point.y}")
         if self.v.map_coordinates(image) != (point.x, point.y):
+            self.save_image(image, "target-refresh-mismatch", True)
+            self.drop_view()
             return self.go_to(point)
         self.verify_target(image, point)
+        self.note_view(point)
         return image
 
-    def dispatch(self, policy: TeamPolicy, obs: Observation, point: Point, kind: str, reuse_target=False):
+    def dispatch(self, policy: TeamPolicy, obs: Observation, point: Point, kind: str):
         # 战场是固定坐标，建筑/归属/标题会变。兼容旧配置中遗留的 expected_name，
         # 仅武勋流程不以名称拦截；主城和备用调动继续严格核验身份。
         if kind == "merit":
             point = replace(point, expected_name="")
         # 用户 2026-11-03：永远按配置的指令顺序走，脚本不按“队伍站在哪”裁剪指令。
         remaining = list(point.actions)
-        while True:
-            try:
-                return self._dispatch(policy, obs, replace(point, actions=remaining), kind, reuse_target)
-            except ActionUnavailable as exc:
-                # 结果未知、标题不符等普通 GameError 不允许在同目标继续点击。
-                if kind == "transfer" or self.j.pending(policy.key) or exc.action not in remaining:
-                    raise
-                remaining = remaining[remaining.index(exc.action)+1:]
-                if not remaining:
-                    raise
-                self.log(f"{point.name}：{exc}；核对同目标的后续允许指令", "WARN")
-                reuse_target = True
-            except DispatchUnconfirmed as exc:
-                # 没受理＝这一条在这里没成。只有“确认队伍还停在原地（可派）”才换下一条，
-                # 并且用提交后读到的真实角标刷新观测，避免拿旧状态做受理对比。
-                if (kind != "merit" or exc.busy or self.j.pending(policy.key)
-                        or exc.action not in remaining):
-                    raise
-                remaining = remaining[remaining.index(exc.action)+1:]
-                if not remaining:
-                    raise
-                if exc.marker and exc.marker != "unknown":
-                    obs = replace(obs, marker_state=exc.marker,
-                                  marker_label=state_label(exc.marker),
-                                  marker_confidence=exc.confidence if exc.confidence is not None else obs.marker_confidence,
-                                  marker_at=time.time(),
-                                  state=LEGACY_STATE.get(exc.marker, obs.state))
-                self.log(f"{point.name}：{exc}；队伍仍在原地，按配置顺序改试下一条", "WARN")
-                reuse_target = True
+        try:
+            while True:
+                try:
+                    return self._dispatch(policy, obs, replace(point, actions=remaining), kind)
+                except ActionUnavailable as exc:
+                    # 结果未知、标题不符等普通 GameError 不允许在同目标继续点击。
+                    if kind == "transfer" or self.j.pending(policy.key) or exc.action not in remaining:
+                        raise
+                    remaining = remaining[remaining.index(exc.action)+1:]
+                    if not remaining:
+                        raise
+                    self.log(f"{point.name}：{exc}；核对同目标的后续允许指令", "WARN")
+                except DispatchUnconfirmed as exc:
+                    # 没受理＝这一条在这里没成。只有“确认队伍还停在原地（可派）”才换下一条，
+                    # 并且用提交后读到的真实角标刷新观测，避免拿旧状态做受理对比。
+                    if (kind != "merit" or exc.busy or self.j.pending(policy.key)
+                            or exc.action not in remaining):
+                        raise
+                    remaining = remaining[remaining.index(exc.action)+1:]
+                    if not remaining:
+                        raise
+                    if exc.marker and exc.marker != "unknown":
+                        obs = replace(obs, marker_state=exc.marker,
+                                      marker_label=state_label(exc.marker),
+                                      marker_confidence=exc.confidence if exc.confidence is not None else obs.marker_confidence,
+                                      marker_at=time.time(),
+                                      state=LEGACY_STATE.get(exc.marker, obs.state))
+                    self.log(f"{point.name}：{exc}；队伍仍在原地，按配置顺序改试下一条", "WARN")
+        except BaseException:
+            # 派兵失败或异常后，屏幕上可能已经不是目标详情（弹层、错误页、断连）。
+            # 现场结论一律作废：下一次派兵必须重新确认镜头，宁可多走一次坐标导航。
+            self.drop_view()
+            raise
 
     def pick_action(self, image, point, kind):
         """按配置顺序挑当前可用的指令：图标模板优先，全不中退回文字识别。"""
@@ -1623,13 +1865,15 @@ class Game:
             return ""
         return self.BLOCKED_CARD_STATES.get(status, "")
 
-    def _dispatch(self, policy: TeamPolicy, obs: Observation, point: Point, kind: str, reuse_target=False):
+    def _dispatch(self, policy: TeamPolicy, obs: Observation, point: Point, kind: str):
         if self.j.pending(policy.key):
             raise GameError("该队上一笔命令还在核对中，稍后自动重试")
         if not self.account_checked and not self.verify_account():
             raise GameError("本次运行尚未核对账号，禁止派兵")
         self.emit("status", f"{policy.display} · 正在定位 {point_label(point)}")
-        image = self.reopen_target(point) if reuse_target else self.go_to(point)
+        # 目标选中只有一条路：reopen_target 内部决定“镜头还在目标上就轻读，否则坐标导航”。
+        # 调用方不再用布尔值替它猜镜头在哪（2026-11-18 实机根因）。
+        image = self.reopen_target(point)
         chosen_action, action_key, tap_point = self.pick_action(image, point, kind)
         self.d.tap(tap_point[0], tap_point[1], .45)
         image = self.capture_clear("dispatch-preflight", True)
@@ -2257,16 +2501,17 @@ class Game:
             # 某个集结刚满员等已知未消耗失败时，不锁定队伍，继续尝试其他可加入集结。
             attempted = set()
             last_rejection = None
-            while True:
+            fresh = []
+            for _ in range(10):
                 image = self.open_bandit_list()
                 fresh = self.v.bandit_rallies(image)
-                rally = next((r for r in fresh if r["text"] not in attempted and r.get("join")), None)
+                rally = next(
+                    (r for r in fresh if r["text"].split("集结中")[0] not in attempted and r.get("join")),
+                    None,
+                )
                 if rally is None:
-                    self.ensure_sandbox()
-                    if last_rejection is not None:
-                        self.emit("daily", {"task":"bandits","result":f"{policy.display}：{last_rejection}；本轮无其他可加入集结"})
-                    return any(r.get("join") for r in fresh)
-                attempted.add(rally["text"])
+                    break
+                attempted.add(rally["text"].split("集结中")[0])
                 try:
                     self.join_bandits(policy,obs,rally, allow_assist=allow_assist)
                 except RallyJoinRejected as exc:
@@ -2275,6 +2520,10 @@ class Game:
                     continue
                 self.ensure_sandbox()
                 return True
+            self.ensure_sandbox()
+            if last_rejection is not None:
+                self.emit("daily", {"task":"bandits","result":f"{policy.display}：{last_rejection}；本轮无其他可加入集结"})
+            return any(r.get("join") for r in fresh)
         return True
 
     def join_bandits(self,policy,obs,rally, *, allow_assist=False):
@@ -2673,9 +2922,20 @@ class Game:
         self.d.tap(label.x, label.y, .5)
         image = self.capture("event-signin", True)
         button = self.v.find(image, ["免费领取", "签到领取", "立即签到"], (345, 180, 1865, 1030), exact=True)
-        if button and commit:
-            if self.j.daily("events")[0] == "pending":
+        pending = self.j.daily("events")[0] == "pending"
+        if pending:
+            if button is None:
+                body = self.v.joined(image, (345, 180, 1865, 1030))
+                if any(token in body for token in ("已领取", "已签到")):
+                    self.j.finish_daily("events", cycle_key("events"), {"check": "已领取"})
+                    result = "上次活动签到已确认领取"
+                else:
+                    result = "上次活动领取结果待核对，当前无领取按钮"
+            elif commit:
                 raise GameError("本周期活动领取结果未确认")
+            else:
+                result = "试运行：本周期活动领取结果待核对"
+        elif button and commit:
             cycle = self.j.prepare_daily("events", {"button":button.text,"activity":label.text})
             self.d.tap(button.x, button.y, .6)
             after = self.capture("event-result", True)

@@ -162,7 +162,7 @@ def test_dispatch_refill_check_uses_the_real_card_center(tmp_path):
                       wounded=False, strength=10000, maximum=28200)
     point = Point(name="拉线目标 (800,800)", x=800, y=800, actions=["occupy", "march"])
     with pytest.raises(LineRefillUnavailable):
-        game._dispatch(policy, obs, point, "line", reuse_target=False)
+        game._dispatch(policy, obs, point, "line")
     assert calls == [517], "拉线补兵核对必须按真实卡中心读数"
 
 
@@ -193,7 +193,7 @@ class FinishGame:
         self.dispatched = []
         self.logs = []
 
-    def dispatch(self, policy, obs, point, kind, reuse_target=False):
+    def dispatch(self, policy, obs, point, kind):
         self.dispatched.append((policy.key, kind, point.name))
 
     def log(self, message, level="INFO"):
