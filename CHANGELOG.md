@@ -1,5 +1,14 @@
 # 更新记录
 
+## 0.12.1 — 2026-11-24
+
+正式公开发行（[v0.12.1](https://github.com/study-college/sanmou-assistant/releases/tag/v0.12.1)）：拉线与巡检效率提速、出征补兵稳健性修复与镜头快路护栏。详见 [RELEASE-0.12.1](docs/RELEASE-0.12.1.md)。
+
+- **ADB 原始帧截屏与 MuMu 就绪兼容**（[transport.py](sanmou_assistant/transport.py)）：默认改用 Android 原始 RGBA8888 帧（免 PNG 压缩，不兼容设备自动回退 PNG），单次截屏提速约 3.5 倍；MuMu 实例就绪判定新增兼容 `player_state="start_finished"` 且 `adb_port` 已就绪。
+- **高频页型识别提速与形近字容错**（[vision.py](sanmou_assistant/vision.py)）：寻访徽章在位直接判 `city`/`sandbox`，并前置 `deployment`/`worldmap`/`overview`/`team` 一级页判定，省掉高频页面上的全宽强敌预警 OCR 扫描；出征页与城外状态兼容「证兵」→ `recruiting`。
+- **拉线选队重截、补兵达标放行与镜头快路护栏**（[game.py](sanmou_assistant/game.py)）：选队后立即重截，避免拿默认满兵队旧图误判「一键补兵」/路线阻挡/自动征兵；一键补兵先判兵力达标再放行，不再因顺手抽干区块配额归零误撤主城；`view_on` 增加 45 秒 `VIEW_TTL` 与主城禁入保护，`reopen_target` 误触非沙盘自动安全退回沙盘再回落 `go_to`；`zoom_out_to_map` 复用已有沙盘帧。
+- **减少无效飞镜头与重复读队**（[worker.py](sanmou_assistant/worker.py)）：拉线等待态无缓存不飞镜头；新增 `line_max_strength` 保留满兵上限，城外可派且开启补兵时直奔目标出征页复用镜头快路；拉线接入 `team_reading_batch`，回主城已完整读队不再读第 2 遍；铺路进行中按整帧右侧角标原地等待；轮间等待前清空镜头快路。
+
 ## 0.12.0 — 2026-11-23
 
 正式公开发行（[v0.12.0](https://github.com/study-college/sanmou-assistant/releases/tag/v0.12.0)）：新增**运行中热换坐标**与**双端（人 / AI Agent）控制接口**，并汇总自 0.11.5 以来的全部持续运行与稳定性修复。详见 [RELEASE-0.12.0](docs/RELEASE-0.12.0.md)。

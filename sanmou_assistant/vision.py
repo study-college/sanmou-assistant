@@ -597,10 +597,6 @@ class Vision:
             return prompt
         if self.bandit_assist_prompt(image) is not None:
             return "bandit_assist_confirm"
-        # 出征提交后的模态弹窗（强敌预警 / 二次确认）：全屏拦截，必须先于底层页型判断，
-        # 否则会被当成 unknown，脚本按“未知页暂停”一直等不到受理证据。
-        if self.enemy_warning(image) is not None:
-            return "enemy_warning"
         if self.confirm_dialog(image) is not None:
             return "dispatch_confirm"
         # 体力和补给提示都盖在结果页上，先识别模态再看底层页面。
@@ -613,11 +609,18 @@ class Vision:
             return "chat"
         if self.channel_menu_panel(image) is not None:
             return "channel_menu"
-        # 左侧竖排艺术字无法稳定 OCR；使用右侧两处横排栏目与批复按钮共同核对。
-        if self.war_summary_button(image):
-            return "war_summary"
-        # 出征页有选队提示、提交按钮和卡片状态三重独立证据，先命中就不必再为
-        # 其他页型识别标题和建筑列表；模态、断线、聊天与渠道仍在前面优先判断。
+        # 2026-11-23 性能优化：右下角寻访徽章清晰在位（0 ms 模板匹配）时，画面不会是
+        # 带全屏暗罩的强敌预警（全宽 OCR 耗时 ~1s）、战事批复、出征页或二级页面；
+        # 上方已完成断线/维护/二次确认/聊天/渠道菜单硬核对，这里直接区分内城与沙盘，
+        # 未命中再落回完整页型链，兼顾提速与零漏判。
+        if self.sandbox_badge(image):
+            if self.find(image, ["出城"], (15, 1000, 180, 1075), exact=True):
+                return "city"
+            bottom = self.joined(image, (700, 930, 1915, 1075))
+            if sandbox_hud(bottom, True):
+                return "sandbox"
+        # 出征页有选队提示、黄色提交按钮和卡片状态三重独立证据（强敌预警等全屏暗罩弹窗下
+        # deploy_button_enabled 为 False）；提前命中可省去全宽 enemy_warning 的 ~1s OCR。
         if self.deploy_button_enabled(image):
             selection = self.find(image, ["请选择出征部队", "选择部队自动铺路"], (475, 675, 1265, 760))
             rested_selection = self.find(image, ["休整状态"], (475, 675, 1265, 760)) and self.find(image, ["调动", "攻城", "攻占", "驻守", "行军"], (750, 20, 1190, 125), exact=True)
@@ -625,9 +628,21 @@ class Vision:
                 if self.find(image, ["出征", "出证"], (1540, 932, 1895, 1036), exact=True):
                     if any(self.deployment_status(image, slot) != "unknown" for slot in range(1, 6)):
                         return "deployment"
-        # 顶部左右两条固定标题区：直接合成一张图一次识别（中间垫黑行防跨缝粘连），
-        # 避免宽带整读把标题与资源栏粘成大框，也比两条分开识别省一次调用。
+        # 顶部左右两条固定标题区（~200 ms）：明确的一级全屏页（地图沙盘/部队总览/部队）不会与
+        # 强敌预警并存，提前返回可省掉高频导航与读队页上的 ~1s 全宽 enemy_warning 扫描。
         header = " | ".join(t.text for t in self._page_headers(image))
+        if "地图沙盘" in header or "地图染色" in header:
+            return "worldmap"
+        if "部队总览" in header:
+            return "overview"
+        if "部队" in header and ("阵" in header or "交换" in self.joined(image, (310, 95, 410, 270))):
+            return "team"
+        # 出征提交后的模态弹窗（强敌预警）：全屏拦截，先于其余底层页型判断。
+        if self.enemy_warning(image) is not None:
+            return "enemy_warning"
+        # 左侧竖排艺术字无法稳定 OCR；使用右侧两处横排栏目与批复按钮共同核对。
+        if self.war_summary_button(image):
+            return "war_summary"
         if "征兵" in header or "证兵" in header:
             settings = self.joined(image, (1230, 220, 1800, 290)).replace(" ", "")
             if "部队征兵设置" in settings or "部队证兵设置" in settings:
@@ -1597,7 +1612,8 @@ class Vision:
         # 铺路/攻占过程中卡片会显示占领倒计时；队伍参战时会显示“战斗”。
         for label, state in (("撤退", "retreat"), ("集结", "outside"), ("战斗", "fighting"),
                              ("占领", "occupying"), ("返回", "returning"),
-                             ("征兵", "recruiting"), ("驻守", "guarding"), ("行军", "marching"),
+                             ("征兵", "recruiting"), ("证兵", "recruiting"),
+                             ("驻守", "guarding"), ("行军", "marching"),
                              ("调动", "outside"), ("停留", "outside"), ("空闲", "home")):
             if label in value:
                 return state

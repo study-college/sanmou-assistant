@@ -111,6 +111,8 @@ class Worker(QThread):
         self.pave_strength = {}
         # 拉线队的兵力缓存（完整读数，含读取时间；之后快照复用，必要时刷新）。
         self.line_snapshot = {}
+        # 已知的拉线队满兵上限：不随派兵/调动清兵力缓存而丢失，避免城外可派队为了找回上限而飞镜头。
+        self.line_max_strength = {}
         # 拉线目标连续点不中的计数：key -> {count, target, at}；目标变化自动重新计数。
         self.line_failures = {}
         # 上一轮整帧角标状态：用于识别“刚回主城”并强制完整读一次兵力。
@@ -746,6 +748,11 @@ class Worker(QThread):
                     self.completed.emit()
 
     def wait_for_next_check(self, game):
+        # 2026-11-23 防误触护栏：进入轮间等待前清空镜头快路，避免等待期间用户手动
+        # 拖图或视角漂移后下一轮盲点屏幕中心。
+        drop_view = getattr(game, "drop_view", None)
+        if callable(drop_view):
+            drop_view()
         end = time.monotonic() + self.profile.poll_seconds
         while time.monotonic() < end:
             self.control.checkpoint()
@@ -1337,6 +1344,15 @@ class Worker(QThread):
         if not routes:
             return
         game.reserved_teams = self.pave_team_keys()
+        # 2026-11-23：铺路进行中先一帧原地读右侧角标（~0.23s）；明确在行军/战斗/占领/撤退/重伤时
+        # 原地等待，不再每 15 秒飞镜头点头像，也不把其他拉线/武勋队的镜头拉跑。
+        hud = {}
+        reader = getattr(game, "read_all_marker_states", None)
+        if callable(reader):
+            try:
+                hud = reader() or {}
+            except GameError:
+                hud = {}
         for route in routes:
             self.control.checkpoint()
             policy = next((t for t in self.profile.teams if t.key == route.team), None)
@@ -1375,8 +1391,24 @@ class Worker(QThread):
                 continue
             self.journal.set_phase(policy.key, "pave")
             if obs is None:
-                obs = self.observe_pave_team(
-                    game, policy, full=progress["status"] not in ("running", "recovering"))
+                marker_hit = hud.get(policy.slot) if progress["status"] in ("running", "recovering") else None
+                mstate = marker_hit.get("state") if marker_hit else None
+                if mstate in ("march", "transfer", "siege_transfer", "fighting",
+                              "queued_battle", "busy", "retreat", "wounded"):
+                    obs = Observation(
+                        policy.key,
+                        state=LEGACY_STATE.get(mstate, "unknown"),
+                        wounded=True if mstate == "wounded" else None,
+                        note="铺路整帧快照",
+                        marker_state=mstate,
+                        marker_label=marker_hit.get("label", ""),
+                        marker_confidence=marker_hit.get("confidence"),
+                        marker_at=time.time(),
+                    )
+                    self.publish("observation", obs.__dict__)
+                else:
+                    obs = self.observe_pave_team(
+                        game, policy, full=progress["status"] not in ("running", "recovering"))
             if obs is None:
                 continue
             if obs.state == "wounded" or obs.wounded is True:
@@ -1680,10 +1712,20 @@ class Worker(QThread):
                 hud = reader() or {}
             except GameError as exc:
                 game.log(f"拉线整帧角标读取失败：{exc}；退回逐队读取", "WARN")
+        batch = getattr(game, "team_reading_batch", None)
+        if callable(batch):
+            with batch(policies):
+                self._process_line_policies(game, policies, hud)
+        else:
+            self._process_line_policies(game, policies, hud)
+
+    def _process_line_policies(self, game, policies, hud):
         for policy in policies:
             self.control.checkpoint()
             if policy.group != "main" or not self.team_present(policy.key):
                 continue
+            obs = None
+            did_full_read = False
             pending = self.journal.pending(policy.key)
             if pending:
                 # 有未结清订单先按真实现场结清（observe_team 是通用结清入口）；
@@ -1724,10 +1766,12 @@ class Worker(QThread):
                 self.line_finished.discard(policy.key)
                 self.line_finished_reasons.pop(policy.key, None)
                 self.line_home_seen.discard(policy.key)
-                self.line_snapshot.pop(policy.key, None)
+                self.line_snapshot[policy.key] = (recheck.strength, recheck.maximum, time.time())
+                self.line_max_strength[policy.key] = recheck.maximum
                 game.log(f"{policy.display} 兵力已恢复 {recheck.strength}/{recheck.maximum}，重新启动拉线", "INFO")
                 # 落到正常流程：用复核读数更新现场，城外满编会判回城，到家后下一轮自动再拉。
                 obs = recheck
+                did_full_read = True
             target = line_target(self.profile, policy)
             if target is None:
                 self.log_once(f"line-target:{policy.key}",
@@ -1744,34 +1788,48 @@ class Worker(QThread):
                 except GameError as exc:
                     game.log(f"拉线前账号核对失败：{exc}", "WARN")
                     continue
-            obs = None
             has_backup = self.line_backup_point(policy) is not None
             marker = hud.get(policy.slot)
+            marker_state = marker.get("state") if marker else None
             prior_marker = self.line_last_marker.get(policy.key)
-            if marker and marker.get("state") not in (None, "unknown"):
-                self.line_last_marker[policy.key] = marker["state"]
+            if marker_state not in (None, "unknown"):
+                self.line_last_marker[policy.key] = marker_state
             cached = self.line_snapshot.get(policy.key)
+            known_max = cached[1] if cached else self.line_max_strength.get(policy.key)
+            # 2026-11-23 系统优化：
+            # 1) 明确处于等待态（调动/行军/撤退/重伤/战斗/驻守/委托）时无需兵力数值，
+            #    即使刚派完兵清了缓存也直接用整帧角标等待，彻底省掉 40s/次的无意义飞镜头。
+            wait_only = (marker_state not in (None, "unknown", "busy")
+                         and not can_dispatch(marker_state))
+            # 2) 城外可派（调动停留/停留）且启用一键补兵、已知满兵上限（或绝对下限）时，
+            #    直接进出征页由卡片读真实兵力并补兵/出征，不先飞镜头读队破坏目标视角，
+            #    使同轮多队自动走 reopen_target 快路（~1.4s）。
+            outside_ready = (marker_state in ("transfer_stay", "siege_transfer_stay", "stationary")
+                             and policy.refill_enabled
+                             and (known_max is not None or policy.min_mode == "absolute"))
             # 缓存太久、而这一刻的决策要看兵力（忙/可派）时完整读一次；其他状态不值当导航。
             stale = bool(cached) and time.time() - cached[2] > self.LINE_STRENGTH_TTL
-            need_strength = bool(marker) and (marker["state"] == "busy" or can_dispatch(marker["state"]))
+            need_strength = bool(marker) and (marker_state == "busy" or can_dispatch(marker_state))
             # 有补兵点时，刚进入“忙碌”要完整读一次：确认是在主城（先转补兵点）还是建筑里。
             # 但忙碌可能持续很久（占领/自然征兵），不能每 15 秒都导航读队；
             # 只在进入忙碌的那一轮、或缓存过期后再读一次。
             force_home_check = (has_backup and bool(marker)
-                                and marker.get("state") == "busy"
+                                and marker_state == "busy"
                                 and (prior_marker != "busy" or stale))
             # 刚回主城（空闲/练兵）：角标缓存里的兵力可能是路上/受伤时的旧值，
             # 必须完整读一次，否则会把“回城已经补满”当成“仍低于出击下限”（2026-11-19 实机）。
-            home_transition = (bool(marker) and marker.get("state") in ("idle", "training")
+            home_transition = (bool(marker) and marker_state in ("idle", "training")
                                and prior_marker not in (None, "idle", "training", "unknown"))
-            force_full = bool(stale and need_strength) or force_home_check or home_transition
-            if (marker and marker.get("state") != "unknown" and cached and not force_full):
+            force_full = (False if (wait_only or outside_ready)
+                          else (bool(stale and need_strength) or force_home_check or home_transition))
+            if obs is None and marker and marker_state != "unknown" and (wait_only or outside_ready or (cached and not force_full)):
                 obs = Observation(
                     policy.key,
-                    state=LEGACY_STATE.get(marker["state"], "unknown"),
-                    strength=cached[0], maximum=cached[1],
-                    wounded=True if marker["state"] == "wounded" else None,
-                    note="拉线整帧快照", marker_state=marker["state"],
+                    state=LEGACY_STATE.get(marker_state, "unknown"),
+                    strength=cached[0] if cached else None,
+                    maximum=known_max,
+                    wounded=True if marker_state == "wounded" else None,
+                    note="拉线整帧快照", marker_state=marker_state,
                     marker_label=marker["label"], marker_confidence=marker["confidence"],
                     marker_at=time.time())
                 self.publish("observation", obs.__dict__)
@@ -1782,11 +1840,16 @@ class Worker(QThread):
                     self.log_once(f"line-absent:{policy.key}", f"{policy.display} 拉线：{exc}", every=300)
                     self._line_idle(game, policy, f"读取判定缺席：{exc}")
                     continue
+                if obs is not None and obs.note != "铺路快照":
+                    did_full_read = True
             if obs is None:
                 self._line_idle(game, policy, "本轮读取未完成")
                 continue
             if obs.strength is not None and obs.maximum is not None:
                 self.line_snapshot[policy.key] = (obs.strength, obs.maximum, time.time())
+                self.line_max_strength[policy.key] = obs.maximum
+            elif obs.maximum is not None:
+                self.line_max_strength[policy.key] = obs.maximum
             # 用户 2026-11-13：有补兵点的拉线队，只要在主城（含自然征兵）就先补到出击线，
             # 再调动到补兵点。
             # 主城只认角标（空闲/练兵；用户 2026-11-13：不搞坐标判据，角标才作数）。
@@ -1798,22 +1861,27 @@ class Worker(QThread):
                 self.line_home_seen.discard(policy.key)
             if has_backup and at_home and not obs.wounded:
                 if policy.key not in self.line_home_seen:
-                    # 刚回主城：角标缓存里的兵力可能是路上读数，必须完整读一次再判定，
-                    # 否则会把“回城瞬间补上的兵”当成没补上。读不到就下一轮再复核。
-                    try:
-                        full = self.observe_team(game, policy)
-                    except TeamAbsent:
-                        full = None
-                    if full is None or full.strength is None:
-                        self.log_once(f"line-home-blind:{policy.key}",
-                                      f"{policy.display} 拉线：已回主城但兵力未读到，下一轮再复核",
-                                      every=600)
-                        continue
-                    obs = full
-                    if obs.strength is not None and obs.maximum is not None:
-                        # 回城后的完整读数才是补兵是否生效的证据；同步刷新缓存。
-                        self.line_snapshot[policy.key] = (obs.strength, obs.maximum, time.time())
-                    self.line_home_seen.add(policy.key)
+                    if did_full_read and obs.strength is not None:
+                        # 本轮刚刚做过完整主城读队：直接采信，不再重复定位读第 2 遍。
+                        self.line_home_seen.add(policy.key)
+                    else:
+                        # 刚回主城：角标缓存里的兵力可能是路上读数，必须完整读一次再判定，
+                        # 否则会把“回城瞬间补上的兵”当成没补上。读不到就下一轮再复核。
+                        try:
+                            full = self.observe_team(game, policy)
+                        except TeamAbsent:
+                            full = None
+                        if full is None or full.strength is None:
+                            self.log_once(f"line-home-blind:{policy.key}",
+                                          f"{policy.display} 拉线：已回主城但兵力未读到，下一轮再复核",
+                                          every=600)
+                            continue
+                        obs = full
+                        if obs.strength is not None and obs.maximum is not None:
+                            # 回城后的完整读数才是补兵是否生效的证据；同步刷新缓存。
+                            self.line_snapshot[policy.key] = (obs.strength, obs.maximum, time.time())
+                            self.line_max_strength[policy.key] = obs.maximum
+                        self.line_home_seen.add(policy.key)
                 need = policy.threshold(obs.maximum) if obs.maximum else None
                 if obs.strength is None:
                     self.log_once(f"line-home-blind:{policy.key}",

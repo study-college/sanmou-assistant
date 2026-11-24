@@ -151,6 +151,7 @@ def test_dispatch_refill_check_uses_the_real_card_center(tmp_path):
     game.pick_action = lambda img, point, kind: ("行军", "march", (1500, 300))
     game.d = SimpleNamespace(tap=lambda *args, **kwargs: None)
     game.capture_clear = lambda *args, **kwargs: FRAME
+    game.capture = lambda *args, **kwargs: FRAME
     game.save_image = lambda *args, **kwargs: None
     game.v = SimpleNamespace(
         page=lambda img, verify=True: "deployment",

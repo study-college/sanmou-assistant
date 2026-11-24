@@ -156,6 +156,8 @@ class Game:
     # 地图现场（详见 __init__）：类上也给默认值，__new__ 构造的旧测试/工具不会缺字段。
     view_point = None
     view_epoch = 0
+    view_at = 0.0
+    VIEW_TTL = 45.0
     # 只读库存刷新间隔。每次刷新要截图 + 页面识别 + 读数，和派兵抢同一个 OCR 线程；
     # 5 秒一次时等待期间几乎一直在识别，反而拖慢真正的游戏操作。
     RESOURCE_INTERVAL = 10
@@ -206,6 +208,7 @@ class Game:
         # 也不能拿旧结论往屏幕正中点——点错会打开整屏弹层，退不出来。
         self.view_point = None
         self.view_epoch = 0
+        self.view_at = 0.0
         # 本赛季实际拥有的主队槽位；None 表示尚未检测，不能据此过滤配置。
         self.active_slots = None
         # 是否有实际刷武勋队；Worker 每轮写入，讨贼决定据此忽略粮食门槛。
@@ -836,28 +839,39 @@ class Game:
         self.d.long_press(point[0], point[1], seconds)
         return True
 
-    def zoom_out_to_map(self, attempts: int = 3):
+    def zoom_out_to_map(self, attempts: int = 3, image=None):
         """长按缩小按钮退到“地图沙盘”（坐标输入页），返回该页画面。
 
         每次长按后都重新读页型，到了就停；不到就再长按一次，最多 3 次。
+        调用方已持有一帧干净沙盘画面时可直接传入 image，省掉首轮重复截屏与识页。
         """
         self.drop_view()
         zoom = getattr(self.v, "map_zoom_point", None)
-        for _ in range(attempts):
-            image = self.capture()
-            if self.v.page(image, verify=False) == "worldmap":
-                return image
+        for attempt in range(attempts):
+            if attempt == 0 and image is not None:
+                current = image
+            else:
+                current = self.capture()
+                if self.v.page(current, verify=False) == "worldmap":
+                    return current
             if zoom is None:
                 break
-            point = zoom(image, zoom_in=False)
+            point = zoom(current, zoom_in=False)
             if point is None:
-                raise RecognitionUnavailable("地图缩小按钮暂未识别，等待重读")
+                if attempt == 0 and image is not None:
+                    # 复用帧上没认出缩小按钮时，立刻现截一帧兜底核对一次。
+                    current = self.capture()
+                    if self.v.page(current, verify=False) == "worldmap":
+                        return current
+                    point = zoom(current, zoom_in=False)
+                if point is None:
+                    raise RecognitionUnavailable("地图缩小按钮暂未识别，等待重读")
             self.d.long_press(point[0], point[1], 1.8)
             self.d.control.sleep(.8)
-        image = self.capture()
-        if self.v.page(image) == "worldmap":
-            return image
-        self.save_image(image, "coordinate-map-not-open", True)
+        current = self.capture()
+        if self.v.page(current) == "worldmap":
+            return current
+        self.save_image(current, "coordinate-map-not-open", True)
         raise GameError("未打开坐标地图（长按缩小仍未到地图沙盘），停止定位")
 
     def zoom_in_to_sandbox(self, attempts: int = 3) -> bool:
@@ -1442,7 +1456,8 @@ class Game:
         state_text = self.v.joined(image, (770, 260, 1540, 785))
         state_text += " | "+" | ".join(self.v.joined(image,r) for r in ((300,600,880,795),(750,600,1330,795),(1150,600,1600,795)))
         state = "unknown"
-        for label, value in (("返回", "returning"), ("征兵", "recruiting"), ("驻守中", "guarding"), ("停留", "outside"), ("回城", "outside")):
+        for label, value in (("返回", "returning"), ("征兵", "recruiting"), ("证兵", "recruiting"),
+                             ("驻守中", "guarding"), ("停留", "outside"), ("回城", "outside")):
             if label in state_text:
                 state = value
                 break
@@ -1599,6 +1614,7 @@ class Game:
         且坐标核对通过之后。别处不得凭“我记得”写入。
         """
         self.view_point = (point.x, point.y)
+        self.view_at = time.monotonic()
         self.view_epoch += 1
 
     def drop_view(self):
@@ -1610,11 +1626,25 @@ class Game:
         """
         if self.view_point is not None:
             self.view_point = None
+        self.view_at = 0.0
         self.view_epoch += 1
 
     def view_on(self, point) -> bool:
-        """镜头是否确实停在这个坐标上（只有 note_view 之后才为真）。"""
-        return self.view_point is not None and self.view_point == (point.x, point.y)
+        """镜头是否确实停在这个坐标上（只有 note_view 之后且在有效期内才为真）。
+
+        2026-11-23 防误触护栏：
+        - 禁止对自己主城走点击屏幕中心快路（点主城中心可能直接进内城）；
+        - 超过 VIEW_TTL（45 秒）或跨轮后自动作废，避免用户中途手动拖图导致点歪。
+        """
+        if self.view_point is None or self.view_point != (point.x, point.y):
+            return False
+        profile = getattr(self, "p", None)
+        main_city = getattr(profile, "main_city", None) if profile is not None else None
+        if main_city is not None and (point.x, point.y) == (main_city.x, main_city.y):
+            return False
+        if self.view_at and (time.monotonic() - self.view_at) > self.VIEW_TTL:
+            return False
+        return True
 
     def tap_target_center(self, label):
         """点屏幕正中，选中“镜头中心”的那一格，并读回这一帧。
@@ -1646,10 +1676,10 @@ class Game:
             image = self.ensure_sandbox()
             # 上一个目标的详情会挡住缩放。地图往返拖动取消选中；左上“空地”会随活动入口变化。
             if image is not None and self.v.page(image) == "sandbox" and self.v.map_coordinates(image) is not None:
-                self.clear_map_selection(image)
+                image = self.clear_map_selection(image)
             # 详情关闭后的比例不固定；用户 2026-11-13 要求改用左下角缩小按钮一路退到
             # “地图沙盘”（坐标输入页），不再用双指缩放。到不了就停，不盲点。
-            image = self.zoom_out_to_map()
+            image = self.zoom_out_to_map(image=image)
             self.d.tap(1483, 998)
             self.d.text(f"{point.x}.{point.y}")
             self.d.finish_coordinate_input()
@@ -1730,6 +1760,13 @@ class Game:
         if self.v.map_coordinates(image) != (point.x, point.y):
             self.save_image(image, "target-refresh-mismatch", True)
             self.drop_view()
+            # 2026-11-23 防误触自愈：若点中心意外进入城内或可返回页面，先安全退回沙盘
+            # 再走标准坐标导航 go_to，避免误触导致整轮罢工。
+            if _vcall(self.v, "page", "sandbox", image) != "sandbox":
+                try:
+                    self.ensure_sandbox(recover_navigation=True)
+                except NavigationRecovered:
+                    pass
             return self.go_to(point)
         self.verify_target(image, point)
         self.note_view(point)
@@ -1891,10 +1928,12 @@ class Game:
             self.log(f"{policy.display} / {point.name}：出征按钮不可用 —— {hint or '未读到上方说明'}", "WARN")
             raise GameError(f"出征按钮不可用：{hint or '未读到上方说明'}")
         # 选队：按本次实际队伍数计算卡片中心；少队时整组居中，不是固定五列。
+        # 2026-11-23 实机根因：游戏进出征页默认选中空闲/满兵队；选队后必须重截，
+        # 否则 line 查一键补兵、merit 查路线阻挡、transfer 查自动征兵都会看到默认旧队的画面。
         card_x = self.card_center(policy.slot)
         self.d.tap(card_x, self.CARD_Y, .3)
+        image = self.capture()
         if kind == "transfer":
-            image = self.capture()
             for attempt in range(2):
                 checkbox = self.v.labeled_checkbox(image, ["自动征兵", "自动证兵"], (1230, 780, 1570, 920))
                 checked = self.v.checked(image, *checkbox) if checkbox else None
@@ -1919,7 +1958,7 @@ class Game:
                     self.log(f"{policy.display} 调动页“自动征兵”原为关闭，已勾选", "INFO")
                 else:
                     self.log(f"{policy.display} 调动页“自动征兵”未能确认已勾选，继续调动", "WARN")
-        if kind == "line" and policy.refill_enabled and obs.maximum:
+        if kind == "line" and policy.refill_enabled and (obs.maximum or policy.min_mode == "absolute"):
             # 兵力低于出击下限才补（不无条件补满，省辐重）；按钮不存在＝当前补不动。
             # 少队时卡槽整组居中，必须按真实卡中心读数，不能按固定五列的旧位置。
             current = self.v.deployment_strength(image, policy.slot,
@@ -1930,18 +1969,22 @@ class Game:
                     self.save_image(image, "line-refill-missing", True)
                     raise LineRefillUnavailable("出征页没有一键补兵按钮，当前补不动")
                 image, _ = self.line_refill(image, policy)
-                if self.v.refill_quota(image) == 0:
-                    self.save_image(image, "line-refill-insufficient", True)
-                    raise LineRefillUnavailable("一键补兵后区块归零，仍低于出击下限，判定补不动")
                 strength_after = self.v.deployment_strength(image, policy.slot,
                                                             center_x=self.card_center(policy.slot))
-                if strength_after is not None and strength_after < floor:
-                    # 用户 2026-11-13：点了补兵还不到出击线，就回城（下一轮转补兵点/营帐），
-                    # 不带残兵出去；回城/撤退/调动需要几分钟，等现场。
-                    self.save_image(image, "line-refill-below-floor", True)
-                    self.log(f"{policy.display} 拉线：一键补兵后 {strength_after}/{obs.maximum} "
-                             f"仍低于出击线 {floor}，回城补兵", "INFO")
-                    raise LineRefillUnavailable("一键补兵后仍低于出击线，回城补兵")
+                # 2026-11-23 实机根因：必须先判补后兵力是否已达到出击下限；
+                # 只要已达标（如 31487/33000 = 95.4% ≥ 90%），即使此次补兵顺手把区块配额
+                # 抽干归零，也应直接放行出征，不能误判补不动而撤回主城。
+                if strength_after is None or strength_after < floor:
+                    if self.v.refill_quota(image) == 0:
+                        self.save_image(image, "line-refill-insufficient", True)
+                        raise LineRefillUnavailable("一键补兵后区块归零，仍低于出击下限，判定补不动")
+                    if strength_after is not None:
+                        # 用户 2026-11-13：点了补兵还不到出击线，就回城（下一轮转补兵点/营帐），
+                        # 不带残兵出去；回城/撤退/调动需要几分钟，等现场。
+                        self.save_image(image, "line-refill-below-floor", True)
+                        self.log(f"{policy.display} 拉线：一键补兵后 {strength_after}/{obs.maximum} "
+                                 f"仍低于出击线 {floor}，回城补兵", "INFO")
+                        raise LineRefillUnavailable("一键补兵后仍低于出击线，回城补兵")
         route = self.v.joined(image, (750, 108, 1250, 174))
         if "阻挡" in route or "无法" in route:
             raise ActionUnavailable(f"{point.name} 的当前路线不可用：{route}", action_key)
@@ -2383,7 +2426,7 @@ class Game:
             if not affairs:
                 self.d.tap(1695, 1035, delay=.6)
                 image = self.capture()
-                if self.v.page(image) != "sandbox":
+                if _vcall(self.v, "page", "sandbox", image) != "sandbox":
                     image = self.wait_transition(image, expected=("sandbox",))
                 affairs = self.v.find(image, ["城务"], (745, 670, 1668, 948), exact=True)
             if affairs:
